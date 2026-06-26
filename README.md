@@ -342,42 +342,48 @@ Generate the Markdown report:
 python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md
 ```
 
+### Persistent in-process client
+
+The benchmark harness talks to the bridge over one keep-alive TCP connection (see `BridgeClient` in `benchmark_harness.py`) instead of spawning `python3 test_client.py` per operation. The native host (`bridge.py`) serves many newline-delimited requests per connection, awaiting each extension response on a per-request queue before reading the next, so request/response order is preserved on a shared socket.
+
+This removed the per-operation Python interpreter startup (~30 ms) and TCP handshake that dominated latency. Median-of-medians dropped from ~41 ms to ~6 ms, and pure-overhead ops (`wait-selector`, `get-html`, `performance-metrics`) fell to ~2 ms — essentially one socket round trip. The CLI (`test_client.py`) still uses one connection per command; the persistent client is the harness/agent fast path. Set `CHROME_BRIDGE_CLIENT` to force the harness back onto an external launcher.
+
 ### Batched bridge actions
 
-Multi-step Chrome Bridge operations (console/network monitoring, dialog handling) use a composite `batch` action so several sub-commands run in a single native-message round trip instead of one CLI spawn and TCP round trip each. The batch fails as a whole if any sub-command throws or returns `success: false`.
+Multi-step Chrome Bridge operations (console/network monitoring, dialog handling) use a composite `batch` action so several sub-commands run in a single native-message round trip. The batch fails as a whole if any sub-command throws or returns `success: false`.
 
 ```bash
 python3 test_client.py batch '[{"action":"startMonitoring"},{"action":"click","payload":{"selector":"#log"}},{"action":"consoleMessages","delayMs":100}]' <tabId>
 ```
 
-Batching cut each monitoring op from roughly three round trips to one (~605 ms to ~142 ms, ~77% lower) and dropped the full Chrome Bridge run from ~34 s to ~8 s.
+Batching collapses the three sub-commands of each monitoring op into one round trip; the residual ~100 ms is the deliberate `delayMs` settle window, not transport.
 
 ### Measured head-to-head
 
-Median ms per operation, 5 iterations, identical local HTTP fixture, all 18 ops `pass` for every adapter. Navigation is normalized to `domcontentloaded` across adapters so `wait-load` is comparable.
+Median ms per operation, 5 iterations, identical local HTTP fixture, all three adapters run back-to-back in one session, all 18 ops `pass` for every adapter. Navigation is normalized to `domcontentloaded` so `wait-load` is comparable.
 
 | Operation | Chrome Bridge | Playwright | Puppeteer |
 | --- | ---: | ---: | ---: |
-| ping | 37.05 | 3.97 | 2.79 |
-| navigate | 48.29 | 10.85 | 67.03 |
-| wait-load | 292.80 | 8.97 | 76.26 |
-| wait-selector | 38.74 | 28.02 | 45.39 |
-| click | 39.88 | 40.04 | 73.85 |
-| fill | 38.95 | 6.21 | 25.10 |
-| select | 39.01 | 4.92 | 24.09 |
-| upload | 46.97 | 44.47 | 21.62 |
-| screenshot | 89.09 | 51.30 | 32.89 |
-| extract-text | 38.11 | 3.98 | 3.64 |
-| get-html | 37.00 | 2.45 | 0.93 |
-| observe-state | 39.39 | 2.21 | 4.63 |
-| console-monitoring | 142.27 | 90.29 | 64.13 |
-| network-monitoring | 140.71 | 83.37 | 63.94 |
-| dialog-handling | 140.47 | 29.87 | 42.22 |
-| storage-state | 42.26 | 3.54 | 6.63 |
-| geolocation | 85.06 | 9.18 | 8.96 |
-| performance-metrics | 38.85 | 1.93 | 1.19 |
+| ping | 4.83 | 1.97 | 0.34 |
+| navigate | 16.36 | 10.93 | 7.96 |
+| wait-load | 255.97 | 5.19 | 18.84 |
+| wait-selector | 1.96 | 11.29 | 5.69 |
+| click | 9.71 | 26.38 | 8.87 |
+| fill | 3.47 | 3.58 | 1.26 |
+| select | 2.48 | 2.61 | 1.51 |
+| upload | 7.62 | 6.18 | 6.42 |
+| screenshot | 51.06 | 61.32 | 28.26 |
+| extract-text | 2.35 | 1.38 | 2.32 |
+| get-html | 2.44 | 1.41 | 0.58 |
+| observe-state | 4.35 | 1.72 | 2.19 |
+| console-monitoring | 106.26 | 72.85 | 57.70 |
+| network-monitoring | 105.96 | 83.63 | 55.83 |
+| dialog-handling | 104.40 | 32.29 | 14.21 |
+| storage-state | 3.65 | 2.12 | 0.54 |
+| geolocation | 17.43 | 11.75 | 1.19 |
+| performance-metrics | 1.91 | 0.95 | 0.35 |
 
-Median-of-medians: Chrome Bridge ~41 ms, Puppeteer ~25 ms, Playwright ~9 ms. The Chrome Bridge gap is structural: each command crosses CLI -> TCP -> native host -> extension -> CDP, while Playwright/Puppeteer hold one in-process CDP connection. Chrome Bridge's edge is real-profile auth reuse, not raw latency. Timings vary with machine load; rerun locally for current numbers.
+Median-of-medians: Chrome Bridge ~6.2 ms, Playwright ~5.7 ms, Puppeteer ~4.0 ms. With the persistent client, Chrome Bridge is competitive with the in-process drivers rather than multiples slower; it wins `wait-selector` outright and beats Playwright on `click` (though it trails Puppeteer there slightly). Two real gaps remain: `wait-load` (~256 ms — `waitForLoad` polls more conservatively than Playwright's load-state signal) and the monitoring ops (the 100 ms settle window). The earlier "~41 ms, 4x slower" figure was per-operation subprocess spawn, now eliminated. Timings vary with machine load; rerun locally for current numbers.
 
 ## Troubleshooting
 
