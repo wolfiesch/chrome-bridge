@@ -71,6 +71,10 @@ threading.Thread(target=delayed_fake_server, args=(port,), daemon=True).start()
 env = os.environ.copy()
 env["BRIDGE_PORT"] = str(port)
 env["BRIDGE_CONNECT_TIMEOUT_SECONDS"] = "5"
+token_fixture = "/tmp/chrome-bridge-heartbeat-token.txt"
+with open(token_fixture, "w", encoding="utf-8") as f:
+    f.write("heartbeat-token\n")
+env["BRIDGE_TOKEN_FILE"] = token_fixture
 proc = subprocess.run([CLIENT, "ping"], env=env, text=True, capture_output=True, timeout=10)
 if proc.returncode != 0:
     fail(f"CLI did not retry refused connection until fake host started; exit={proc.returncode}, stderr={proc.stderr.strip()}")

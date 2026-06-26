@@ -2,10 +2,67 @@ let nativePort = null;
 const HEARTBEAT_ALARM = "chromeBridgeHeartbeat";
 const HEARTBEAT_MINUTES = 0.5;
 const monitors = new Map();
+const interceptors = new Map();
 const MONITOR_LIMIT = 200;
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (!source.tabId || !monitors.has(source.tabId)) return;
+  if (!source.tabId) return;
+
+  if (method === "Fetch.requestPaused" && interceptors.has(source.tabId)) {
+    const interceptor = interceptors.get(source.tabId);
+    const request = params.request || {};
+    const redacted = redactUrl(request.url || "");
+    const record = {
+      requestId: params.requestId,
+      ts: Date.now(),
+      url: redacted.url,
+      hasQuery: redacted.hasQuery,
+      method: request.method || "GET",
+      resourceType: params.resourceType || "Document"
+    };
+    pushLimited(interceptor.requests, record);
+
+    const mode = interceptor.mode;
+    const target = { tabId: source.tabId };
+
+    if (mode === "continue") {
+      chrome.debugger.sendCommand(target, "Fetch.continueRequest", {
+        requestId: params.requestId
+      }, (result) => {
+        if (chrome.runtime.lastError) {
+          console.warn("Fetch.continueRequest failed:", chrome.runtime.lastError.message);
+        }
+      });
+    } else if (mode === "abort") {
+      chrome.debugger.sendCommand(target, "Fetch.failRequest", {
+        requestId: params.requestId,
+        errorReason: "Aborted"
+      }, (result) => {
+        if (chrome.runtime.lastError) {
+          console.warn("Fetch.failRequest failed:", chrome.runtime.lastError.message);
+        }
+      });
+    } else if (mode === "fulfill") {
+      const responseCode = interceptor.status ?? 200;
+      const responseHeaders = [
+        { name: "Content-Type", value: "text/plain" }
+      ];
+      const encodedBody = toBase64(interceptor.body || "");
+      chrome.debugger.sendCommand(target, "Fetch.fulfillRequest", {
+        requestId: params.requestId,
+        responseCode,
+        responseHeaders,
+        body: encodedBody
+      }, (result) => {
+        if (chrome.runtime.lastError) {
+          console.warn("Fetch.fulfillRequest failed:", chrome.runtime.lastError.message);
+        }
+      });
+    }
+    return;
+  }
+
+  if (!monitors.has(source.tabId)) return;
   const monitor = monitors.get(source.tabId);
   const ts = Date.now();
 
@@ -232,6 +289,30 @@ async function handleMessageFromHost(message) {
       case "handleDialog":
         result = await handleDialog(payload.tabId, payload.accept, payload.promptText);
         break;
+      case "downloadUrl":
+        result = await downloadUrl(payload.url, payload.filename);
+        break;
+      case "storageState":
+        result = await getStorageState(payload.tabId);
+        break;
+      case "setGeolocation":
+        result = await setGeolocation(payload.tabId, payload.latitude, payload.longitude, payload.accuracy);
+        break;
+      case "clearGeolocation":
+        result = await clearGeolocation(payload.tabId);
+        break;
+      case "startInterception":
+        result = await startInterception(payload.tabId, payload.urlPattern, payload.mode, payload.status, payload.body);
+        break;
+      case "stopInterception":
+        result = await stopInterception(payload.tabId);
+        break;
+      case "interceptedRequests":
+        result = interceptedRequests(payload.tabId);
+        break;
+      case "performanceMetrics":
+        result = await performanceMetrics(payload.tabId);
+        break;
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
@@ -338,7 +419,7 @@ function debuggerDetach(target) {
 
 async function withDebugger(tabId, fn) {
   const target = { tabId };
-  if (monitors.has(tabId)) return fn(target);
+  if (monitors.has(tabId) || interceptors.has(tabId)) return fn(target);
   await debuggerAttach(target);
   try {
     return await fn(target);
@@ -695,7 +776,9 @@ async function observeTab(tabId) {
 async function startMonitoring(tabId) {
   if (monitors.has(tabId)) return { success: true, tabId, already: true };
   const target = { tabId };
-  await debuggerAttach(target);
+  if (!interceptors.has(tabId)) {
+    await debuggerAttach(target);
+  }
   monitors.set(tabId, { console: [], network: new Map(), dialogs: [] });
   try {
     await debuggerCommand(target, 'Runtime.enable', {});
@@ -704,7 +787,9 @@ async function startMonitoring(tabId) {
     await debuggerCommand(target, 'Page.enable', {});
   } catch (error) {
     monitors.delete(tabId);
-    await debuggerDetach(target);
+    if (!interceptors.has(tabId)) {
+      await debuggerDetach(target);
+    }
     throw error;
   }
   return { success: true, tabId, already: false };
@@ -713,7 +798,9 @@ async function startMonitoring(tabId) {
 async function stopMonitoring(tabId) {
   if (!monitors.has(tabId)) return { success: true, tabId, alreadyStopped: true };
   monitors.delete(tabId);
-  await debuggerDetach({ tabId });
+  if (!interceptors.has(tabId)) {
+    await debuggerDetach({ tabId });
+  }
   return { success: true, tabId };
 }
 
@@ -765,6 +852,222 @@ function redactUrl(rawUrl) {
   } catch (_error) {
     return { url: rawUrl.split('?')[0], hasQuery: rawUrl.includes('?') };
   }
+}
+
+async function downloadUrl(url, filename) {
+  const options = { url: url, saveAs: false };
+  if (filename) {
+    options.filename = filename;
+  }
+  const downloadId = await chrome.downloads.download(options);
+  return { downloadId };
+}
+
+async function getStorageState(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab.url || "";
+  let origin = "";
+  try {
+    if (url) {
+      origin = new URL(url).origin;
+    }
+  } catch (e) {
+    // Ignore invalid URL
+  }
+
+  let localStorageVal = {};
+  let sessionStorageVal = {};
+
+  if (origin && origin !== "null" && origin.startsWith("http")) {
+    try {
+      const storageRes = await withDebugger(tabId, async (target) => {
+        return await evaluateWithDebugger(target, `(() => {
+          const ls = {};
+          const ss = {};
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              ls[k] = localStorage.getItem(k);
+            }
+          } catch(e) {}
+          try {
+            for (let i = 0; i < sessionStorage.length; i++) {
+              const k = sessionStorage.key(i);
+              ss[k] = sessionStorage.getItem(k);
+            }
+          } catch(e) {}
+          return { localStorage: ls, sessionStorage: ss };
+        })()`);
+      });
+
+      if (storageRes.success && storageRes.val) {
+        localStorageVal = storageRes.val.localStorage || {};
+        sessionStorageVal = storageRes.val.sessionStorage || {};
+      }
+    } catch (e) {
+      // Ignore debugger or evaluation errors
+    }
+  }
+
+  let cookies = [];
+  if (origin && origin.startsWith("http")) {
+    try {
+      cookies = await chrome.cookies.getAll({ url: origin });
+    } catch (e) {
+      // Ignore cookie errors
+    }
+  }
+
+  return {
+    origin,
+    cookies,
+    localStorage: localStorageVal,
+    sessionStorage: sessionStorageVal
+  };
+}
+
+async function setGeolocation(tabId, latitude, longitude, accuracy) {
+  const tab = await chrome.tabs.get(tabId);
+  let origin = "";
+  try {
+    origin = new URL(tab.url).origin;
+  } catch (e) {}
+
+  return withDebugger(tabId, async (target) => {
+    let grantError = null;
+    if (origin && origin.startsWith("http")) {
+      try {
+        await chrome.contentSettings.location.set({
+          primaryPattern: `${origin}/*`,
+          setting: 'allow'
+        });
+      } catch (contentSettingsError) {
+        try {
+          await debuggerCommand(target, 'Browser.setPermission', {
+            permission: { name: 'geolocation' },
+            setting: 'granted',
+            origin: origin
+          });
+        } catch (setPermissionError) {
+          try {
+            await debuggerCommand(target, 'Browser.grantPermissions', {
+              permissions: ['geolocation'],
+              origin: origin
+            });
+          } catch (grantPermissionsError) {
+            grantError = `${contentSettingsError.message}; ${setPermissionError.message}; ${grantPermissionsError.message}`;
+          }
+        }
+      }
+    }
+    const params = {
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      accuracy: accuracy !== undefined && accuracy !== null ? Number(accuracy) : 100
+    };
+    await debuggerCommand(target, 'Emulation.setGeolocationOverride', params);
+    return { success: true, tabId, latitude, longitude, accuracy: params.accuracy, grantError };
+  });
+}
+
+async function clearGeolocation(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  let origin = "";
+  try {
+    origin = new URL(tab.url).origin;
+  } catch (e) {}
+  if (origin && origin.startsWith("http")) {
+    try {
+      await chrome.contentSettings.location.set({
+        primaryPattern: `${origin}/*`,
+        setting: 'ask'
+      });
+    } catch (_error) {}
+  }
+  await withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Emulation.clearGeolocationOverride', {});
+  });
+  return { success: true, tabId };
+}
+
+function toBase64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let binString = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binString += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binString);
+}
+
+async function startInterception(tabId, urlPattern, mode, status, body) {
+  const target = { tabId };
+  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId);
+  if (attachedHere) {
+    await debuggerAttach(target);
+  }
+
+  const interceptor = {
+    urlPattern,
+    mode,
+    status: (status !== undefined && status !== null) ? parseInt(status, 10) : 200,
+    body: body || "",
+    requests: []
+  };
+  interceptors.set(tabId, interceptor);
+
+  try {
+    await debuggerCommand(target, 'Fetch.enable', {
+      patterns: [{ urlPattern: urlPattern, requestStage: "Request" }]
+    });
+    return { success: true, tabId, urlPattern, mode };
+  } catch (error) {
+    interceptors.delete(tabId);
+    if (attachedHere && !monitors.has(tabId)) {
+      await debuggerDetach(target);
+    }
+    throw error;
+  }
+}
+
+async function stopInterception(tabId) {
+  if (!interceptors.has(tabId)) return { success: true, tabId, alreadyStopped: true };
+  const target = { tabId };
+  try {
+    await debuggerCommand(target, 'Fetch.disable', {});
+  } catch (error) {
+    console.warn("Fetch.disable failed:", error.message);
+  }
+  interceptors.delete(tabId);
+  if (!monitors.has(tabId)) {
+    await debuggerDetach(target);
+  }
+  return { success: true, tabId };
+}
+
+function interceptedRequests(tabId) {
+  const interceptor = interceptors.get(tabId);
+  if (!interceptor) {
+    return { success: false, err: `Interception is not active for tab ${tabId}; run startInterception first` };
+  }
+  return { success: true, tabId, requests: [...interceptor.requests] };
+}
+
+async function performanceMetrics(tabId) {
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Performance.enable', {});
+    try {
+      const response = await debuggerCommand(target, 'Performance.getMetrics', {});
+      const metrics = {};
+      if (response && response.metrics) {
+        for (const item of response.metrics) {
+          metrics[item.name] = item.value;
+        }
+      }
+      return { success: true, tabId, metrics };
+    } finally {
+      await debuggerCommand(target, 'Performance.disable', {}).catch(() => {});
+    }
+  });
 }
 
 connectToHost();

@@ -187,6 +187,39 @@ def save_html(tab_id, output_path):
     return 0
 
 
+def save_storage_state(tab_id, output_path):
+    exit_code, response, stderr = send_command_data("storageState", {"tabId": tab_id})
+    if exit_code != 0:
+        if response is not None:
+            print(json.dumps(response, indent=2))
+        if stderr:
+            print(stderr, file=sys.stderr)
+        return exit_code
+    result = result_payload(response)
+    if not isinstance(result, dict):
+        print("Error: storageState response was empty or invalid", file=sys.stderr)
+        return 1
+    encoded = json.dumps(result, indent=2).encode("utf-8")
+    path = expand_output_path(output_path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(encoded)
+    origin = result.get("origin")
+    cookie_count = len(result.get("cookies", []))
+    ls_origins = [origin] if (origin and result.get("localStorage")) else []
+    ss_origins = [origin] if (origin and result.get("sessionStorage")) else []
+    out = {
+        "success": True,
+        "path": path,
+        "bytes": len(encoded),
+        "cookieCount": cookie_count,
+        "localStorageOrigins": ls_origins,
+        "sessionStorageOrigins": ss_origins
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def require_args(argv, count, usage):
     if len(argv) < count:
         print(usage, file=sys.stderr)
@@ -230,7 +263,14 @@ def print_usage():
     print("  python3 test_client.py consoleMessages <tabId>")
     print("  python3 test_client.py networkRequests <tabId>")
     print("  python3 test_client.py handleDialog <tabId> accept|dismiss [promptText]")
-
+    print("  python3 test_client.py downloadUrl <url> [filename]")
+    print("  python3 test_client.py storageState <tabId> <outputPath>")
+    print("  python3 test_client.py setGeolocation <tabId> <latitude> <longitude> [accuracy]")
+    print("  python3 test_client.py clearGeolocation <tabId>")
+    print("  python3 test_client.py startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]")
+    print("  python3 test_client.py stopInterception <tabId>")
+    print("  python3 test_client.py interceptedRequests <tabId>")
+    print("  python3 test_client.py performanceMetrics <tabId>")
 
 def main():
     if len(sys.argv) < 2:
@@ -335,6 +375,51 @@ def main():
             "accept": args[3] == "accept",
             "promptText": " ".join(args[4:]) if len(args) > 4 else None,
         }))
+    elif action == "downloadUrl":
+        require_args(args, 3, "Usage: python3 test_client.py downloadUrl <url> [filename]")
+        payload = {"url": args[2]}
+        if len(args) > 3:
+            payload["filename"] = args[3]
+        sys.exit(send_command("downloadUrl", payload))
+    elif action == "storageState":
+        require_args(args, 4, "Usage: python3 test_client.py storageState <tabId> <outputPath>")
+        sys.exit(save_storage_state(parse_int(args[2], "tabId"), args[3]))
+    elif action == "setGeolocation":
+        require_args(args, 5, "Usage: python3 test_client.py setGeolocation <tabId> <latitude> <longitude> [accuracy]")
+        accuracy = parse_float(args[5], "accuracy") if len(args) > 5 else None
+        sys.exit(send_command("setGeolocation", {
+            "tabId": parse_int(args[2], "tabId"),
+            "latitude": parse_float(args[3], "latitude"),
+            "longitude": parse_float(args[4], "longitude"),
+            "accuracy": accuracy
+        }))
+    elif action == "clearGeolocation":
+        require_args(args, 3, "Usage: python3 test_client.py clearGeolocation <tabId>")
+        sys.exit(send_command("clearGeolocation", {"tabId": parse_int(args[2], "tabId")}))
+    elif action == "startInterception":
+        require_args(args, 5, "Usage: python3 test_client.py startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]")
+        tab_id = parse_int(args[2], "tabId")
+        url_pattern = args[3]
+        mode = args[4]
+        if mode not in {"continue", "abort", "fulfill"}:
+            print("Interception mode must be continue, abort, or fulfill", file=sys.stderr)
+            sys.exit(2)
+        status = None
+        body = None
+        if len(args) > 5:
+            status = parse_int(args[5], "status")
+        if len(args) > 6:
+            body = " ".join(args[6:])
+        sys.exit(send_command("startInterception", {
+            "tabId": tab_id,
+            "urlPattern": url_pattern,
+            "mode": mode,
+            "status": status,
+            "body": body
+        }))
+    elif action in {"stopInterception", "interceptedRequests", "performanceMetrics"}:
+        require_args(args, 3, f"Usage: python3 test_client.py {action} <tabId>")
+        sys.exit(send_command(action, {"tabId": parse_int(args[2], "tabId")}))
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(64)

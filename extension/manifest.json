@@ -10,7 +10,9 @@
     "activeTab",
     "cookies",
     "debugger",
-    "alarms"
+    "alarms",
+    "downloads",
+    "contentSettings"
   ],
   "background": {
     "service_worker": "background.js"

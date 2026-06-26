@@ -50,7 +50,8 @@ def round_trip(proc, port, action, result_payload, label):
     print(f"[TEST] --- {label} ---")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(('127.0.0.1', port))
-    with open(os.path.join(SCRIPT_DIR, 'bridge_token.txt')) as f:
+    token_file = os.environ.get('BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
+    with open(token_file) as f:
         token = f.read().strip()
     sock.sendall((json.dumps({"action": action, "payload": {}, "token": token}) + "\n").encode('utf-8'))
 
@@ -82,6 +83,11 @@ def main():
     print("[TEST] Starting integration verification of Native Messaging Host...")
     test_env = os.environ.copy()
     test_env['BRIDGE_PORT'] = '9224'
+    token_fixture = "/tmp/chrome-bridge-verify-token.txt"
+    with open(token_fixture, "w", encoding="utf-8") as f:
+        f.write("verify-token\n")
+    test_env['BRIDGE_TOKEN_FILE'] = token_fixture
+    os.environ['BRIDGE_TOKEN_FILE'] = token_fixture
 
     proc = subprocess.Popen(
         [os.path.join(SCRIPT_DIR, 'bridge.py')],

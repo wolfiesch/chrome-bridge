@@ -11,6 +11,11 @@ ENV = os.environ.copy()
 # without needing a live Chrome extension.
 ENV["BRIDGE_PORT"] = "9"
 ENV["BRIDGE_CONNECT_TIMEOUT_SECONDS"] = "0"
+TOKEN_FIXTURE = "/tmp/chrome-bridge-contract-token.txt"
+with open(TOKEN_FIXTURE, "w", encoding="utf-8") as f:
+    f.write("contract-token\n")
+ENV["BRIDGE_TOKEN_FILE"] = TOKEN_FIXTURE
+
 
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-upload.txt"
 with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
@@ -54,6 +59,18 @@ CASES = [
     (["networkRequests", "1"], 111),
     (["handleDialog", "1", "accept"], 111),
     (["handleDialog", "1", "accept", "typed prompt value"], 111),
+    (["startInterception", "1", "*api*", "continue"], 111),
+    (["startInterception", "1", "*api*", "abort"], 111),
+    (["startInterception", "1", "*api*", "fulfill", "200", '{"data":1}'], 111),
+    (["stopInterception", "1"], 111),
+    (["interceptedRequests", "1"], 111),
+    (["downloadUrl", "https://example.com/file.zip"], 111),
+    (["downloadUrl", "https://example.com/file.zip", "my_file.zip"], 111),
+    (["storageState", "1", "/tmp/chrome-bridge-state.json"], 111),
+    (["setGeolocation", "1", "37.7749", "-122.4194"], 111),
+    (["setGeolocation", "1", "37.7749", "-122.4194", "100"], 111),
+    (["clearGeolocation", "1"], 111),
+    (["performanceMetrics", "1"], 111),
     (["noSuchAction"], 64),
 ]
 

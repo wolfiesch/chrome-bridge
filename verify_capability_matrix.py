@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import time
+import http.server
+import threading
+import subprocess
+import contextlib
+from pathlib import Path
+
+# Paths & Settings
+HOST = "127.0.0.1"
+PORT = 0  # Dynamic port binding
+BASE_URL = ""
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CLIENT = os.path.join(SCRIPT_DIR, "test_client.py")
+BRIDGE_COMMAND = os.environ.get("CHROME_BRIDGE_CLIENT")
+
+UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
+SHOT_PATH = "/tmp/chrome-bridge-live.png"
+HTML_PATH = "/tmp/chrome-bridge-live.html"
+STATE_PATH = "/tmp/chrome-bridge-state.json"
+DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
+LAST_SUMMARY = {}
+
+
+PAGE = b"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Chrome Bridge Live Test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; min-height: 1600px; }
+    #from, #to { width: 80px; height: 40px; margin: 20px; padding: 8px; border: 1px solid #333; }
+    #to { margin-top: 300px; }
+    #panel { height: 120px; overflow: auto; border: 1px solid #999; }
+    #spacer { height: 600px; }
+  </style>
+</head>
+<body>
+  <h1>Chrome Bridge Live Test</h1>
+  <input id="q" name="q" value="">
+  <button id="btn">Click me</button>
+  <button id="log">Log</button>
+  <button id="fetch">Fetch</button>
+  <button id="alert">Alert</button>
+  <select id="kind" name="kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>
+  <input id="file" type="file">
+  <div id="status">ready</div>
+  <div id="from" draggable="true">from</div>
+  <div id="to">to</div>
+  <div id="panel"><div id="spacer">scroll panel</div></div>
+  <script>
+    document.querySelector('#btn').addEventListener('click', () => {
+      document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
+    });
+    document.querySelector('#log').addEventListener('click', () => console.log('bridge fixture console message'));
+    document.querySelector('#fetch').addEventListener('click', () => fetch('/data.json?secret=redact-me').then(r => r.json()).then(d => console.log('fetch', d.ok)));
+    document.querySelector('#alert').addEventListener('click', () => alert('hello dialog'));
+  </script>
+</body>
+</html>"""
+
+DATA = b'{"ok": true}'
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/data.json"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(DATA)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(PAGE)
+
+    def log_message(self, _format, *_args):
+        return
+
+class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+def start_server():
+    global BASE_URL
+    server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
+    derived_port = server.server_address[1]
+    BASE_URL = f"http://{HOST}:{derived_port}/"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+def bridge_command():
+    token_file = os.environ.get("BRIDGE_TOKEN_FILE", os.path.join(SCRIPT_DIR, "bridge_token.txt"))
+    if not BRIDGE_COMMAND and not os.path.exists(token_file):
+        raise RuntimeError(
+            "Missing bridge token. Run ./setup.sh <extension-id> first, set BRIDGE_TOKEN_FILE, "
+            "or set CHROME_BRIDGE_CLIENT=chrome-bridge to use an installed launcher."
+        )
+    return [BRIDGE_COMMAND] if BRIDGE_COMMAND else [sys.executable, CLIENT]
+
+def run_bridge(*args, timeout=20):
+    proc = subprocess.run([*bridge_command(), *map(str, args)], text=True, capture_output=True, timeout=timeout)
+    parsed = None
+    if proc.stdout:
+        try:
+            parsed = json.loads(proc.stdout)
+        except Exception:
+            pass
+    return {
+        "exit": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "json": parsed
+    }
+
+def result(call):
+    data = call.get("json") or {}
+    item = data.get("result")
+    if item is not None:
+        return item
+    return data
+
+def record(summary, name, call, extra=None):
+    global LAST_SUMMARY
+    entry = {"exit": call["exit"]}
+    if extra:
+        entry.update(extra)
+    summary[name] = entry
+    LAST_SUMMARY = summary
+    return call
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+def main():
+    Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
+    for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+
+    server = start_server()
+    summary = {}
+    tab_id = None
+    monitoring_started = False
+    interception_started = False
+    try:
+        # 1. Ping
+        call = run_bridge("ping")
+        record(summary, "ping", call, {"pong": result(call) == "pong"})
+        require(call["exit"] == 0 and result(call) == "pong", "ping failed")
+
+        # 2. Navigate
+        call = run_bridge("navigate", BASE_URL)
+        nav = result(call) or {}
+        tab_id = nav.get("tabId")
+        record(summary, "navigate", call, {"tabId": tab_id})
+        require(call["exit"] == 0 and tab_id is not None, "navigate did not return tabId")
+
+        # 3. Wait For Load
+        call = run_bridge("waitForLoad", tab_id, 10000)
+        record(summary, "waitForLoad", call)
+        require(call["exit"] == 0, "waitForLoad failed")
+
+        # 4. Wait For Selector
+        call = run_bridge("waitForSelector", tab_id, "#q", 10000)
+        record(summary, "waitForSelector", call)
+        require(call["exit"] == 0, "waitForSelector failed")
+
+        # 5. Fill
+        call = run_bridge("fill", tab_id, "#q", "hello")
+        record(summary, "fill", call)
+        require(call["exit"] == 0, "fill failed")
+
+        # 6. Select
+        call = run_bridge("select", tab_id, "#kind", "beta")
+        record(summary, "select", call)
+        require(call["exit"] == 0, "select failed")
+
+        # 7. Hover
+        call = run_bridge("hover", tab_id, "#btn")
+        record(summary, "hover", call)
+        require(call["exit"] == 0, "hover failed")
+
+        # 8. Scroll
+        call = run_bridge("scroll", tab_id, 0, 300)
+        record(summary, "scroll", call)
+        require(call["exit"] == 0, "scroll failed")
+
+        # 9. Upload File
+        call = run_bridge("uploadFile", tab_id, "#file", UPLOAD_FIXTURE)
+        record(summary, "uploadFile", call)
+        require(call["exit"] == 0, "uploadFile failed")
+
+        # 10. Execute Script CDP (verification)
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#q').value")
+        val = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_fill", call, {"value": val})
+        require(call["exit"] == 0 and val == "hello", "fill did not set value properly")
+
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#file').files.length")
+        file_count = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_upload", call, {"files": file_count})
+        require(call["exit"] == 0 and file_count == 1, "uploadFile did not set file input properly")
+
+        # 11. Click
+        call = run_bridge("click", tab_id, "#btn")
+        record(summary, "click", call)
+        require(call["exit"] == 0, "click failed")
+
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        status = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_click", call, {"status": status})
+        require(call["exit"] == 0 and status == "clicked:hello", "click did not update status")
+
+        # 12. Drag
+        call = run_bridge("drag", tab_id, "#from", "#to")
+        record(summary, "drag", call)
+        require(call["exit"] == 0, "drag failed")
+
+        # 13. Press
+        call = run_bridge("press", tab_id, "Enter")
+        record(summary, "press", call)
+        require(call["exit"] == 0, "press failed")
+
+        # 14. Screenshot
+        call = run_bridge("screenshot", tab_id, SHOT_PATH)
+        shot = call.get("json") or {}
+        record(summary, "screenshot", call, {
+            "bytes": shot.get("bytes"),
+            "mimeType": shot.get("mimeType"),
+            "path": SHOT_PATH
+        })
+        require(call["exit"] == 0 and shot.get("bytes", 0) > 1000 and Path(SHOT_PATH).is_file(), "screenshot failed")
+
+        # 15. Get HTML
+        call = run_bridge("getHTML", tab_id, HTML_PATH)
+        html = call.get("json") or {}
+        record(summary, "getHTML", call, {
+            "bytes": html.get("bytes"),
+            "path": HTML_PATH
+        })
+        require(call["exit"] == 0 and "Chrome Bridge Live Test" in Path(HTML_PATH).read_text(encoding="utf-8"), "getHTML failed")
+
+        # 16. Extract Text
+        call = run_bridge("extractText", tab_id, 2000)
+        text = (result(call) or {}).get("text", "")
+        record(summary, "extractText", call, {
+            "containsTitle": "Chrome Bridge Live Test" in text,
+            "chars": len(text)
+        })
+        require(call["exit"] == 0 and "Chrome Bridge Live Test" in text, "extractText failed")
+
+        # 17. Set Viewport
+        call = run_bridge("setViewport", tab_id, 800, 600, 1)
+        viewport = result(call) or {}
+        record(summary, "setViewport", call, {
+            "width": viewport.get("width"),
+            "height": viewport.get("height")
+        })
+        require(call["exit"] == 0 and viewport.get("width") == 800 and viewport.get("height") == 600, "setViewport failed")
+
+        # 18. Monitoring Start
+        call = run_bridge("startMonitoring", tab_id)
+        record(summary, "startMonitoring", call)
+        require(call["exit"] == 0, "startMonitoring failed")
+        monitoring_started = True
+
+        # 19. Console Messages
+        run_bridge("click", tab_id, "#log")
+        time.sleep(0.5)
+        call = run_bridge("consoleMessages", tab_id)
+        messages = (result(call) or {}).get("messages", [])
+        record(summary, "consoleMessages", call, {"count": len(messages)})
+        require(call["exit"] == 0 and len(messages) >= 1, "consoleMessages failed")
+
+        # 20. Network Requests
+        run_bridge("click", tab_id, "#fetch")
+        time.sleep(0.5)
+        call = run_bridge("networkRequests", tab_id)
+        requests = (result(call) or {}).get("requests", [])
+        has_query_in_url = any("secret=redact-me" in req.get("url", "") for req in requests if isinstance(req, dict))
+        record(summary, "networkRequests", call, {
+            "count": len(requests),
+            "redacted": not has_query_in_url
+        })
+        require(call["exit"] == 0 and len(requests) >= 1 and not has_query_in_url, "networkRequests failed")
+
+        # 21. Handle Dialog
+        run_bridge("executeScriptCDP", tab_id, "setTimeout(() => alert('hello dialog'), 0); 'scheduled'")
+        time.sleep(0.2)
+        call = run_bridge("handleDialog", tab_id, "accept")
+        record(summary, "handleDialog", call)
+        require(call["exit"] == 0, "handleDialog failed")
+
+        # 22. Monitoring Stop
+        call = run_bridge("stopMonitoring", tab_id)
+        record(summary, "stopMonitoring", call)
+        require(call["exit"] == 0, "stopMonitoring failed")
+        monitoring_started = False
+
+        # 23. Get Current State & Observe
+        call = run_bridge("getCurrentState", tab_id)
+        res = result(call) or {}
+        obs_list = res.get("observe", [])
+        obs_ok = isinstance(obs_list, list) and len(obs_list) > 0 and any(
+            "Chrome Bridge Live Test" in str(node.get("name", "")) or "ready" in str(node.get("name", ""))
+            for node in obs_list if isinstance(node, dict)
+        )
+        record(summary, "getCurrentState", call, {"observe_ok": obs_ok})
+        require(call["exit"] == 0 and obs_ok, "getCurrentState failed or observe did not contain fixture text")
+
+        # 24. Start Interception
+        call = run_bridge("startInterception", tab_id, "*data.json*", "fulfill", 200, '{"ok":true,"intercepted":true}')
+        record(summary, "startInterception", call)
+        require(call["exit"] == 0, "startInterception failed")
+        interception_started = True
+
+        # 25. Intercepted Requests
+        call = run_bridge("executeScriptCDP", tab_id, "fetch('/data.json?secret=intercept-me').then(r => r.text()).then(t => { window.__interceptedBody = t; return t; })")
+        body = (result(call) or {}).get("val", "")
+        record(summary, "interceptedFetchBody", call, {"fulfilled": '"intercepted":true' in body})
+        require(call["exit"] == 0 and '"intercepted":true' in body, "interception did not fulfill mocked response body")
+        time.sleep(0.5)
+        call = run_bridge("interceptedRequests", tab_id)
+        interception = result(call) or {}
+        reqs = interception.get("requests", []) if isinstance(interception, dict) else []
+        intercepted_url_leak = any("?" in req.get("url", "") for req in reqs if isinstance(req, dict))
+        intercepted_has_query = any(req.get("hasQuery") is True for req in reqs if isinstance(req, dict))
+        record(summary, "interceptedRequests", call, {"count": len(reqs), "redacted": not intercepted_url_leak, "hasQuery": intercepted_has_query})
+        require(call["exit"] == 0 and len(reqs) >= 1 and not intercepted_url_leak and intercepted_has_query, "interceptedRequests failed redaction/query check")
+
+        # 26. Stop Interception
+        call = run_bridge("stopInterception", tab_id)
+        record(summary, "stopInterception", call)
+        require(call["exit"] == 0, "stopInterception failed")
+        interception_started = False
+
+        # 27. Download URL
+        call = run_bridge("downloadUrl", BASE_URL + "data.json", DOWNLOAD_NAME)
+        res = result(call) or {}
+        record(summary, "downloadUrl", call, {"downloadId": res.get("downloadId")})
+        require(call["exit"] == 0 and res.get("downloadId") is not None, "downloadUrl failed")
+
+        # 28. Storage State
+        call = run_bridge("storageState", tab_id, STATE_PATH)
+        state_meta = call.get("json") or {}
+        record(summary, "storageState", call, {
+            "cookieCount": state_meta.get("cookieCount"),
+            "bytes": state_meta.get("bytes"),
+            "path": STATE_PATH
+        })
+        require(call["exit"] == 0 and Path(STATE_PATH).is_file(), "storageState failed")
+
+        # 29. Geolocation
+        call = run_bridge("setGeolocation", tab_id, 37.7749, -122.4194, 100)
+        geo_set = result(call) or {}
+        record(summary, "setGeolocation", call, {"grantError": geo_set.get("grantError")})
+        require(call["exit"] == 0, "setGeolocation failed")
+
+        geo_expr = """new Promise((resolve) => {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => resolve({ok: true, latitude: pos.coords.latitude, longitude: pos.coords.longitude}),
+            (err) => resolve({ok: false, code: err.code, message: err.message}),
+            {maximumAge: 0, timeout: 3000}
+          );
+        })"""
+        call = run_bridge("executeScriptCDP", tab_id, geo_expr)
+        geo = (result(call) or {}).get("val") or {}
+        geo_ok = (
+            call["exit"] == 0
+            and geo.get("ok") is True
+            and abs(float(geo.get("latitude")) - 37.7749) < 0.01
+            and abs(float(geo.get("longitude")) - (-122.4194)) < 0.01
+        )
+        record(summary, "geolocationRead", call, {"ok": geo.get("ok"), "code": geo.get("code"), "message": geo.get("message")})
+        require(geo_ok, "geolocation read did not return overridden coordinates")
+
+        call = run_bridge("clearGeolocation", tab_id)
+        record(summary, "clearGeolocation", call)
+        require(call["exit"] == 0, "clearGeolocation failed")
+
+        # 30. Performance Metrics
+        call = run_bridge("performanceMetrics", tab_id)
+        perf = result(call) or {}
+        metrics = perf.get("metrics", {}) if isinstance(perf, dict) else {}
+        record(summary, "performanceMetrics", call, {"metricCount": len(metrics)})
+        require(call["exit"] == 0 and len(metrics) > 0, "performanceMetrics failed or returned no metrics")
+
+        # Compact JSON output on success
+        print(json.dumps(summary, separators=(",", ":")))
+
+    finally:
+        # Best effort cleanup
+        if tab_id is not None:
+            if monitoring_started:
+                with contextlib.suppress(Exception):
+                    run_bridge("stopMonitoring", tab_id)
+            if interception_started:
+                with contextlib.suppress(Exception):
+                    run_bridge("stopInterception", tab_id)
+            with contextlib.suppress(Exception):
+                run_bridge("closeTab", tab_id)
+
+        server.shutdown()
+
+        for path in [UPLOAD_FIXTURE, SHOT_PATH, HTML_PATH, STATE_PATH]:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if LAST_SUMMARY:
+            print(json.dumps(LAST_SUMMARY, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        sys.exit(1)

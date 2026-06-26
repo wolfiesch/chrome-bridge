@@ -126,7 +126,7 @@ chrome-bridge uploadFile <tabId> <selector> <path...>
 chrome-bridge setViewport <tabId> <width> <height> [deviceScaleFactor]
 ```
 
-### Diagnostics
+### Diagnostics, interception, downloads, storage, geolocation, and metrics
 
 ```bash
 chrome-bridge startMonitoring <tabId>
@@ -134,9 +134,17 @@ chrome-bridge stopMonitoring <tabId>
 chrome-bridge consoleMessages <tabId>
 chrome-bridge networkRequests <tabId>
 chrome-bridge handleDialog <tabId> accept|dismiss [promptText]
+chrome-bridge startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]
+chrome-bridge stopInterception <tabId>
+chrome-bridge interceptedRequests <tabId>
+chrome-bridge downloadUrl <url> [filename]
+chrome-bridge storageState <tabId> <outputPath>
+chrome-bridge setGeolocation <tabId> <latitude> <longitude> [accuracy]
+chrome-bridge clearGeolocation <tabId>
+chrome-bridge performanceMetrics <tabId>
 ```
 
-`startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `networkRequests` stores URLs as origin plus pathname and reports `hasQuery` instead of query strings.
+`startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
 ## Raw-output safety
 
@@ -149,7 +157,10 @@ These commands can reveal private browsing context:
 - `screenshot`
 - `consoleMessages`
 - `networkRequests`
-
+- `interceptedRequests`
+- `storageState`
+  - Raw output is written to the requested file and may include cookies, localStorage, and sessionStorage.
+  - Do not paste the file contents into transcripts.
 Never paste raw cookies, raw tab URLs/titles, screenshot contents, raw HTML, or network URLs into transcripts unless the user explicitly asks for that output.
 
 Use redacted summaries:
@@ -176,18 +187,21 @@ Offline checks (no browser needed), run from the repo root:
 PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_agent_actions_live.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_agent_actions_live.py verify_capability_matrix.py
 node --check background.js
 diff -q manifest.json extension/manifest.json
 diff -q background.js extension/background.js
 ```
 
-Manual live gate after reloading the unpacked extension (opens real Chrome tabs):
+Manual live gates after reloading the unpacked extension (opens real Chrome tabs):
 
 ```bash
 python3 test_client.py ping
 PYTHONDONTWRITEBYTECODE=1 ./verify_agent_actions_live.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
 ```
+
+`verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
 
 ## Troubleshooting
 
@@ -206,5 +220,6 @@ tail -f bridge_debug.log
 - TCP API is localhost-only and requires the shared token.
 - Payload bodies such as cookies and DOM are not logged by the host.
 - `executeScript` uses `chrome.scripting` in the page MAIN world and can be blocked by strict page CSP.
-- `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, and monitoring use `chrome.debugger`.
-- `host_permissions: <all_urls>`, cookie access, debugger access, and script execution are powerful. Use this profile for trusted automation only.
+- `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, monitoring, interception, geolocation, and performance metrics use `chrome.debugger`.
+- `downloads`, `contentSettings`, `host_permissions: <all_urls>`, cookie access, debugger access, and script execution are powerful. Use this profile for trusted automation only.
+- The bridge still intentionally lacks Playwright-style isolated browser contexts/profiles and multi-browser support; it controls the real Chrome profile.
