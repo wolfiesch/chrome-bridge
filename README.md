@@ -239,6 +239,47 @@ This runs the same framing/auth/large-payload parity checks (ping/pong, 500KB ro
 
 The Rust host honors the same env vars: `BRIDGE_PORT` (default 9223), `BRIDGE_TOKEN_FILE`, `BRIDGE_LOG_FILE`.
 
+## MCP server
+
+`mcp/` exposes the bridge to MCP clients (Claude Desktop, Cursor, Cline) so an agent drives your real, logged-in Chrome profile through the standard Model Context Protocol. It is a pure client of the token-gated `127.0.0.1:9223` TCP API; the extension, wire protocol, and host are unchanged.
+
+The server reuses `test_client.py`'s transport verbatim, so the MCP tools and the CLI stay in lockstep.
+
+### Tools
+
+P1 ships a curated set plus a passthrough. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
+
+- `browser_list_tabs`
+- `browser_navigate`
+- `browser_snapshot` (accessibility snapshot)
+- `browser_extract_text`
+- `browser_screenshot` (returned inline as an image)
+- `browser_click`, `browser_type`, `browser_fill`
+- `browser_wait_for` (`mode`: `load|selector|text|url`)
+- `browser_tab_control` (`op`: `activate|close|reload|back|forward`)
+- `browser_action` — escape hatch for any raw bridge action (interception, geolocation, monitoring, console/network logs, `downloadUrl`, `storageState`, `executeScript`, `setViewport`, `handleDialog`, `batch`, ...)
+
+### Register
+
+Copy `mcp/claude_desktop_config.example.json` into your MCP client config and set the absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "chrome-bridge": {
+      "command": "uvx",
+      "args": ["--from", "/ABSOLUTE/PATH/TO/chrome-native-bridge/mcp", "chrome-bridge-mcp"],
+      "env": {
+        "BRIDGE_REPO_ROOT": "/ABSOLUTE/PATH/TO/chrome-native-bridge",
+        "BRIDGE_PORT": "9223"
+      }
+    }
+  }
+}
+```
+
+The server honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, and `BRIDGE_CONNECT_TIMEOUT_SECONDS`, and reads the same `bridge_token.txt`. Chrome with the loaded extension must be running and the native host registered (`./setup.sh` or `./setup-rs.sh`).
+
 ## Benchmarking against other browser automation surfaces
 
 The benchmark harness measures speed for the selected adapter. `chrome-bridge`, `playwright`, and `puppeteer` are live-measurable; Claude in Chrome, Codex Chrome extension, and Chrome DevTools MCP remain static capability metadata until adapters exist. The report also emits a normalized scorecard and gap tickets.
