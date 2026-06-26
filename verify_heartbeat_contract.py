@@ -25,11 +25,14 @@ def fail(message):
     failed = True
     print("FAIL:", message)
 
-# Manifest must grant alarms for the reconnect heartbeat.
+# Manifest must grant alarms for the reconnect heartbeat and storage for the
+# durable (suspension-surviving) reconnect backoff state.
 for path in MANIFESTS:
     data = json.load(open(path))
     if "alarms" not in data.get("permissions", []):
         fail(f"{path} missing alarms permission")
+    if "storage" not in data.get("permissions", []):
+        fail(f"{path} missing storage permission")
 
 # Background must install an alarm listener, send native keepalive traffic, and
 # keep persistent debugger monitors compatible with one-shot debugger commands.
@@ -43,6 +46,9 @@ for path in BACKGROUNDS:
         "chrome.debugger.onEvent.addListener",
         "Network.requestWillBeSent",
         "Runtime.consoleAPICalled",
+        "RECONNECT_ALARM",
+        "scheduleReconnect",
+        "chrome.storage",
     ]:
         if needle not in text:
             fail(f"{path} missing {needle}")

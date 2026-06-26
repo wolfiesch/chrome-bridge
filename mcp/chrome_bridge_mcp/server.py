@@ -7,6 +7,7 @@ which scopes the exposed surface from ``readonly``/``allow_sensitive`` flags
 and applies ``readOnly``/``destructive`` annotations. Every tab-scoped tool
 takes an optional ``tab_id``; when omitted the active tab is used.
 """
+import functools
 import json
 import os
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent, ToolAnnotations
 
+from .identity import LeaseManager, provision_identity
 from .transport import BridgeError, call, resolve_tab_id
 
 _PNG_PREFIX = "data:image/png;base64,"
@@ -293,12 +295,80 @@ _TOOLS = [
 ]
 
 
-def build_server(readonly=None, allow_sensitive=None) -> FastMCP:
+# Lease/release/status tools must never trigger auto-lease (avoid recursion).
+_LEASE_TOOLS = (browser_lease, browser_release, browser_lease_status)
+
+# Set in main() when running for real; build_server wraps mutating tools to
+# call ensure() on this manager when auto_lease is enabled.
+_lease_manager = None
+
+
+def _with_lease(func, manager):
+    """Wrap ``func`` so it acquires/renews the lease before its bridge action.
+
+    ``functools.wraps`` keeps the name, docstring, signature, and annotations
+    intact so FastMCP introspection sees the original function via __wrapped__.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        manager.ensure()
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def _with_lease_sync(func, manager):
+    """Wrap a manual lease/release tool so the auto-lease manager's local state
+    stays coherent: after the tool talks to the host directly, forget the
+    cached lease so the next mutating call reacquires instead of trusting stale
+    state. ``functools.wraps`` preserves FastMCP-introspected metadata.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        finally:
+            manager.invalidate()
+
+    return wrapper
+
+
+_LEASE_VERBS = ("lease", "release", "leaseStatus")
+
+
+def _with_lease_raw(func, manager):
+    """Wrap the raw ``browser_action`` escape hatch for auto-lease mode.
+
+    Acquires/renews the lease before the call (like any mutating tool), but with
+    two exceptions for raw lease verbs:
+    - ``leaseStatus`` is read-only: do NOT ``ensure()`` (a status check must not
+      acquire the lease and report itself as owner) and do NOT invalidate.
+    - ``lease``/``release`` hit the host directly, so forget the cached lease
+      afterward, keeping the manager from running a later mutating call on a
+      lease the agent already changed out from under it.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        raw_action = kwargs.get("action", args[0] if args else None)
+        if raw_action != "leaseStatus":
+            manager.ensure()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if raw_action in ("lease", "release"):
+                manager.invalidate()
+
+    return wrapper
+
+
+def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastMCP:
     """Assemble a ``FastMCP`` server scoped by ``readonly``/``allow_sensitive``.
 
     Each flag falls back to its env var (``BRIDGE_MCP_READONLY`` /
     ``BRIDGE_MCP_ALLOW_SENSITIVE``) parsed with ``_truthy``. Mutating tools are
-    dropped in read-only mode; sensitive tools require ``allow_sensitive``.
+    dropped in read-only mode; sensitive tools require ``allow_sensitive``. When
+    ``auto_lease`` is True, every mutating tool (except the lease tools) is
+    wrapped to call ``_lease_manager.ensure()`` before its bridge action.
     """
     if readonly is None:
         readonly = _truthy(os.environ.get("BRIDGE_MCP_READONLY", ""))
@@ -312,9 +382,19 @@ def build_server(readonly=None, allow_sensitive=None) -> FastMCP:
             continue
         if sensitive and not allow_sensitive:
             continue
+        tool_func = func
+        if auto_lease and _lease_manager is not None:
+            if func in (browser_lease, browser_release):
+                # Manual lease ops hit the host directly; keep manager state coherent.
+                tool_func = _with_lease_sync(func, _lease_manager)
+            elif func is browser_action:
+                # Raw escape hatch: ensure first, but resync if the raw verb is a lease op.
+                tool_func = _with_lease_raw(func, _lease_manager)
+            elif mutating and func not in _LEASE_TOOLS:
+                tool_func = _with_lease(func, _lease_manager)
         m.tool(annotations=ToolAnnotations(
             readOnlyHint=not mutating, destructiveHint=mutating
-        ))(func)
+        ))(tool_func)
 
     @m.resource("browser://tabs")
     def tabs_resource() -> str:
@@ -330,11 +410,28 @@ def build_server(readonly=None, allow_sensitive=None) -> FastMCP:
 
 
 def main() -> None:
+    global _lease_manager
+
+    auto_identity = _truthy(os.environ.get("BRIDGE_MCP_AUTO_IDENTITY", "1"))
+    auto_lease = False
+    if auto_identity:
+        repo_root = os.environ.get(
+            "BRIDGE_REPO_ROOT",
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+        )
+        _lease_manager = LeaseManager(call)
+        # Single shutdown path: provision runs _lease_manager.release() at the
+        # start of cleanup (before the token is removed) for BOTH atexit and
+        # signal-driven exits, so the lease is always released before its token
+        # disappears. No separate atexit registration (that diverged on signals).
+        identity = provision_identity(repo_root, on_shutdown=_lease_manager.release)
+        auto_lease = True
+
     transport = os.environ.get("BRIDGE_MCP_TRANSPORT", "stdio")
     if transport == "http":
         host = os.environ.get("BRIDGE_MCP_HTTP_HOST", "127.0.0.1")
         port = os.environ.get("BRIDGE_MCP_HTTP_PORT", "8723")
-        m = build_server()
+        m = build_server(auto_lease=auto_lease)
         try:
             m.settings.host = host
             m.settings.port = int(port)
@@ -342,7 +439,7 @@ def main() -> None:
             pass
         m.run(transport="streamable-http")
     else:
-        build_server().run()
+        build_server(auto_lease=auto_lease).run()
 
 
 if __name__ == "__main__":

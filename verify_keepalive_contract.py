@@ -47,17 +47,18 @@ def recv_line(sock, buf):
     return line, buf
 
 
-def main():
+def run_against(label, cmd, port):
+    print(f"\n=== host: {label} ===")
     token_file = "/tmp/chrome-bridge-keepalive-token.txt"
     with open(token_file, "w") as f:
         f.write(TOKEN + "\n")
     env = os.environ.copy()
-    env["BRIDGE_PORT"] = str(PORT)
+    env["BRIDGE_PORT"] = str(port)
     env["BRIDGE_TOKEN_FILE"] = token_file
-    env["BRIDGE_LOG_FILE"] = "/tmp/chrome-bridge-keepalive.log"
+    env["BRIDGE_LOG_FILE"] = f"/tmp/chrome-bridge-keepalive-{label}.log"
 
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(SCRIPT_DIR, "bridge.py")],
+        cmd,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
     )
     threading.Thread(target=mock_extension, args=(proc,), daemon=True).start()
@@ -68,53 +69,83 @@ def main():
     def expect(cond, msg):
         if not cond:
             failures.append(msg)
-            print(f"FAIL: {msg}")
+            print(f"FAIL: {label}: {msg}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)
-    sock.connect(("127.0.0.1", PORT))
+    sock.connect(("127.0.0.1", port))
     buf = b""
 
-    # Case 1: two sequential requests on the SAME socket.
-    for action in ("ping", "getTabs"):
-        sock.sendall((json.dumps({"action": action, "payload": {}, "token": TOKEN}) + "\n").encode())
+    try:
+        # Case 1: two sequential requests on the SAME socket.
+        for action in ("ping", "getTabs"):
+            sock.sendall((json.dumps({"action": action, "payload": {}, "token": TOKEN}) + "\n").encode())
+            line, buf = recv_line(sock, buf)
+            expect(line is not None, f"no response for {action} on persistent socket")
+            if line:
+                resp = json.loads(line.decode())
+                expect(resp.get("success") is True and resp["result"]["echo"] == action,
+                       f"wrong/again response for {action}: {resp}")
+
+        # Case 2: two requests COALESCED into one send() (newline-delimited).
+        coalesced = (
+            json.dumps({"action": "navigate", "payload": {}, "token": TOKEN}) + "\n" +
+            json.dumps({"action": "click", "payload": {}, "token": TOKEN}) + "\n"
+        ).encode()
+        sock.sendall(coalesced)
+        for action in ("navigate", "click"):
+            line, buf = recv_line(sock, buf)
+            expect(line is not None, f"no response for coalesced {action}")
+            if line:
+                resp = json.loads(line.decode())
+                expect(resp["result"]["echo"] == action, f"coalesced ordering wrong for {action}: {resp}")
+
+        # Case 3: bad token on the persistent socket is rejected.
+        sock.sendall((json.dumps({"action": "ping", "payload": {}, "token": "WRONG"}) + "\n").encode())
         line, buf = recv_line(sock, buf)
-        expect(line is not None, f"no response for {action} on persistent socket")
+        expect(line is not None, "bad token: no response on persistent socket (expected unauthorized error)")
         if line:
             resp = json.loads(line.decode())
-            expect(resp.get("success") is True and resp["result"]["echo"] == action,
-                   f"wrong/again response for {action}: {resp}")
+            expect(resp.get("success") is False and resp.get("error") == "unauthorized",
+                   "bad token not rejected on persistent socket")
+    finally:
+        sock.close()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
-    # Case 2: two requests COALESCED into one send() (newline-delimited).
-    coalesced = (
-        json.dumps({"action": "navigate", "payload": {}, "token": TOKEN}) + "\n" +
-        json.dumps({"action": "click", "payload": {}, "token": TOKEN}) + "\n"
-    ).encode()
-    sock.sendall(coalesced)
-    for action in ("navigate", "click"):
-        line, buf = recv_line(sock, buf)
-        expect(line is not None, f"no response for coalesced {action}")
-        if line:
-            resp = json.loads(line.decode())
-            expect(resp["result"]["echo"] == action, f"coalesced ordering wrong for {action}: {resp}")
+    if not failures:
+        print(f"OK: {label} keep-alive contract holds")
+    return failures
 
-    # Case 3: bad token on the persistent socket is rejected.
-    sock.sendall((json.dumps({"action": "ping", "payload": {}, "token": "WRONG"}) + "\n").encode())
-    line, buf = recv_line(sock, buf)
-    expect(line is not None, "bad token: no response on persistent socket (expected unauthorized error)")
-    if line:
-        resp = json.loads(line.decode())
-        expect(resp.get("success") is False and resp.get("error") == "unauthorized",
-               "bad token not rejected on persistent socket")
-    sock.close()
 
-    proc.terminate()
-    proc.wait()
+def resolve_rust_bin():
+    rust_bin = os.path.join(SCRIPT_DIR, "host-rs", "target", "release", "bridge-host")
+    try:
+        meta = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps",
+             "--manifest-path", os.path.join(SCRIPT_DIR, "host-rs", "Cargo.toml")]))
+        rust_bin = os.path.join(meta["target_directory"], "release", "bridge-host")
+    except Exception:
+        pass
+    return rust_bin
+
+
+def main():
+    failures = run_against("python", [sys.executable, os.path.join(SCRIPT_DIR, "bridge.py")], PORT)
+
+    rust_bin = resolve_rust_bin()
+    if os.path.exists(rust_bin):
+        failures += run_against("rust", [rust_bin], PORT + 1)
+    else:
+        print("\n(skipping rust host: binary not built)")
 
     if failures:
         print(f"\n{len(failures)} keep-alive failure(s).")
         sys.exit(1)
-    print("Keep-alive contract OK")
+    print("\nKeep-alive contract OK (both hosts)")
 
 
 if __name__ == "__main__":
