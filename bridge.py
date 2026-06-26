@@ -220,9 +220,19 @@ def handle_socket_client(client_socket):
                 pending_requests[req_id] = response_queue
 
             # Send to extension, then block this connection until its response.
+            # Most actions resolve well within SOCKET_IDLE_TIMEOUT, but waits and
+            # human-handoff carry a payload timeoutMs that can exceed it; cover
+            # that window (plus headroom) so the host does not time out before
+            # the extension legitimately finishes.
+            resp_timeout = SOCKET_IDLE_TIMEOUT
+            payload = cmd.get("payload")
+            if isinstance(payload, dict):
+                req_timeout_ms = payload.get("timeoutMs")
+                if isinstance(req_timeout_ms, (int, float)) and req_timeout_ms > 0:
+                    resp_timeout = max(SOCKET_IDLE_TIMEOUT, req_timeout_ms / 1000 + 30)
             write_message(cmd)
             try:
-                response = response_queue.get(timeout=SOCKET_IDLE_TIMEOUT)
+                response = response_queue.get(timeout=resp_timeout)
             except queue.Empty:
                 logging.error(f"Timed out waiting for extension response to {req_id}.")
                 with requests_lock:

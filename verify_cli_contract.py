@@ -104,6 +104,57 @@ if proc.returncode != 2 or "Upload file not found:" not in proc.stderr:
     if proc.stderr:
         print("stderr:", proc.stderr.strip())
 
+# Offline dispatch assertions: import the client module and monkeypatch
+# send_command_data so we can observe the exact action/payload/read_timeout_ms
+# produced by main() without needing a live bridge.
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location("test_client", CLIENT)
+test_client = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(test_client)
+
+captured = {}
+
+def _fake_send_command_data(action, payload=None, read_timeout_ms=None):
+    captured["action"] = action
+    captured["payload"] = payload
+    captured["read_timeout_ms"] = read_timeout_ms
+    # Mimic a successful response so send_command returns exit code 0.
+    return 0, {"success": True}, ""
+
+test_client.send_command_data = _fake_send_command_data
+
+def dispatch(argv):
+    captured.clear()
+    saved_argv = sys.argv
+    sys.argv = [CLIENT, *argv]
+    try:
+        test_client.main()
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = saved_argv
+    return dict(captured)
+
+def check(name, got, expected):
+    global failed
+    if got != expected:
+        failed = True
+        print(f"FAIL {name}: expected {expected}, got {got}")
+
+result = dispatch(["sessionStatus", "a.com", "b.com"])
+check("sessionStatus action", result.get("action"), "sessionStatus")
+check("sessionStatus payload", result.get("payload"), {"domains": ["a.com", "b.com"]})
+
+result = dispatch(["waitForHandoff", "please log in", "selector", "#ok", "60000"])
+check("waitForHandoff action", result.get("action"), "waitForHandoff")
+check(
+    "waitForHandoff payload",
+    result.get("payload"),
+    {"message": "please log in", "until": {"mode": "selector", "selector": "#ok"}, "timeoutMs": 60000},
+)
+check("waitForHandoff read_timeout_ms", result.get("read_timeout_ms"), 60000)
+
 if failed:
     sys.exit(1)
 print("CLI contract OK")

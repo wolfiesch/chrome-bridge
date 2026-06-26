@@ -268,6 +268,45 @@ def browser_lease_status() -> str:
     return _text(call("leaseStatus", {}))
 
 
+def browser_session_status(domains: list) -> str:
+    """REDACTED auth/session probe over the REAL logged-in profile.
+
+    For each domain in ``domains``, reports cookie names and counts and a
+    ``loggedIn`` boolean. NEVER returns cookie values: this surfaces whether the
+    real profile is authenticated to a site without leaking the credentials.
+    """
+    return _text(call("sessionStatus", {"domains": domains}))
+
+
+def browser_wait_for_handoff(
+    message: str,
+    mode: str = "manual",
+    selector: Optional[str] = None,
+    url_substring: Optional[str] = None,
+    text: Optional[str] = None,
+    timeout_ms: int = 120000,
+    tab_id: Optional[int] = None,
+) -> str:
+    """Pause automation and hand control to the human.
+
+    Focuses the real tab and shows ``message``, then blocks until the human
+    finishes an interactive step (login/2FA/captcha) and the page reaches the
+    expected state described by ``mode`` (with ``selector``/``url_substring``/
+    ``text`` as appropriate), after which automation resumes.
+    """
+    until = {"mode": mode}
+    if selector is not None:
+        until["selector"] = selector
+    if url_substring is not None:
+        until["urlSubstring"] = url_substring
+    if text is not None:
+        until["text"] = text
+    payload = {"message": message, "until": until, "timeoutMs": timeout_ms}
+    if tab_id is not None:
+        payload["tabId"] = tab_id
+    return _text(call("waitForHandoff", payload, read_timeout_ms=timeout_ms))
+
+
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
     (browser_list_tabs, False, False),
@@ -277,6 +316,7 @@ _TOOLS = [
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
     (browser_get_cookies, False, True),
+    (browser_session_status, False, True),
     (browser_navigate, True, False),
     (browser_click, True, False),
     (browser_type, True, False),
@@ -288,6 +328,7 @@ _TOOLS = [
     (browser_select, True, False),
     (browser_upload_file, True, False),
     (browser_tab_control, True, False),
+    (browser_wait_for_handoff, True, False),
     (browser_action, True, True),
     (browser_lease, True, False),
     (browser_release, True, False),
@@ -361,6 +402,31 @@ def _with_lease_raw(func, manager):
     return wrapper
 
 
+def _with_lease_handoff(func, manager):
+    """Wrap ``browser_wait_for_handoff`` so the lease covers the whole wait.
+
+    A handoff can run far longer than the default lease TTL; ensure with
+    ``min_remaining_ms`` equal to the requested ``timeout_ms`` (defaulting to
+    the tool's own default) so the lease cannot expire mid-handoff and let
+    another agent mutate the real profile while the human is acting.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # timeout_ms is the 6th parameter (index 5): message, mode, selector,
+        # url_substring, text, timeout_ms. Callers may pass it positionally or
+        # by keyword; fall back to the tool's declared default otherwise.
+        if len(args) > 5:
+            timeout_ms = args[5]
+        elif "timeout_ms" in kwargs:
+            timeout_ms = kwargs["timeout_ms"]
+        else:
+            timeout_ms = 120000
+        manager.ensure(min_remaining_ms=int(timeout_ms))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
 def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastMCP:
     """Assemble a ``FastMCP`` server scoped by ``readonly``/``allow_sensitive``.
 
@@ -390,6 +456,9 @@ def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastM
             elif func is browser_action:
                 # Raw escape hatch: ensure first, but resync if the raw verb is a lease op.
                 tool_func = _with_lease_raw(func, _lease_manager)
+            elif func is browser_wait_for_handoff:
+                # Long human handoff: hold the lease for the whole wait window.
+                tool_func = _with_lease_handoff(func, _lease_manager)
             elif mutating and func not in _LEASE_TOOLS:
                 tool_func = _with_lease(func, _lease_manager)
         m.tool(annotations=ToolAnnotations(

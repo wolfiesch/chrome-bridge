@@ -40,14 +40,17 @@ class BridgeError(Exception):
     """Raised when the bridge transport or the extension reports a failure."""
 
 
-def call(action, payload=None):
+def call(action, payload=None, read_timeout_ms=None):
     """Send one action to the bridge and return its ``result`` payload.
 
     Raises ``BridgeError`` with an actionable message on transport failures,
-    auth rejection, or an unsuccessful extension result.
+    auth rejection, or an unsuccessful extension result. ``read_timeout_ms``
+    extends the post-connect socket read deadline for long waits (e.g. human
+    handoff); the wire timeout is kept above it so transport never fires first.
     """
     with _call_lock:
-        exit_code, response, stderr = _client.send_command_data(action, payload or {})
+        exit_code, response, stderr = _client.send_command_data(
+            action, payload or {}, read_timeout_ms=read_timeout_ms)
 
     if response is None:
         raise BridgeError(stderr or "No response from bridge.")

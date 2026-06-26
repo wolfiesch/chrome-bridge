@@ -198,27 +198,39 @@ class LeaseManager:
     def _now_ms():
         return int(time.time() * 1000)
 
-    def ensure(self):
+    def ensure(self, min_remaining_ms=0):
         """Acquire or renew the lease if needed.
+
+        ``min_remaining_ms`` guarantees the lease will stay valid for at least
+        that long after this call; when the current lease would expire sooner
+        (e.g. a long human handoff outlasting the default TTL), it reacquires
+        with a TTL of ``min_remaining_ms`` plus headroom so another agent cannot
+        mutate the profile mid-wait.
 
         Raises ``BridgeError`` (propagated from ``call``) when the lease is held
         by another agent, so the caller can back off.
         """
         with self._lock:
             now = self._now_ms()
+            ttl = self._ttl_ms
+            if min_remaining_ms > 0:
+                # Cover the requested window with 30s of headroom.
+                ttl = max(ttl, int(min_remaining_ms) + 30000)
             if self._expires_at is not None and self._acquired_at is not None:
                 elapsed = now - self._acquired_at
                 span = self._expires_at - self._acquired_at
-                # Renew only past the renew window; otherwise the lease stands.
-                if span > 0 and elapsed < span * self._renew_fraction:
+                covers = self._expires_at - now >= min_remaining_ms
+                # Renew only past the renew window; otherwise the lease stands --
+                # but only if it still covers the requested remaining window.
+                if span > 0 and elapsed < span * self._renew_fraction and covers:
                     return
-            result = self._call("lease", {"ttlMs": self._ttl_ms})
+            result = self._call("lease", {"ttlMs": ttl})
             self._acquired_at = self._now_ms()
             expires = None
             if isinstance(result, dict):
                 expires = result.get("expiresAt")
             self._expires_at = expires if expires is not None else (
-                self._acquired_at + self._ttl_ms
+                self._acquired_at + ttl
             )
 
     def release(self):

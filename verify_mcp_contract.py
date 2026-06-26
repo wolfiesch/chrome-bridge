@@ -294,6 +294,50 @@ def main():
         recent = [a for a, _ in received[-3:]]
     expect("getTabs" not in recent, "lease tools must not resolve a tab")
 
+    # 19c. session_status -> sessionStatus with domains list.
+    server.browser_session_status(["a.test", "b.test"])
+    expect(last_request() == ("sessionStatus", {"domains": ["a.test", "b.test"]}),
+           "session_status payload mismatch")
+
+    # 19d. wait_for_handoff -> waitForHandoff with until payload, and the call
+    #      must pass read_timeout_ms=timeout_ms so the wire outlasts the human.
+    captured_kwargs = {}
+    real_call = server.call
+
+    def _capture_call(action, payload=None, read_timeout_ms=None):
+        captured_kwargs["read_timeout_ms"] = read_timeout_ms
+        return real_call(action, payload, read_timeout_ms=read_timeout_ms)
+
+    server.call = _capture_call
+    try:
+        server.browser_wait_for_handoff(
+            "log in please", mode="selector", selector="#done",
+            timeout_ms=30000, tab_id=11,
+        )
+    finally:
+        server.call = real_call
+    expect(last_request() == ("waitForHandoff", {
+        "message": "log in please",
+        "until": {"mode": "selector", "selector": "#done"},
+        "timeoutMs": 30000,
+        "tabId": 11,
+    }), "wait_for_handoff payload mismatch")
+    expect(captured_kwargs.get("read_timeout_ms") == 30000,
+           "wait_for_handoff must pass read_timeout_ms=timeout_ms to call()")
+
+    # 19e. session_status is sensitive: hidden by default, present with allow_sensitive.
+    expect("browser_session_status" not in _tool_names(server.build_server()),
+           "session_status must be hidden by default (sensitive)")
+    expect("browser_session_status" in _tool_names(server.build_server(allow_sensitive=True)),
+           "session_status should be exposed under allow_sensitive")
+
+    # 19f. wait_for_handoff is mutating non-sensitive: present in a normal build,
+    #      hidden under readonly.
+    expect("browser_wait_for_handoff" in _tool_names(server.build_server()),
+           "wait_for_handoff should be present in a normal build")
+    expect("browser_wait_for_handoff" not in _tool_names(server.build_server(readonly=True)),
+           "wait_for_handoff must be hidden under readonly")
+
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):
         raise _Unauthorized()

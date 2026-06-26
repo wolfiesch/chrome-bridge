@@ -405,6 +405,12 @@ async function dispatchAction(action, payload) {
       case "performanceMetrics":
         result = await performanceMetrics(payload.tabId);
         break;
+      case "sessionStatus":
+        result = await sessionStatus(payload.domains);
+        break;
+      case "waitForHandoff":
+        result = await waitForHandoff(payload);
+        break;
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
@@ -1157,6 +1163,134 @@ async function performanceMetrics(tabId) {
       await debuggerCommand(target, 'Performance.disable', {}).catch(() => {});
     }
   });
+}
+
+const SESSION_COOKIE_HINTS = ["session", "sess", "sid", "auth", "token", "login", "logged_in", "jwt", "remember"];
+
+async function sessionStatus(domains) {
+  if (!Array.isArray(domains) || domains.length === 0) return { sessions: [] };
+  const sessions = [];
+  for (const domain of domains) {
+    const cookies = await chrome.cookies.getAll({ domain });
+    const cookieNames = cookies.map((cookie) => cookie.name);
+    const hasSessionCookie = cookieNames.some((name) => {
+      const lower = name.toLowerCase();
+      return SESSION_COOKIE_HINTS.some((hint) => lower.includes(hint));
+    });
+    sessions.push({
+      domain,
+      cookieCount: cookies.length,
+      cookieNames,
+      hasSessionCookie,
+      loggedIn: hasSessionCookie
+    });
+  }
+  return { sessions };
+}
+
+async function handoffBodyLength(tabId) {
+  const res = await withDebugger(tabId, (target) => evaluateWithDebugger(target, "(document.body && document.body.innerText || '').length"));
+  return res.success ? res.val : -1;
+}
+
+async function handoffResult(tabId, mode, startedAt) {
+  const tab = await chrome.tabs.get(tabId);
+  const redacted = redactUrl(tab.url || "");
+  return {
+    success: true,
+    handedOff: true,
+    mode,
+    elapsedMs: Date.now() - startedAt,
+    tabId,
+    finalUrl: redacted.url,
+    finalUrlHasQuery: redacted.hasQuery,
+  };
+}
+
+async function showHandoffOverlay(tabId, message) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (msg) => {
+        const id = "__chrome_bridge_handoff__";
+        document.getElementById(id)?.remove();
+        const el = document.createElement("div");
+        el.id = id;
+        el.textContent = "\u270b Automation paused \u2014 " + String(msg || "please complete this step");
+        el.style.cssText = [
+          "position:fixed", "top:0", "left:0", "right:0", "z-index:2147483647",
+          "background:#1a73e8", "color:#fff", "font:600 14px system-ui,sans-serif",
+          "padding:10px 16px", "text-align:center", "box-shadow:0 2px 8px rgba(0,0,0,.3)",
+        ].join(";");
+        (document.body || document.documentElement).appendChild(el);
+      },
+      args: [message || ""],
+    });
+  } catch (_e) {
+    // Overlay is best-effort (blocked by strict CSP / unsupported pages); the
+    // handoff still proceeds without it.
+  }
+}
+
+async function hideHandoffOverlay(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => document.getElementById("__chrome_bridge_handoff__")?.remove(),
+    });
+  } catch (_e) {
+    // Best-effort cleanup.
+  }
+}
+
+async function waitForHandoff(payload) {
+  payload = payload || {};
+  const until = payload.until || {};
+  const mode = until.mode || "manual";
+  const timeoutMs = payload.timeoutMs || 120000;
+  let tabId = payload.tabId;
+  if (tabId === undefined || tabId === null) {
+    const active = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = active[0] && active[0].id;
+  }
+  if (tabId === undefined || tabId === null) {
+    return { success: false, err: "No target tab for handoff" };
+  }
+  const tab = await chrome.tabs.update(tabId, { active: true });
+  if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+  const startedAt = Date.now();
+  await showHandoffOverlay(tabId, payload.message);
+  const timeoutErr = { success: false, err: `handoff timeout after ${timeoutMs}ms (${mode})` };
+  const settle = async (found) => {
+    await hideHandoffOverlay(tabId);
+    return found ? await handoffResult(tabId, mode, startedAt) : timeoutErr;
+  };
+  if (mode === "selector") {
+    const found = await waitForSelector(tabId, until.selector, timeoutMs);
+    return await settle(found.success);
+  }
+  if (mode === "url") {
+    const found = await waitForUrl(tabId, until.urlSubstring, timeoutMs);
+    return await settle(found.success);
+  }
+  if (mode === "text") {
+    const found = await waitForText(tabId, until.text, timeoutMs);
+    return await settle(found.success);
+  }
+  const startUrl = (await chrome.tabs.get(tabId)).url || "";
+  const startLen = await handoffBodyLength(tabId);
+  const deadline = deadlineFrom(timeoutMs);
+  while (Date.now() <= deadline) {
+    await sleep(250);
+    const currentUrl = (await chrome.tabs.get(tabId)).url || "";
+    const currentLen = await handoffBodyLength(tabId);
+    if (currentUrl !== startUrl || currentLen !== startLen) {
+      return await settle(true);
+    }
+  }
+  return await settle(false);
 }
 
 connectToHost();

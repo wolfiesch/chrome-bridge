@@ -148,6 +148,19 @@ chrome-bridge performanceMetrics <tabId>
 
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
+### Real-profile moat: session probe and human handoff
+
+These two commands exploit what sets this bridge apart from Playwright/Puppeteer: it drives your **real, already-logged-in Chrome profile**, so existing sessions (cookies, SSO, passkeys) are ambient. Neither command ever reads, imports, or overwrites cookie values — they only observe and hand control to you.
+
+```bash
+chrome-bridge sessionStatus <domain> [<domain> ...]
+chrome-bridge waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]
+```
+
+`sessionStatus` is a **redacted auth probe**: for each domain it reports cookie count, cookie *names* (never values), whether a session/auth cookie is present, and a `loggedIn` boolean — enough to decide "is this profile already signed in to X?" without exposing secrets. Treat its output as sensitive: cookie names plus logged-in status can reveal which accounts and sites the profile uses.
+
+`waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, shows an in-page banner with your `message`, and blocks until the page reaches an expected state, then resumes the agent. Use it for interactive steps an agent should not perform — login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting.
+
 ## Raw-output safety
 
 These commands can reveal private browsing context:
@@ -190,6 +203,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
 python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_agent_actions_live.py verify_capability_matrix.py
 node --check background.js
@@ -261,6 +275,7 @@ Read-only:
 Sensitive:
 
 - `browser_get_cookies`
+- `browser_session_status` — redacted auth/session probe (cookie names/counts + `loggedIn` per domain, never values)
 
 Mutating:
 
@@ -270,6 +285,7 @@ Mutating:
 - `browser_select`
 - `browser_upload_file` (validates local paths before contacting Chrome)
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
+- `browser_wait_for_handoff` — pause automation, focus the real tab with an on-page banner, and wait for a human to finish login/2FA/captcha before resuming
 
 Escape hatch (sensitive):
 
@@ -285,7 +301,7 @@ Escape hatch (sensitive):
 The server reads two env flags to scope the exposed surface:
 
 - `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, and `browser_action`.
-- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies` and the `browser_action` escape hatch), which are hidden by default.
+- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, and the `browser_action` escape hatch), which are hidden by default.
 
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately.
 
@@ -426,4 +442,5 @@ tail -f bridge_debug.log
 - `executeScript` uses `chrome.scripting` in the page MAIN world and can be blocked by strict page CSP.
 - `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, monitoring, interception, geolocation, and performance metrics use `chrome.debugger`.
 - `downloads`, `contentSettings`, `host_permissions: <all_urls>`, cookie access, debugger access, and script execution are powerful. Use this profile for trusted automation only.
-- The bridge still intentionally lacks Playwright-style isolated browser contexts/profiles and multi-browser support; it controls the real Chrome profile.
+- `sessionStatus` reports cookie names and counts only, never cookie values; `waitForHandoff` only focuses a tab, shows a banner, and waits — neither reads, imports, nor overwrites cookies. Operating on the real profile is the bridge's design, not a leak, but `sessionStatus` output (which sites/accounts are logged in) is itself sensitive — keep it out of transcripts.
+- The bridge still intentionally lacks Playwright-style isolated browser contexts/profiles and multi-browser support; it controls the real Chrome profile. That ambient real-profile session is the point: it is what lets an agent reuse your existing logins and hand off to you for steps it should not do itself.

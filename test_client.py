@@ -56,9 +56,18 @@ def expand_output_path(path):
     return os.path.abspath(os.path.expanduser(path))
 
 
-def send_command_data(action, payload=None):
+def send_command_data(action, payload=None, read_timeout_ms=None):
     if payload is None:
         payload = {}
+
+    # Any action carrying a payload ``timeoutMs`` (waits, human handoff) may run
+    # longer than the default 15s socket read; derive the read timeout from it
+    # unless the caller passed one explicitly, mirroring the host-side per-request
+    # timeout so no layer times out before the extension legitimately finishes.
+    if read_timeout_ms is None and isinstance(payload, dict):
+        pt = payload.get("timeoutMs")
+        if isinstance(pt, (int, float)) and pt > 0:
+            read_timeout_ms = pt
 
     token = load_token()
     if not token:
@@ -75,6 +84,11 @@ def send_command_data(action, payload=None):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(15)
                 sock.connect(('127.0.0.1', port))
+                # Connect uses a short timeout; the post-connect read can be much
+                # longer (e.g. human-handoff waits), with headroom over the
+                # extension-side deadline so the wire never times out first.
+                if read_timeout_ms is not None:
+                    sock.settimeout(max(15, read_timeout_ms / 1000 + 10))
                 break
             except ConnectionRefusedError:
                 try:
@@ -126,8 +140,8 @@ def send_command_data(action, payload=None):
                 pass
 
 
-def send_command(action, payload=None):
-    exit_code, response, stderr = send_command_data(action, payload)
+def send_command(action, payload=None, read_timeout_ms=None):
+    exit_code, response, stderr = send_command_data(action, payload, read_timeout_ms)
     if response is not None:
         print(json.dumps(response, indent=2))
     if stderr:
@@ -271,6 +285,8 @@ def print_usage():
     print("  python3 test_client.py stopInterception <tabId>")
     print("  python3 test_client.py interceptedRequests <tabId>")
     print("  python3 test_client.py performanceMetrics <tabId>")
+    print("  python3 test_client.py sessionStatus <domain> [<domain> ...]")
+    print("  python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
 
 def main():
     if len(sys.argv) < 2:
@@ -431,6 +447,26 @@ def main():
         if len(args) > 3:
             payload["tabId"] = parse_int(args[3], "tabId")
         sys.exit(send_command("batch", payload))
+    elif action == "sessionStatus":
+        require_args(args, 3, "Usage: python3 test_client.py sessionStatus <domain> [<domain> ...]")
+        sys.exit(send_command("sessionStatus", {"domains": list(args[2:])}))
+    elif action == "waitForHandoff":
+        require_args(args, 3, "Usage: python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
+        message = args[2]
+        mode = args[3] if len(args) > 3 else "manual"
+        target = args[4] if len(args) > 4 else None
+        timeoutMs = parse_int(args[5], "timeoutMs") if len(args) > 5 else 120000
+        until = {"mode": mode}
+        if mode == "selector" and target is not None:
+            until["selector"] = target
+        elif mode == "url" and target is not None:
+            until["urlSubstring"] = target
+        elif mode == "text" and target is not None:
+            until["text"] = target
+        payload = {"message": message, "until": until, "timeoutMs": timeoutMs}
+        if len(args) > 6:
+            payload["tabId"] = parse_int(args[6], "tabId")
+        sys.exit(send_command("waitForHandoff", payload, read_timeout_ms=timeoutMs))
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(64)

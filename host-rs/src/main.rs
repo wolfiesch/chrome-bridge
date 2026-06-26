@@ -460,8 +460,18 @@ fn handle_socket_client(
         }
 
         // Send to extension, then block this connection until its response.
+        // Waits and human-handoff carry a payload timeoutMs that may exceed the
+        // idle timeout; cover that window (plus headroom) so the host does not
+        // give up before the extension legitimately finishes.
+        let resp_timeout = payload
+            .as_ref()
+            .and_then(|p| p.get("timeoutMs"))
+            .and_then(|t| t.as_f64())
+            .filter(|ms| *ms > 0.0)
+            .map(|ms| idle.max(Duration::from_millis(ms as u64 + 30000)))
+            .unwrap_or(idle);
         write_message(stdout, logger, &cmd);
-        match rx.recv_timeout(idle) {
+        match rx.recv_timeout(resp_timeout) {
             Ok(response) => {
                 if write_line(&mut stream, &response).is_err() {
                     return;
