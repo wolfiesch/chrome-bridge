@@ -1,0 +1,13 @@
+[package]
+name = "chrome-bridge-host"
+edition = "2021"
+version = "0.1.0"
+
+[[bin]]
+name = "bridge-host"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"

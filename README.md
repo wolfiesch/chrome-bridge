@@ -207,6 +207,38 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
 
 `verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
 
+## Rust host (parity port)
+
+`host-rs/` is a behavior-identical Rust port of `bridge.py` (same MV3 extension, same native-messaging framing, same token-gated `127.0.0.1:9223` TCP API). The Python host remains the reference; the Rust host is a drop-in replacement for the native-host process only.
+
+### Build
+
+```bash
+cargo build --release --manifest-path host-rs/Cargo.toml
+```
+
+Produces `host-rs/target/release/bridge-host`.
+
+### Register
+
+```bash
+./setup-rs.sh <extension-id>
+```
+
+Registers the Rust binary as the native host. It reuses the same `bridge_token.txt` and the same `com.automation.bridge` host name, so the unchanged extension talks to it transparently. Only one host (Python or Rust) can own the `com.automation.bridge` registration / port `9223` at a time.
+
+### Verify
+
+Build first, then run the parity checks:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
+```
+
+This runs the same framing/auth/large-payload parity checks (ping/pong, 500KB round-trip, invalid-token rejection) against the Rust host on port `9225`.
+
+The Rust host honors the same env vars: `BRIDGE_PORT` (default 9223), `BRIDGE_TOKEN_FILE`, `BRIDGE_LOG_FILE`.
+
 ## Benchmarking against other browser automation surfaces
 
 The benchmark harness measures speed for the selected adapter. `chrome-bridge`, `playwright`, and `puppeteer` are live-measurable; Claude in Chrome, Codex Chrome extension, and Chrome DevTools MCP remain static capability metadata until adapters exist. The report also emits a normalized scorecard and gap tickets.
