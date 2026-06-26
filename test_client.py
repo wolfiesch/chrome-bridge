@@ -420,6 +420,17 @@ def main():
     elif action in {"stopInterception", "interceptedRequests", "performanceMetrics"}:
         require_args(args, 3, f"Usage: python3 test_client.py {action} <tabId>")
         sys.exit(send_command(action, {"tabId": parse_int(args[2], "tabId")}))
+    elif action == "batch":
+        require_args(args, 3, "Usage: python3 test_client.py batch <stepsJson> [tabId]")
+        try:
+            steps = json.loads(args[2])
+        except Exception as exc:
+            print(f"Invalid steps JSON: {exc}", file=sys.stderr)
+            sys.exit(2)
+        payload = {"steps": steps}
+        if len(args) > 3:
+            payload["tabId"] = parse_int(args[3], "tabId")
+        sys.exit(send_command("batch", payload))
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(64)

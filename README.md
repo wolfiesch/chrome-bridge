@@ -17,9 +17,11 @@ chrome-native-bridge/
 ├── com.automation.bridge.json.template <- host-manifest template (setup.sh fills it in)
 ├── setup.sh                            <- generates token, renders + registers host manifest
 ├── test_client.py                      <- CLI client
+├── benchmark_harness.py                <- benchmark and comparison harness
 ├── verify_bridge.py                    <- offline framing/auth test
 ├── verify_cli_contract.py              <- offline CLI dispatch test
 ├── verify_heartbeat_contract.py        <- offline heartbeat/structure test
+├── verify_benchmark_harness.py         <- offline benchmark contract test
 ├── verify_agent_actions_live.py        <- manual live browser gate
 └── README.md
 ```
@@ -187,7 +189,9 @@ Offline checks (no browser needed), run from the repo root:
 PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_agent_actions_live.py verify_capability_matrix.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
+python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_agent_actions_live.py verify_capability_matrix.py
 node --check background.js
 diff -q manifest.json extension/manifest.json
 diff -q background.js extension/background.js
@@ -202,6 +206,75 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
 ```
 
 `verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
+
+## Benchmarking against other browser automation surfaces
+
+The benchmark harness measures speed for the selected adapter. `chrome-bridge`, `playwright`, and `puppeteer` are live-measurable; Claude in Chrome, Codex Chrome extension, and Chrome DevTools MCP remain static capability metadata until adapters exist. The report also emits a normalized scorecard and gap tickets.
+
+Run the offline contract adapter:
+
+```bash
+python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
+```
+
+Run measured adapters:
+
+```bash
+python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --output /tmp/chrome-bridge-results.json
+python3 benchmark_harness.py run --adapter playwright --iterations 5 --output /tmp/playwright-results.json
+python3 benchmark_harness.py run --adapter puppeteer --iterations 5 --output /tmp/puppeteer-results.json
+```
+
+`chrome-bridge`, `playwright`, and `puppeteer` start a local HTTP fixture by default. To benchmark another page, pass `--base-url`:
+
+```bash
+python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --base-url http://127.0.0.1:PORT/ --output /tmp/results.json
+```
+
+Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks.
+
+Generate the Markdown report:
+
+```bash
+python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md
+```
+
+### Batched bridge actions
+
+Multi-step Chrome Bridge operations (console/network monitoring, dialog handling) use a composite `batch` action so several sub-commands run in a single native-message round trip instead of one CLI spawn and TCP round trip each. The batch fails as a whole if any sub-command throws or returns `success: false`.
+
+```bash
+python3 test_client.py batch '[{"action":"startMonitoring"},{"action":"click","payload":{"selector":"#log"}},{"action":"consoleMessages","delayMs":100}]' <tabId>
+```
+
+Batching cut each monitoring op from roughly three round trips to one (~605 ms to ~142 ms, ~77% lower) and dropped the full Chrome Bridge run from ~34 s to ~8 s.
+
+### Measured head-to-head
+
+Median ms per operation, 5 iterations, identical local HTTP fixture, all 18 ops `pass` for every adapter. Navigation is normalized to `domcontentloaded` across adapters so `wait-load` is comparable.
+
+| Operation | Chrome Bridge | Playwright | Puppeteer |
+| --- | ---: | ---: | ---: |
+| ping | 37.05 | 3.97 | 2.79 |
+| navigate | 48.29 | 10.85 | 67.03 |
+| wait-load | 292.80 | 8.97 | 76.26 |
+| wait-selector | 38.74 | 28.02 | 45.39 |
+| click | 39.88 | 40.04 | 73.85 |
+| fill | 38.95 | 6.21 | 25.10 |
+| select | 39.01 | 4.92 | 24.09 |
+| upload | 46.97 | 44.47 | 21.62 |
+| screenshot | 89.09 | 51.30 | 32.89 |
+| extract-text | 38.11 | 3.98 | 3.64 |
+| get-html | 37.00 | 2.45 | 0.93 |
+| observe-state | 39.39 | 2.21 | 4.63 |
+| console-monitoring | 142.27 | 90.29 | 64.13 |
+| network-monitoring | 140.71 | 83.37 | 63.94 |
+| dialog-handling | 140.47 | 29.87 | 42.22 |
+| storage-state | 42.26 | 3.54 | 6.63 |
+| geolocation | 85.06 | 9.18 | 8.96 |
+| performance-metrics | 38.85 | 1.93 | 1.19 |
+
+Median-of-medians: Chrome Bridge ~41 ms, Puppeteer ~25 ms, Playwright ~9 ms. The Chrome Bridge gap is structural: each command crosses CLI -> TCP -> native host -> extension -> CDP, while Playwright/Puppeteer hold one in-process CDP connection. Chrome Bridge's edge is real-profile auth reuse, not raw latency. Timings vary with machine load; rerun locally for current numbers.
 
 ## Troubleshooting
 

@@ -11,6 +11,7 @@ bridge_debug.log
 *.log
 __pycache__/
 *.pyc
+.chrome-bridge-puppeteer-*/
 
 # OS noise
 .DS_Store

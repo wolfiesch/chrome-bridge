@@ -182,8 +182,50 @@ scheduleHeartbeat();
 async function handleMessageFromHost(message) {
   const { id, action, payload } = message;
   try {
+    const result = await dispatchAction(action, payload);
+    sendResponseToHost({ id, success: true, result });
+  } catch (error) {
+    sendResponseToHost({ id, success: false, error: error.message });
+  }
+}
+
+async function runBatch(steps, defaultTabId) {
+  if (!Array.isArray(steps)) {
+    throw new Error("batch requires a steps array");
+  }
+  const results = [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i] || {};
+    if (step.delayMs) {
+      await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+    }
+    if (!step.action) {
+      results.push(null);
+      continue;
+    }
+    const stepPayload = step.payload ? { ...step.payload } : {};
+    if (stepPayload.tabId === undefined && defaultTabId !== undefined) {
+      stepPayload.tabId = defaultTabId;
+    }
+    try {
+      const stepResult = await dispatchAction(step.action, stepPayload);
+      if (stepResult && typeof stepResult === "object" && stepResult.success === false) {
+        throw new Error(stepResult.error || "step reported success=false");
+      }
+      results.push(stepResult);
+    } catch (error) {
+      throw new Error(`batch step ${i} (${step.action}) failed: ${error.message}`);
+    }
+  }
+  return results;
+}
+
+async function dispatchAction(action, payload) {
     let result;
     switch (action) {
+      case "batch":
+        result = await runBatch(payload.steps, payload.tabId);
+        break;
       case "ping":
         result = "pong";
         break;
@@ -316,10 +358,7 @@ async function handleMessageFromHost(message) {
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
-    sendResponseToHost({ id, success: true, result });
-  } catch (error) {
-    sendResponseToHost({ id, success: false, error: error.message });
-  }
+    return result;
 }
 
 function sendResponseToHost(response) {
