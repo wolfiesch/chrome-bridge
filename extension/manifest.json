@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Native Messaging Automation Bridge",
+  "version": "1.0.0",
+  "description": "Bidirectional bridge to local Python automation script.",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "scripting",
+    "activeTab",
+    "cookies",
+    "debugger",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

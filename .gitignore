@@ -1,0 +1,16 @@
+# Secrets — never commit
+bridge_token.txt
+extension_key.pem
+*.pem
+
+# Generated host manifest (contains absolute paths + your extension ID)
+com.automation.bridge.json
+
+# Logs and caches
+bridge_debug.log
+*.log
+__pycache__/
+*.pyc
+
+# OS noise
+.DS_Store

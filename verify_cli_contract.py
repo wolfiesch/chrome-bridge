@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CLIENT = os.path.join(SCRIPT_DIR, "test_client.py")
+ENV = os.environ.copy()
+# Port 9 should be closed; recognized commands should attempt a connection and
+# return 111. Unknown actions should return 64. This lets us test CLI dispatch
+# without needing a live Chrome extension.
+ENV["BRIDGE_PORT"] = "9"
+ENV["BRIDGE_CONNECT_TIMEOUT_SECONDS"] = "0"
+
+UPLOAD_FIXTURE = "/tmp/chrome-bridge-upload.txt"
+with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
+    f.write("chrome bridge upload fixture\n")
+
+CASES = [
+    (["ping"], 111),
+    (["navigate", "https://example.com"], 111),
+    (["getCookies", "example.com"], 111),
+    (["executeScript", "1", "document.title"], 111),
+    (["getTabs"], 111),
+    (["executeScriptCDP", "1", "document.title"], 111),
+    (["click", "1", "#submit"], 111),
+    (["type", "1", "input[name=q]", "hello"], 111),
+    (["observe", "1"], 111),
+    (["activateTab", "1"], 111),
+    (["closeTab", "1"], 111),
+    (["reload", "1"], 111),
+    (["goBack", "1"], 111),
+    (["goForward", "1"], 111),
+    (["waitForLoad", "1", "5000"], 111),
+    (["waitForSelector", "1", "#ready", "5000"], 111),
+    (["waitForText", "1", "Loaded", "5000"], 111),
+    (["waitForUrl", "1", "github.com", "5000"], 111),
+    (["getCurrentState", "1"], 111),
+    (["screenshot", "1", "/tmp/chrome-bridge-shot.png"], 111),
+    (["extractText", "1", "2000"], 111),
+    (["getHTML", "1", "/tmp/chrome-bridge-page.html"], 111),
+    (["hover", "1", "#target"], 111),
+    (["scroll", "1", "0", "500"], 111),
+    (["scroll", "1", "0", "500", "#panel"], 111),
+    (["press", "1", "Enter"], 111),
+    (["drag", "1", "#from", "#to"], 111),
+    (["fill", "1", "input[name=q]", "hello"], 111),
+    (["select", "1", "select[name=kind]", "beta"], 111),
+    (["uploadFile", "1", "input[type=file]", UPLOAD_FIXTURE], 111),
+    (["setViewport", "1", "1280", "720", "1"], 111),
+    (["startMonitoring", "1"], 111),
+    (["stopMonitoring", "1"], 111),
+    (["consoleMessages", "1"], 111),
+    (["networkRequests", "1"], 111),
+    (["handleDialog", "1", "accept"], 111),
+    (["handleDialog", "1", "accept", "typed prompt value"], 111),
+    (["noSuchAction"], 64),
+]
+
+failed = False
+for args, expected in CASES:
+    proc = subprocess.run([CLIENT, *args], env=ENV, text=True, capture_output=True)
+    if proc.returncode != expected:
+        failed = True
+        print(f"FAIL {' '.join(args)}: expected exit {expected}, got {proc.returncode}")
+        if proc.stdout:
+            print("stdout:", proc.stdout.strip())
+        if proc.stderr:
+            print("stderr:", proc.stderr.strip())
+
+missing = "/tmp/chrome-bridge-upload-missing.txt"
+try:
+    os.unlink(missing)
+except FileNotFoundError:
+    pass
+proc = subprocess.run(
+    [CLIENT, "uploadFile", "1", "input[type=file]", missing],
+    env=ENV,
+    text=True,
+    capture_output=True,
+)
+if proc.returncode != 2 or "Upload file not found:" not in proc.stderr:
+    failed = True
+    print(f"FAIL uploadFile missing preflight: expected exit 2 and missing-file stderr, got {proc.returncode}")
+    if proc.stdout:
+        print("stdout:", proc.stdout.strip())
+    if proc.stderr:
+        print("stderr:", proc.stderr.strip())
+
+if failed:
+    sys.exit(1)
+print("CLI contract OK")
