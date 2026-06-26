@@ -2,8 +2,8 @@
 name = "chrome-bridge-mcp"
 version = "0.1.0"
 description = "MCP server exposing the Chrome native-messaging automation bridge to MCP clients."
-requires-python = ">=3.9"
-dependencies = ["mcp>=1.2.0"]
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.10.0"]
 
 [project.scripts]
 chrome-bridge-mcp = "chrome_bridge_mcp.server:main"

@@ -41,7 +41,7 @@ chrome-native-bridge/
 ## Requirements
 
 - Google Chrome, Chrome Beta/Canary, or Chromium with Developer mode.
-- Python 3.9+.
+- Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`).
 - macOS or Linux. `setup.sh` auto-registers the native host for each installed variant. Windows works but requires manual native-host registration.
 
 ## Setup
@@ -247,17 +247,47 @@ The server reuses `test_client.py`'s transport verbatim, so the MCP tools and th
 
 ### Tools
 
-P1 ships a curated set plus a passthrough. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
+P2 ships a grouped tool set. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
+
+Read-only:
 
 - `browser_list_tabs`
-- `browser_navigate`
 - `browser_snapshot` (accessibility snapshot)
 - `browser_extract_text`
 - `browser_screenshot` (returned inline as an image)
-- `browser_click`, `browser_type`, `browser_fill`
+- `browser_get_html`
 - `browser_wait_for` (`mode`: `load|selector|text|url`)
+
+Sensitive:
+
+- `browser_get_cookies`
+
+Mutating:
+
+- `browser_navigate`
+- `browser_click`, `browser_type`, `browser_fill`, `browser_hover`
+- `browser_scroll`, `browser_press`, `browser_drag`
+- `browser_select`
+- `browser_upload_file` (validates local paths before contacting Chrome)
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`)
+
+Escape hatch (sensitive):
+
 - `browser_action` — escape hatch for any raw bridge action (interception, geolocation, monitoring, console/network logs, `downloadUrl`, `storageState`, `executeScript`, `setViewport`, `handleDialog`, `batch`, ...)
+
+### Resources
+
+- `browser://tabs` — live tab list.
+- `browser://tab/{id}/state` — current state of a tab.
+
+### Scoping
+
+The server reads two env flags to scope the exposed surface:
+
+- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, and `browser_action`.
+- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies` and the `browser_action` escape hatch), which are hidden by default.
+
+Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately.
 
 ### Register
 
@@ -278,7 +308,7 @@ Copy `mcp/claude_desktop_config.example.json` into your MCP client config and se
 }
 ```
 
-The server honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, and `BRIDGE_CONNECT_TIMEOUT_SECONDS`, and reads the same `bridge_token.txt`. Chrome with the loaded extension must be running and the native host registered (`./setup.sh` or `./setup-rs.sh`).
+The server honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, `BRIDGE_CONNECT_TIMEOUT_SECONDS`, `BRIDGE_MCP_READONLY`, and `BRIDGE_MCP_ALLOW_SENSITIVE`, and reads the same `bridge_token.txt`. Chrome with the loaded extension must be running and the native host registered (`./setup.sh` or `./setup-rs.sh`).
 
 ## Benchmarking against other browser automation surfaces
 

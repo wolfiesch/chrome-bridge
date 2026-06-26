@@ -7,8 +7,10 @@ imports the MCP tool functions, and asserts each tool emits the exact
 tab, that screenshots return inline image content, and that bridge failures map
 to BridgeError. No browser or real host needed.
 """
+import asyncio
 import json
 import os
+import tempfile
 import socket
 import sys
 import threading
@@ -94,6 +96,21 @@ def last_request():
         return received[-1] if received else (None, None)
 
 
+def _tool_names(srv):
+    return {t.name for t in srv._tool_manager.list_tools()}
+
+
+def _resource_uris(srv):
+    res = asyncio.run(srv.list_resources())
+    tmpl = asyncio.run(srv.list_resource_templates())
+    return {str(r.uri) for r in res} | {str(t.uriTemplate) for t in tmpl}
+
+
+class _Unauthorized(Exception):
+    def __str__(self):
+        return "unauthorized"
+
+
 # Default mock: active-tab tabs list, and per-action canned results.
 TABS = [
     {"id": 11, "active": False, "url": "https://a.test", "title": "A"},
@@ -112,6 +129,12 @@ def default_result(action, payload):
         return {"success": True, "text": "hello"}
     if action == "screenshot":
         return {"success": True, "mimeType": "image/png", "dataUrl": "data:image/png;base64,QUJD"}
+    if action == "getHTML":
+        return {"success": True, "html": "H" * 50}
+    if action == "getCurrentState":
+        return {"success": True, "tab": {"id": payload.get("tabId"), "url": "https://b.test"}}
+    if action == "getCookies":
+        return [{"name": "sid", "domain": payload.get("domain")}]
     return {"success": True, "tabId": payload.get("tabId")}
 
 
@@ -191,6 +214,80 @@ def main():
         expect(False, "invalid wait_for mode should raise")
     except BridgeError:
         pass
+    # --- P2 cases ---
+
+    # 13. New named tools emit correct payloads.
+    server.browser_hover("#h", tab_id=11)
+    expect(last_request() == ("hover", {"tabId": 11, "selector": "#h"}), "hover payload mismatch")
+    server.browser_scroll(5, 10, tab_id=11)
+    expect(last_request() == ("scroll", {"tabId": 11, "deltaX": 5, "deltaY": 10, "selector": None}), "scroll payload mismatch")
+    server.browser_scroll(1, 2, tab_id=11, selector="#p")
+    expect(last_request() == ("scroll", {"tabId": 11, "deltaX": 1, "deltaY": 2, "selector": "#p"}), "scroll selector payload mismatch")
+    server.browser_press("Enter", tab_id=11)
+    expect(last_request() == ("press", {"tabId": 11, "key": "Enter"}), "press payload mismatch")
+    server.browser_drag("#a", "#b", tab_id=11)
+    expect(last_request() == ("drag", {"tabId": 11, "fromSelector": "#a", "toSelector": "#b"}), "drag payload mismatch")
+    server.browser_select("#s", "v", tab_id=11)
+    expect(last_request() == ("select", {"tabId": 11, "selector": "#s", "value": "v"}), "select payload mismatch")
+    server.browser_get_cookies("x.test")
+    expect(last_request() == ("getCookies", {"domain": "x.test"}), "get_cookies payload mismatch")
+
+    # 14. get_html truncates to max_chars with a marker.
+    out = server.browser_get_html(tab_id=11, max_chars=10)
+    expect(out.startswith("H" * 10) and "truncated 40 chars" in out, f"get_html truncation wrong: {out!r}")
+
+    # 15. upload_file validates paths before any bridge call.
+    with received_lock:
+        received.clear()
+    try:
+        server.browser_upload_file("#f", ["/no/such/file-xyz.txt"])
+        expect(False, "upload_file should raise on missing file")
+    except BridgeError as exc:
+        expect("Upload file not found" in str(exc), "upload_file error message wrong")
+    with received_lock:
+        expect(received == [], "upload_file must not contact the bridge on missing file")
+    # Valid file -> expanded absolute path forwarded.
+    fd, real = tempfile.mkstemp()
+    os.close(fd)
+    server.browser_upload_file("#f", [real], tab_id=11)
+    act, payload = last_request()
+    expect(act == "uploadFile" and payload["files"] == [os.path.abspath(real)], "upload_file should forward abs path")
+    os.unlink(real)
+
+    # 16. Gating: default build hides sensitive tools (cookies + action escape hatch).
+    default_names = _tool_names(server.build_server())
+    expect("browser_get_cookies" not in default_names, "cookies must be hidden by default")
+    expect("browser_action" not in default_names, "browser_action must be hidden by default (sensitive)")
+    expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
+
+    # 17. allow_sensitive exposes sensitive tools.
+    sens_names = _tool_names(server.build_server(allow_sensitive=True))
+    expect("browser_get_cookies" in sens_names and "browser_action" in sens_names, "allow_sensitive should expose sensitive tools")
+
+    # 18. readonly hides ALL mutating tools (including the escape hatch).
+    ro_names = _tool_names(server.build_server(readonly=True, allow_sensitive=True))
+    expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
+    expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
+    expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
+
+    # 19. Annotations + resources are registered.
+    srv = server.build_server(allow_sensitive=True)
+    tools = {t.name: t for t in srv._tool_manager.list_tools()}
+    expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
+    expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
+    res_uris = _resource_uris(srv)
+    expect("browser://tabs" in res_uris, "browser://tabs resource missing")
+    expect(any(u.startswith("browser://tab/") for u in res_uris), "tab state resource template missing")
+
+    # 20. unauthorized maps to an actionable message.
+    def unauth(action, payload):
+        raise _Unauthorized()
+    _result_fn = unauth
+    try:
+        server.browser_list_tabs()
+        expect(False, "unauthorized should raise")
+    except BridgeError as exc:
+        expect("token mismatch" in str(exc), f"unauthorized should be actionable: {exc}")
 
     # 12. bridge failure result maps to BridgeError (swap behavior, same server).
     def failing(action, payload):

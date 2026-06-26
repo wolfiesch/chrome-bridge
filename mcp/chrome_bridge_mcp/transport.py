@@ -53,7 +53,12 @@ def call(action, payload=None):
         raise BridgeError(stderr or "No response from bridge.")
 
     if response.get("success") is not True:
-        raise BridgeError(response.get("error") or stderr or "Bridge reported failure.")
+        err = response.get("error") or stderr or "Bridge reported failure."
+        if err == "unauthorized":
+            err = ("unauthorized: bridge token mismatch. Ensure the MCP server "
+                   "reads the same bridge_token.txt as the running host "
+                   "(check BRIDGE_TOKEN_FILE / BRIDGE_REPO_ROOT).")
+        raise BridgeError(err)
 
     result = response.get("result")
     if isinstance(result, dict) and result.get("success") is False:
