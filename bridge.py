@@ -28,14 +28,23 @@ stdout_lock = threading.Lock()
 
 # Shared-secret auth: every TCP request must include this token. The file is
 # created with 0600 perms next to this script; override path via BRIDGE_TOKEN_FILE.
+TOKEN_FILE = os.environ.get(
+    'BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
+TOKENS_FILE = os.environ.get(
+    'BRIDGE_TOKENS_FILE', os.path.join(SCRIPT_DIR, 'bridge_tokens.txt'))
+
 def load_token():
-    token_file = os.environ.get(
-        'BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
     try:
-        with open(token_file) as f:
+        with open(TOKEN_FILE) as f:
             return f.read().strip()
     except Exception as e:
-        logging.error(f"Could not read token file {token_file}: {e}")
+        logging.error(f"Could not read token file {TOKEN_FILE}: {e}")
+        return None
+
+def _file_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
         return None
 
 # Per-client token registry. The legacy single token (bridge_token.txt) is the
@@ -45,11 +54,9 @@ def load_token_registry():
     legacy = load_token()
     if legacy:
         registry[legacy] = 'default'
-    tokens_file = os.environ.get(
-        'BRIDGE_TOKENS_FILE', os.path.join(SCRIPT_DIR, 'bridge_tokens.txt'))
-    if os.path.exists(tokens_file):
+    if os.path.exists(TOKENS_FILE):
         try:
-            with open(tokens_file) as f:
+            with open(TOKENS_FILE) as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -61,10 +68,30 @@ def load_token_registry():
                     if name and token:
                         registry[token] = name
         except Exception as e:
-            logging.error(f"Could not read tokens file {tokens_file}: {e}")
-    return registry
+            logging.error(f"Could not read tokens file {TOKENS_FILE}: {e}")
+    # Record the mtimes observed for both token-file paths (missing -> None).
+    mtimes = {TOKEN_FILE: _file_mtime(TOKEN_FILE),
+              TOKENS_FILE: _file_mtime(TOKENS_FILE)}
+    return registry, mtimes
 
-TOKEN_REGISTRY = load_token_registry()
+# Guards both the registry dict and the recorded mtimes; reloads happen under it.
+_registry_lock = threading.Lock()
+TOKEN_REGISTRY, _registry_mtimes = load_token_registry()
+
+def resolve_client(token):
+    # Resolve a token to its client name. On a miss, reload the registry only if
+    # a token file's mtime changed (including absent->present) since last load.
+    global TOKEN_REGISTRY, _registry_mtimes
+    with _registry_lock:
+        name = TOKEN_REGISTRY.get(token)
+        if name is not None:
+            return name
+        changed = any(_file_mtime(path) != recorded
+                      for path, recorded in _registry_mtimes.items())
+        if changed:
+            TOKEN_REGISTRY, _registry_mtimes = load_token_registry()
+            name = TOKEN_REGISTRY.get(token)
+        return name
 
 # Cooperative leasing: at most one client holds an exclusive lease at a time.
 # A live lease blocks other clients' non-lease actions with "leased by <owner>".
@@ -162,7 +189,7 @@ def handle_socket_client(client_socket):
             cmd = json.loads(line.decode('utf-8'))
 
             # Resolve the client by its token; unknown/missing token is rejected.
-            name = TOKEN_REGISTRY.get(cmd.get("token"))
+            name = resolve_client(cmd.get("token"))
             if name is None:
                 logging.warning("Rejected unauthenticated/invalid-token request.")
                 client_socket.sendall(
@@ -226,7 +253,7 @@ def socket_server_loop():
             f"FATAL: could not bind 127.0.0.1:{port} ({e}). Another bridge host is "
             f"likely already running. Disable the duplicate Chrome extension so only "
             f"one host owns this port. This host will not accept CLI commands.")
-        return
+        os._exit(1)
     server.listen(5)
     logging.info(f"TCP socket server listening on 127.0.0.1:{port}")
     while True:

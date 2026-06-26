@@ -4,10 +4,11 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use socket2::{Domain, Protocol, Socket, Type};
 
 /// Directory of the current executable; base for default token/log paths.
 fn host_dir() -> PathBuf {
@@ -63,12 +64,30 @@ fn log_path(host_dir: &Path) -> PathBuf {
     }
 }
 
-/// Read BRIDGE_TOKEN_FILE env or <host_dir>/bridge_token.txt, trimmed.
-fn load_token(host_dir: &Path, logger: &Arc<Logger>) -> Option<String> {
-    let token_file = match std::env::var("BRIDGE_TOKEN_FILE") {
+/// Path of the legacy single-token file (BRIDGE_TOKEN_FILE or <host_dir>/bridge_token.txt).
+fn token_file_path(host_dir: &Path) -> PathBuf {
+    match std::env::var("BRIDGE_TOKEN_FILE") {
         Ok(p) => PathBuf::from(p),
         Err(_) => host_dir.join("bridge_token.txt"),
-    };
+    }
+}
+
+/// Path of the named-token file (BRIDGE_TOKENS_FILE or <host_dir>/bridge_tokens.txt).
+fn tokens_file_path(host_dir: &Path) -> PathBuf {
+    match std::env::var("BRIDGE_TOKENS_FILE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => host_dir.join("bridge_tokens.txt"),
+    }
+}
+
+/// Last-modified time of a path, or None when the file is missing/unreadable.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Read BRIDGE_TOKEN_FILE env or <host_dir>/bridge_token.txt, trimmed.
+fn load_token(host_dir: &Path, logger: &Arc<Logger>) -> Option<String> {
+    let token_file = token_file_path(host_dir);
     match std::fs::read_to_string(&token_file) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) => {
@@ -96,10 +115,7 @@ fn load_tokens(host_dir: &Path, logger: &Arc<Logger>) -> HashMap<String, String>
         }
     }
 
-    let tokens_file = match std::env::var("BRIDGE_TOKENS_FILE") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => host_dir.join("bridge_tokens.txt"),
-    };
+    let tokens_file = tokens_file_path(host_dir);
     if tokens_file.exists() {
         match std::fs::read_to_string(&tokens_file) {
             Ok(contents) => {
@@ -172,8 +188,54 @@ fn value_field(v: Option<&Value>) -> String {
 /// responses here.
 type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 
-/// token -> client name registry, shared read-only across connections.
-type Tokens = Arc<HashMap<String, String>>;
+/// token -> client name registry plus the recorded mtimes of the two token
+/// files, shared across connections and reloadable under a write lock.
+struct TokenRegistry {
+    map: HashMap<String, String>,
+    token_file_mtime: Option<SystemTime>,
+    tokens_file_mtime: Option<SystemTime>,
+}
+
+type Tokens = Arc<RwLock<TokenRegistry>>;
+
+/// Build the registry: load the map and record both files' current mtimes.
+fn build_registry(host_dir: &Path, logger: &Arc<Logger>) -> TokenRegistry {
+    TokenRegistry {
+        map: load_tokens(host_dir, logger),
+        token_file_mtime: file_mtime(&token_file_path(host_dir)),
+        tokens_file_mtime: file_mtime(&tokens_file_path(host_dir)),
+    }
+}
+
+/// Resolve a request token to a client name. On a miss, reload the registry if
+/// either token file's mtime advanced (or an absent file became present) and
+/// re-lookup; only a still-absent token is unresolved.
+fn resolve_client(
+    tokens: &Tokens,
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+    token: &str,
+) -> Option<String> {
+    if let Ok(reg) = tokens.read() {
+        if let Some(name) = reg.map.get(token) {
+            return Some(name.clone());
+        }
+    }
+
+    let cur_token = file_mtime(&token_file_path(host_dir));
+    let cur_tokens = file_mtime(&tokens_file_path(host_dir));
+
+    if let Ok(mut reg) = tokens.write() {
+        if cur_token != reg.token_file_mtime || cur_tokens != reg.tokens_file_mtime {
+            reg.map = load_tokens(host_dir, logger);
+            reg.token_file_mtime = cur_token;
+            reg.tokens_file_mtime = cur_tokens;
+        }
+        return reg.map.get(token).cloned();
+    }
+
+    None
+}
 
 /// Cooperative single-holder lease over the shared Chrome profile.
 struct Lease {
@@ -303,6 +365,7 @@ fn write_line(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
 
 fn handle_socket_client(
     mut stream: TcpStream,
+    host_dir: &Path,
     tokens: &Tokens,
     pending: &Pending,
     lease: &LeaseState,
@@ -347,11 +410,12 @@ fn handle_socket_client(
         };
 
         // Reject any request whose token is missing or not in the registry.
+        // On a miss, resolve_client mtime-checks the token files and reloads
+        // before giving up, so newly added tokens resolve without a restart.
         let client_name = cmd
             .get("token")
             .and_then(|t| t.as_str())
-            .and_then(|t| tokens.get(t))
-            .cloned();
+            .and_then(|t| resolve_client(tokens, host_dir, logger, t));
         let client_name = match client_name {
             Some(name) => name,
             None => {
@@ -422,6 +486,7 @@ fn handle_socket_client(
 }
 
 fn socket_server_loop(
+    host_dir: PathBuf,
     tokens: Tokens,
     pending: Pending,
     lease: LeaseState,
@@ -433,8 +498,17 @@ fn socket_server_loop(
         .and_then(|p| p.parse().ok())
         .unwrap_or(9223);
 
-    // Plain TcpListener::bind; SO_REUSEADDR is best-effort (OS default).
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+    // SO_REUSEADDR before bind, matching Python (SOL_SOCKET/SO_REUSEADDR=1). Avoids
+    // transient bind failures against a TIME_WAIT port during rapid host replacement.
+    let addr: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let bind_result = (|| -> io::Result<TcpListener> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(128)?;
+        Ok(socket.into())
+    })();
+    let listener = match bind_result {
         Ok(l) => l,
         Err(e) => {
             log_error(
@@ -446,7 +520,7 @@ fn socket_server_loop(
                     port, e
                 ),
             );
-            return;
+            std::process::exit(1);
         }
     };
 
@@ -463,13 +537,14 @@ fn socket_server_loop(
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "<unknown>".to_string());
                 log_info(&logger, &format!("Accepted connection from {}", addr));
+                let host_dir = host_dir.clone();
                 let tokens = Arc::clone(&tokens);
                 let pending = Arc::clone(&pending);
                 let lease = Arc::clone(&lease);
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &tokens, &pending, &lease, &stdout, &logger);
+                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &stdout, &logger);
                 });
             }
             Err(e) => {
@@ -490,7 +565,7 @@ fn main() {
 
     log_info(&logger, "Native Messaging Host started.");
 
-    let tokens: Tokens = Arc::new(load_tokens(&host_dir, &logger));
+    let tokens: Tokens = Arc::new(RwLock::new(build_registry(&host_dir, &logger)));
     let stdout: Arc<Mutex<io::Stdout>> = Arc::new(Mutex::new(io::stdout()));
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let lease: LeaseState = Arc::new(Mutex::new(Lease {
@@ -499,13 +574,14 @@ fn main() {
     }));
 
     {
+        let host_dir = host_dir.clone();
         let tokens = Arc::clone(&tokens);
         let pending = Arc::clone(&pending);
         let lease = Arc::clone(&lease);
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(tokens, pending, lease, stdout, logger);
+            socket_server_loop(host_dir, tokens, pending, lease, stdout, logger);
         });
     }
 

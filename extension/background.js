@@ -1,6 +1,49 @@
 let nativePort = null;
 const HEARTBEAT_ALARM = "chromeBridgeHeartbeat";
 const HEARTBEAT_MINUTES = 0.5;
+const RECONNECT_ALARM = "chromeBridgeReconnect";
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_FACTOR = 2;
+const RECONNECT_CAP_MS = 30000;
+// Persist retry state across SW suspension. A bare module variable is lost when
+// the MV3 service worker suspends, so we keep backoff state in chrome.storage.
+// The manifest grants "storage"; prefer storage.session (resets on browser
+// restart, no disk churn) and fall back to storage.local, then an in-memory copy
+// so the worker never throws even if storage is unavailable.
+const reconnectStore =
+  (chrome.storage && (chrome.storage.session || chrome.storage.local)) || null;
+let reconnectStateFallback = { attempt: 0, delay: RECONNECT_BASE_MS };
+
+async function getReconnectState() {
+  if (!reconnectStore) return { ...reconnectStateFallback };
+  const data = await reconnectStore.get("reconnectState");
+  return data.reconnectState || { attempt: 0, delay: RECONNECT_BASE_MS };
+}
+
+async function setReconnectState(state) {
+  reconnectStateFallback = state;
+  if (!reconnectStore) return;
+  await reconnectStore.set({ reconnectState: state });
+}
+
+async function resetBackoff() {
+  await setReconnectState({ attempt: 0, delay: RECONNECT_BASE_MS });
+  await chrome.alarms.clear(RECONNECT_ALARM);
+}
+
+async function scheduleReconnect() {
+  const state = await getReconnectState();
+  const currentDelay = state.delay || RECONNECT_BASE_MS;
+  // Durable mechanism: an alarm survives SW suspension. Alarms only fire on a
+  // ~30s granularity in practice, so also fire an OPPORTUNISTIC immediate
+  // setTimeout fast-path; the alarm remains the authoritative retry trigger.
+  const jitter = Math.random() * 0.3 * currentDelay;
+  const delayMs = Math.min(currentDelay + jitter, RECONNECT_CAP_MS);
+  chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: delayMs / 60000 });
+  setTimeout(connectToHost, delayMs);
+  const nextDelay = Math.min(currentDelay * RECONNECT_FACTOR, RECONNECT_CAP_MS);
+  await setReconnectState({ attempt: (state.attempt || 0) + 1, delay: nextDelay });
+}
 const monitors = new Map();
 const interceptors = new Map();
 const MONITOR_LIMIT = 200;
@@ -140,6 +183,8 @@ function sendHeartbeat() {
   } catch (error) {
     console.warn("Heartbeat failed:", error);
     nativePort = null;
+    // Don't wait for the next heartbeat alarm; schedule a backed-off reconnect now.
+    scheduleReconnect();
   }
 }
 function connectToHost() {
@@ -151,6 +196,7 @@ function connectToHost() {
   } catch (error) {
     console.error("Failed to connect native host:", error);
     nativePort = null;
+    scheduleReconnect();
     return;
   }
 
@@ -162,8 +208,11 @@ function connectToHost() {
   nativePort.onDisconnect.addListener(() => {
     console.warn("Disconnected from native host:", chrome.runtime.lastError);
     nativePort = null;
-    setTimeout(connectToHost, 5000);
+    scheduleReconnect();
   });
+
+  // Connection established: reset backoff and clear any pending reconnect alarm.
+  resetBackoff();
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -176,6 +225,7 @@ chrome.runtime.onStartup.addListener(() => {
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) sendHeartbeat();
+  else if (alarm.name === RECONNECT_ALARM) connectToHost();
 });
 scheduleHeartbeat();
 
