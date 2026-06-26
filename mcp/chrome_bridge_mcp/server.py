@@ -238,6 +238,34 @@ def browser_action(action: str, payload: Optional[dict] = None) -> str:
     return _text(call(action, payload or {}))
 
 
+def browser_lease(ttl_ms: int = 300000) -> str:
+    """Acquire exclusive cooperative control of the shared real-Chrome profile.
+
+    Cooperative multi-agent leasing: while you hold the lease, other clients
+    are blocked with 'leased by <owner>' until you release it or the lease
+    expires after ``ttl_ms`` milliseconds (TTL).
+    """
+    return _text(call("lease", {"ttlMs": ttl_ms}))
+
+
+def browser_release() -> str:
+    """Release the cooperative lease on the shared real-Chrome profile.
+
+    Frees the exclusive control acquired via ``browser_lease`` so other clients
+    are no longer blocked with 'leased by <owner>'.
+    """
+    return _text(call("release", {}))
+
+
+def browser_lease_status() -> str:
+    """Report the current cooperative lease on the shared real-Chrome profile.
+
+    Shows who (if anyone) holds exclusive control; other clients are blocked
+    with 'leased by <owner>' until release or TTL expiry.
+    """
+    return _text(call("leaseStatus", {}))
+
+
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
     (browser_list_tabs, False, False),
@@ -259,6 +287,9 @@ _TOOLS = [
     (browser_upload_file, True, False),
     (browser_tab_control, True, False),
     (browser_action, True, True),
+    (browser_lease, True, False),
+    (browser_release, True, False),
+    (browser_lease_status, False, False),
 ]
 
 
@@ -299,7 +330,19 @@ def build_server(readonly=None, allow_sensitive=None) -> FastMCP:
 
 
 def main() -> None:
-    build_server().run()
+    transport = os.environ.get("BRIDGE_MCP_TRANSPORT", "stdio")
+    if transport == "http":
+        host = os.environ.get("BRIDGE_MCP_HTTP_HOST", "127.0.0.1")
+        port = os.environ.get("BRIDGE_MCP_HTTP_PORT", "8723")
+        m = build_server()
+        try:
+            m.settings.host = host
+            m.settings.port = int(port)
+        except AttributeError:
+            pass
+        m.run(transport="streamable-http")
+    else:
+        build_server().run()
 
 
 if __name__ == "__main__":

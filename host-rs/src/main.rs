@@ -3,8 +3,9 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -80,6 +81,62 @@ fn load_token(host_dir: &Path, logger: &Arc<Logger>) -> Option<String> {
     }
 }
 
+/// Build a token -> client-name registry.
+///
+/// The legacy single token (BRIDGE_TOKEN_FILE, default <host_dir>/bridge_token.txt)
+/// is registered under the name `default`. If BRIDGE_TOKENS_FILE (default
+/// <host_dir>/bridge_tokens.txt) exists, each non-empty, non-`#` line is parsed
+/// as `name:token` (split on the first ':') and added to the registry.
+fn load_tokens(host_dir: &Path, logger: &Arc<Logger>) -> HashMap<String, String> {
+    let mut tokens: HashMap<String, String> = HashMap::new();
+
+    if let Some(legacy) = load_token(host_dir, logger) {
+        if !legacy.is_empty() {
+            tokens.insert(legacy, "default".to_string());
+        }
+    }
+
+    let tokens_file = match std::env::var("BRIDGE_TOKENS_FILE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => host_dir.join("bridge_tokens.txt"),
+    };
+    if tokens_file.exists() {
+        match std::fs::read_to_string(&tokens_file) {
+            Ok(contents) => {
+                for line in contents.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    match trimmed.split_once(':') {
+                        Some((name, tok)) => {
+                            let name = name.trim();
+                            let tok = tok.trim();
+                            if !name.is_empty() && !tok.is_empty() {
+                                tokens.insert(tok.to_string(), name.to_string());
+                            }
+                        }
+                        None => {
+                            log_warn(
+                                logger,
+                                &format!("Ignoring malformed token line (expected name:token): {}", trimmed),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_error(
+                    logger,
+                    &format!("Could not read tokens file {}: {}", tokens_file.display(), e),
+                );
+            }
+        }
+    }
+
+    tokens
+}
+
 /// Framed stdout writer: native-endian u32 length prefix + JSON bytes.
 fn write_message(stdout: &Arc<Mutex<io::Stdout>>, logger: &Arc<Logger>, message: &Value) {
     let encoded = serde_json::to_vec(message).unwrap_or_else(|_| b"{}".to_vec());
@@ -110,89 +167,264 @@ fn value_field(v: Option<&Value>) -> String {
     }
 }
 
-type Pending = Arc<Mutex<HashMap<String, TcpStream>>>;
+/// Per-request channel registry: in-flight request id -> Sender the handler
+/// thread blocks on for the extension's response. The stdin reader routes
+/// responses here.
+type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
+
+/// token -> client name registry, shared read-only across connections.
+type Tokens = Arc<HashMap<String, String>>;
+
+/// Cooperative single-holder lease over the shared Chrome profile.
+struct Lease {
+    owner: Option<String>,
+    expires_at: Option<u128>,
+}
+
+type LeaseState = Arc<Mutex<Lease>>;
+
+/// Current wall-clock time in epoch milliseconds.
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Idle read timeout for a persistent connection (BRIDGE_SOCKET_IDLE_TIMEOUT, default 300s).
+fn socket_idle_timeout() -> Duration {
+    let secs = std::env::var("BRIDGE_SOCKET_IDLE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(300.0);
+    Duration::from_secs_f64(secs)
+}
+
+/// Resolve the live lease owner, clearing the lease in place if its TTL expired.
+fn live_owner(lease: &mut Lease, now: u128) -> Option<String> {
+    match lease.expires_at {
+        Some(exp) if now < exp => lease.owner.clone(),
+        _ => {
+            lease.owner = None;
+            lease.expires_at = None;
+            None
+        }
+    }
+}
+
+/// Handle lease/release/leaseStatus host-side. Returns None if `action` is not
+/// a lease verb (caller should forward to the extension instead).
+fn handle_lease_action(action: &str, payload: Option<&Value>, client: &str, lease: &LeaseState) -> Option<Value> {
+    let now = now_ms();
+    match action {
+        "lease" => {
+            let ttl = payload
+                .and_then(|p| p.get("ttlMs"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300_000) as u128;
+            let resp = if let Ok(mut g) = lease.lock() {
+                match live_owner(&mut g, now) {
+                    Some(o) if o != client => {
+                        json!({"success": false, "error": format!("leased by {}", o)})
+                    }
+                    _ => {
+                        let expires = now + ttl;
+                        g.owner = Some(client.to_string());
+                        g.expires_at = Some(expires);
+                        json!({"success": true, "result": {
+                            "owner": client,
+                            "expiresAt": expires as u64,
+                            "ttlMs": ttl as u64
+                        }})
+                    }
+                }
+            } else {
+                json!({"success": false, "error": "lease state unavailable"})
+            };
+            Some(resp)
+        }
+        "release" => {
+            let resp = if let Ok(mut g) = lease.lock() {
+                match live_owner(&mut g, now) {
+                    Some(o) if o != client => {
+                        json!({"success": false, "error": "not lease owner"})
+                    }
+                    Some(_) => {
+                        g.owner = None;
+                        g.expires_at = None;
+                        json!({"success": true, "result": {"released": true}})
+                    }
+                    None => json!({"success": true, "result": {"released": false}}),
+                }
+            } else {
+                json!({"success": false, "error": "lease state unavailable"})
+            };
+            Some(resp)
+        }
+        "leaseStatus" => {
+            let resp = if let Ok(mut g) = lease.lock() {
+                let owner = live_owner(&mut g, now);
+                json!({"success": true, "result": {
+                    "owner": owner,
+                    "expiresAt": g.expires_at.map(|e| e as u64),
+                    "now": now as u64
+                }})
+            } else {
+                json!({"success": false, "error": "lease state unavailable"})
+            };
+            Some(resp)
+        }
+        _ => None,
+    }
+}
+
+/// Enforcement gate for non-lease actions: if another client holds a live lease,
+/// block with `leased by <owner>`. Returns Some(blocked_response) when blocked.
+fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
+    let now = now_ms();
+    if let Ok(mut g) = lease.lock() {
+        if let Some(o) = live_owner(&mut g, now) {
+            if o != client {
+                return Some(json!({"success": false, "error": format!("leased by {}", o)}));
+            }
+        }
+    }
+    None
+}
+
+/// Write a single newline-delimited JSON response line to the client socket.
+fn write_line(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
+    let mut out = serde_json::to_vec(value).unwrap_or_default();
+    out.push(b'\n');
+    stream.write_all(&out)?;
+    stream.flush()
+}
 
 fn handle_socket_client(
     mut stream: TcpStream,
-    token: &Arc<Option<String>>,
+    tokens: &Tokens,
     pending: &Pending,
+    lease: &LeaseState,
     stdout: &Arc<Mutex<io::Stdout>>,
     logger: &Arc<Logger>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let idle = socket_idle_timeout();
+    let _ = stream.set_read_timeout(Some(idle));
 
-    // Read a complete newline-delimited JSON request (TCP may split/coalesce).
+    // Serve many newline-delimited requests on one connection. The residual
+    // buffer carries bytes past the consumed line across iterations (TCP may
+    // split/coalesce frames).
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 65536];
-    while !buffer.contains(&b'\n') {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-            Err(_) => break,
+
+    loop {
+        // Read until we have at least one complete line.
+        while !buffer.contains(&b'\n') {
+            match stream.read(&mut chunk) {
+                Ok(0) => return, // client closed
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(_) => return, // idle timeout or other IO error: drop connection
+            }
         }
-    }
 
-    if buffer.iter().all(|b| b.is_ascii_whitespace()) {
-        drop(stream);
-        return;
-    }
+        let nl = match buffer.iter().position(|&b| b == b'\n') {
+            Some(i) => i,
+            None => continue,
+        };
+        let line: Vec<u8> = buffer.drain(..=nl).take(nl).collect();
 
-    let line: Vec<u8> = buffer
-        .iter()
-        .copied()
-        .take_while(|&b| b != b'\n')
-        .collect();
-
-    let mut cmd: Value = match serde_json::from_slice(&line) {
-        Ok(v) => v,
-        Err(e) => {
-            log_error(logger, &format!("Error handling socket client: {}", e));
-            drop(stream);
-            return;
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            continue; // tolerate blank keep-alive lines
         }
-    };
 
-    // Reject any request missing or mismatching the shared token.
-    let authorized = match token.as_ref() {
-        Some(expected) => cmd
+        let mut cmd: Value = match serde_json::from_slice(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                log_error(logger, &format!("Error handling socket client: {}", e));
+                return;
+            }
+        };
+
+        // Reject any request whose token is missing or not in the registry.
+        let client_name = cmd
             .get("token")
             .and_then(|t| t.as_str())
-            .map(|t| t == expected)
-            .unwrap_or(false),
-        None => false,
-    };
+            .and_then(|t| tokens.get(t))
+            .cloned();
+        let client_name = match client_name {
+            Some(name) => name,
+            None => {
+                log_warn(logger, "Rejected unauthenticated/invalid-token request.");
+                let _ = write_line(&mut stream, &json!({"success": false, "error": "unauthorized"}));
+                return;
+            }
+        };
 
-    if !authorized {
-        log_warn(logger, "Rejected unauthenticated/invalid-token request.");
-        let resp = json!({"success": false, "error": "unauthorized"});
-        let mut out = serde_json::to_vec(&resp).unwrap_or_default();
-        out.push(b'\n');
-        let _ = stream.write_all(&out);
-        let _ = stream.flush();
-        drop(stream);
-        return;
+        // Never forward the secret to the extension.
+        if let Value::Object(map) = &mut cmd {
+            map.remove("token");
+        }
+
+        let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        let payload = cmd.get("payload").cloned();
+
+        // Lease verbs are answered host-side with no extension round-trip.
+        if let Some(resp) = handle_lease_action(&action, payload.as_ref(), &client_name, lease) {
+            if write_line(&mut stream, &resp).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // A live lease held by another client blocks every other action.
+        if let Some(blocked) = lease_gate(&client_name, lease) {
+            if write_line(&mut stream, &blocked).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        let req_id = uuid::Uuid::new_v4().to_string();
+        if let Value::Object(map) = &mut cmd {
+            map.insert("id".to_string(), Value::String(req_id.clone()));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+        if let Ok(mut p) = pending.lock() {
+            p.insert(req_id.clone(), tx);
+        }
+
+        // Send to extension, then block this connection until its response.
+        write_message(stdout, logger, &cmd);
+        match rx.recv_timeout(idle) {
+            Ok(response) => {
+                if write_line(&mut stream, &response).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                log_error(
+                    logger,
+                    &format!("Timed out waiting for extension response to {}.", req_id),
+                );
+                if let Ok(mut p) = pending.lock() {
+                    p.remove(&req_id);
+                }
+                let _ = write_line(
+                    &mut stream,
+                    &json!({"success": false, "error": "extension response timeout"}),
+                );
+                return;
+            }
+        }
     }
-
-    // Never forward the secret to the extension.
-    if let Value::Object(map) = &mut cmd {
-        map.remove("token");
-    }
-
-    let req_id = uuid::Uuid::new_v4().to_string();
-    if let Value::Object(map) = &mut cmd {
-        map.insert("id".to_string(), Value::String(req_id.clone()));
-    }
-
-    if let Ok(mut p) = pending.lock() {
-        p.insert(req_id, stream);
-    }
-
-    write_message(stdout, logger, &cmd);
 }
 
 fn socket_server_loop(
-    token: Arc<Option<String>>,
+    tokens: Tokens,
     pending: Pending,
+    lease: LeaseState,
     stdout: Arc<Mutex<io::Stdout>>,
     logger: Arc<Logger>,
 ) {
@@ -231,12 +463,13 @@ fn socket_server_loop(
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "<unknown>".to_string());
                 log_info(&logger, &format!("Accepted connection from {}", addr));
-                let token = Arc::clone(&token);
+                let tokens = Arc::clone(&tokens);
                 let pending = Arc::clone(&pending);
+                let lease = Arc::clone(&lease);
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &token, &pending, &stdout, &logger);
+                    handle_socket_client(stream, &tokens, &pending, &lease, &stdout, &logger);
                 });
             }
             Err(e) => {
@@ -257,17 +490,22 @@ fn main() {
 
     log_info(&logger, "Native Messaging Host started.");
 
-    let token: Arc<Option<String>> = Arc::new(load_token(&host_dir, &logger));
+    let tokens: Tokens = Arc::new(load_tokens(&host_dir, &logger));
     let stdout: Arc<Mutex<io::Stdout>> = Arc::new(Mutex::new(io::stdout()));
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let lease: LeaseState = Arc::new(Mutex::new(Lease {
+        owner: None,
+        expires_at: None,
+    }));
 
     {
-        let token = Arc::clone(&token);
+        let tokens = Arc::clone(&tokens);
         let pending = Arc::clone(&pending);
+        let lease = Arc::clone(&lease);
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(token, pending, stdout, logger);
+            socket_server_loop(tokens, pending, lease, stdout, logger);
         });
     }
 
@@ -313,35 +551,30 @@ fn main() {
 
         match msg_id {
             Some(id) => {
-                let client = pending.lock().ok().and_then(|mut p| p.remove(&id));
-                match client {
-                    Some(mut stream) => {
-                        let mut out = serde_json::to_vec(&msg).unwrap_or_default();
-                        out.push(b'\n');
-                        match stream.write_all(&out).and_then(|_| stream.flush()) {
-                            Ok(()) => {
-                                drop(stream);
-                                log_info(
-                                    &logger,
-                                    &format!(
-                                        "Routed response for request ID {} back to socket client.",
-                                        id
-                                    ),
-                                );
-                            }
-                            Err(e) => {
-                                log_error(
-                                    &logger,
-                                    &format!("Error sending response to socket client: {}", e),
-                                );
-                            }
+                let sender = pending.lock().ok().and_then(|mut p| p.remove(&id));
+                match sender {
+                    Some(tx) => match tx.send(msg) {
+                        Ok(()) => {
+                            log_info(
+                                &logger,
+                                &format!(
+                                    "Routed response for request ID {} to its socket handler.",
+                                    id
+                                ),
+                            );
                         }
-                    }
+                        Err(e) => {
+                            log_error(
+                                &logger,
+                                &format!("Error sending response to socket handler: {}", e),
+                            );
+                        }
+                    },
                     None => {
                         log_info(
                             &logger,
                             &format!(
-                                "Received message with ID {} but no pending socket client was found.",
+                                "Received message with ID {} but no pending request was found.",
                                 id
                             ),
                         );

@@ -282,6 +282,18 @@ def main():
     expect("browser://tabs" in res_uris, "browser://tabs resource missing")
     expect(any(u.startswith("browser://tab/") for u in res_uris), "tab state resource template missing")
 
+    # 19b. Lease tools emit the host-side lease verbs.
+    server.browser_lease(ttl_ms=5000)
+    expect(last_request() == ("lease", {"ttlMs": 5000}), "browser_lease payload mismatch")
+    server.browser_release()
+    expect(last_request() == ("release", {}), "browser_release payload mismatch")
+    server.browser_lease_status()
+    expect(last_request() == ("leaseStatus", {}), "browser_lease_status payload mismatch")
+    # lease verbs never resolve a tab (no getTabs).
+    with received_lock:
+        recent = [a for a, _ in received[-3:]]
+    expect("getTabs" not in recent, "lease tools must not resolve a tab")
+
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):
         raise _Unauthorized()

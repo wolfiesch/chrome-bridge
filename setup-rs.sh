@@ -40,13 +40,27 @@ if [[ ! -x "$RUST_BIN" ]]; then
   exit 1
 fi
 
-# 4. Render the host manifest from the template.
-sed -e "s#__BRIDGE_PY_PATH__#$RUST_BIN#g" \
+# 4. Generate a launcher that pins the repo-root token paths, since native-host
+#    manifests cannot pass env and the binary otherwise resolves paths relative
+#    to its own (cargo target) directory.
+LAUNCHER="$SCRIPT_DIR/bridge-host-launch.sh"
+cat > "$LAUNCHER" <<EOF
+#!/usr/bin/env bash
+export BRIDGE_TOKEN_FILE="\${BRIDGE_TOKEN_FILE:-$SCRIPT_DIR/bridge_token.txt}"
+export BRIDGE_TOKENS_FILE="\${BRIDGE_TOKENS_FILE:-$SCRIPT_DIR/bridge_tokens.txt}"
+export BRIDGE_LOG_FILE="\${BRIDGE_LOG_FILE:-$SCRIPT_DIR/bridge_debug.log}"
+exec "$RUST_BIN" "\$@"
+EOF
+chmod +x "$LAUNCHER"
+echo "Wrote launcher $LAUNCHER"
+
+# 5. Render the host manifest from the template (registers the launcher).
+sed -e "s#__BRIDGE_PY_PATH__#$LAUNCHER#g" \
     -e "s#__EXTENSION_ID__#$EXTENSION_ID#g" \
     "$TEMPLATE" > "$HOST_MANIFEST"
 echo "Wrote host manifest $HOST_MANIFEST"
 
-# 5. Register the host for every installed Chrome/Chromium variant on this OS.
+# 6. Register the host for every installed Chrome/Chromium variant on this OS.
 case "$(uname -s)" in
   Darwin)
     BASE="$HOME/Library/Application Support"

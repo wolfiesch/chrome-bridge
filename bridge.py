@@ -8,6 +8,7 @@ import socket
 import threading
 import uuid
 import queue
+import time
 
 # Resolve paths relative to this script so the install is location-independent.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -37,7 +38,41 @@ def load_token():
         logging.error(f"Could not read token file {token_file}: {e}")
         return None
 
-AUTH_TOKEN = load_token()
+# Per-client token registry. The legacy single token (bridge_token.txt) is the
+# `default` client; an optional name:token file adds named clients on top.
+def load_token_registry():
+    registry = {}
+    legacy = load_token()
+    if legacy:
+        registry[legacy] = 'default'
+    tokens_file = os.environ.get(
+        'BRIDGE_TOKENS_FILE', os.path.join(SCRIPT_DIR, 'bridge_tokens.txt'))
+    if os.path.exists(tokens_file):
+        try:
+            with open(tokens_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    name, sep, token = line.partition(':')
+                    if not sep:
+                        continue
+                    name, token = name.strip(), token.strip()
+                    if name and token:
+                        registry[token] = name
+        except Exception as e:
+            logging.error(f"Could not read tokens file {tokens_file}: {e}")
+    return registry
+
+TOKEN_REGISTRY = load_token_registry()
+
+# Cooperative leasing: at most one client holds an exclusive lease at a time.
+# A live lease blocks other clients' non-lease actions with "leased by <owner>".
+lease_lock = threading.Lock()
+lease_state = {'owner': None, 'expires_at': None}
+
+def now_ms():
+    return int(time.time() * 1000)
 
 # Keep-alive: a single TCP connection may carry many newline-delimited
 # requests. Idle connections are closed after this many seconds so a
@@ -65,6 +100,44 @@ def write_message(message):
         sys.stdout.buffer.write(encoded_message)
         sys.stdout.buffer.flush()
 
+def _lease_status_locked():
+    # Caller holds lease_lock. Returns the live lease snapshot, clearing it if expired.
+    owner = lease_state['owner']
+    expires_at = lease_state['expires_at']
+    if owner is not None and expires_at is not None and now_ms() >= expires_at:
+        lease_state['owner'] = None
+        lease_state['expires_at'] = None
+        owner = None
+        expires_at = None
+    return owner, expires_at
+
+def handle_lease_action(action, payload, name):
+    # Compute the host-side response for lease/release/leaseStatus. Returns a
+    # dict to send straight back to the client (never forwarded to the extension).
+    with lease_lock:
+        owner, expires_at = _lease_status_locked()
+        if action == 'lease':
+            if owner is not None and owner != name:
+                return {"success": False, "error": f"leased by {owner}"}
+            try:
+                ttl_ms = int(payload.get('ttlMs', 300000))
+            except (TypeError, ValueError):
+                ttl_ms = 300000
+            expires = now_ms() + ttl_ms
+            lease_state['owner'] = name
+            lease_state['expires_at'] = expires
+            return {"success": True, "result": {"owner": name, "expiresAt": expires, "ttlMs": ttl_ms}}
+        if action == 'release':
+            if owner is not None and owner != name:
+                return {"success": False, "error": "not lease owner"}
+            if owner is None:
+                return {"success": True, "result": {"released": False}}
+            lease_state['owner'] = None
+            lease_state['expires_at'] = None
+            return {"success": True, "result": {"released": True}}
+        # leaseStatus: non-mutating snapshot (expired leases already cleared).
+        return {"success": True, "result": {"owner": owner, "expiresAt": expires_at, "now": now_ms()}}
+
 def handle_socket_client(client_socket):
     # Serve many newline-delimited requests on one connection. Each request is
     # forwarded to the extension and its response awaited via a per-request
@@ -88,13 +161,30 @@ def handle_socket_client(client_socket):
                 continue  # tolerate blank keep-alive lines
             cmd = json.loads(line.decode('utf-8'))
 
-            # Reject any request missing or mismatching the shared token.
-            if not AUTH_TOKEN or cmd.get("token") != AUTH_TOKEN:
+            # Resolve the client by its token; unknown/missing token is rejected.
+            name = TOKEN_REGISTRY.get(cmd.get("token"))
+            if name is None:
                 logging.warning("Rejected unauthenticated/invalid-token request.")
                 client_socket.sendall(
                     (json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode('utf-8'))
                 return
             cmd.pop("token", None)  # never forward the secret to the extension
+
+            action = cmd.get("action")
+
+            # Lease control actions are answered host-side, never forwarded.
+            if action in ('lease', 'release', 'leaseStatus'):
+                resp = handle_lease_action(action, cmd.get("payload") or {}, name)
+                client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                continue
+
+            # Enforcement gate: a live lease held by another client blocks others.
+            with lease_lock:
+                owner, _ = _lease_status_locked()
+            if owner is not None and owner != name:
+                client_socket.sendall(
+                    (json.dumps({"success": False, "error": f"leased by {owner}"}) + "\n").encode('utf-8'))
+                continue
 
             req_id = str(uuid.uuid4())
             cmd["id"] = req_id

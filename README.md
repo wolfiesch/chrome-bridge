@@ -26,7 +26,7 @@ chrome-native-bridge/
 └── README.md
 ```
 
-`setup.sh` generates `bridge_token.txt` (0600 shared secret) and `com.automation.bridge.json`. Both are git-ignored and stay local. Keep Python files out of `extension/`: running them creates `__pycache__`, and Chrome refuses to load extension folders containing `_`-prefixed names.
+`setup.sh` generates `bridge_token.txt` (0600 shared secret) and `com.automation.bridge.json`; `setup-rs.sh` additionally generates `com.automation.bridge.rust.json` and the `bridge-host-launch.sh` wrapper. The optional `bridge_tokens.txt` named-token registry (see Multi-client tokens and leasing) is also a local secret. All of these are git-ignored and stay local. Keep Python files out of `extension/`: running them creates `__pycache__`, and Chrome refuses to load extension folders containing `_`-prefixed names.
 
 ## Components
 
@@ -225,7 +225,7 @@ Produces `host-rs/target/release/bridge-host`.
 ./setup-rs.sh <extension-id>
 ```
 
-Registers the Rust binary as the native host. It reuses the same `bridge_token.txt` and the same `com.automation.bridge` host name, so the unchanged extension talks to it transparently. Only one host (Python or Rust) can own the `com.automation.bridge` registration / port `9223` at a time.
+Registers the Rust binary as the native host. Because native-messaging manifests cannot pass environment variables and the binary otherwise resolves token/log paths relative to its own directory, `setup-rs.sh` generates a small `bridge-host-launch.sh` wrapper that exports the repo-root `BRIDGE_TOKEN_FILE`/`BRIDGE_TOKENS_FILE`/`BRIDGE_LOG_FILE` and registers that launcher. It reuses the same `bridge_token.txt` and the same `com.automation.bridge` host name, so the unchanged extension talks to it transparently. Only one host (Python or Rust) can own the `com.automation.bridge` registration / port `9223` at a time.
 
 ### Verify
 
@@ -255,7 +255,7 @@ Read-only:
 - `browser_snapshot` (accessibility snapshot)
 - `browser_extract_text`
 - `browser_screenshot` (returned inline as an image)
-- `browser_get_html`
+- `browser_get_html`, `browser_lease_status`
 - `browser_wait_for` (`mode`: `load|selector|text|url`)
 
 Sensitive:
@@ -269,7 +269,7 @@ Mutating:
 - `browser_scroll`, `browser_press`, `browser_drag`
 - `browser_select`
 - `browser_upload_file` (validates local paths before contacting Chrome)
-- `browser_tab_control` (`op`: `activate|close|reload|back|forward`)
+- `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
 
 Escape hatch (sensitive):
 
@@ -309,6 +309,28 @@ Copy `mcp/claude_desktop_config.example.json` into your MCP client config and se
 ```
 
 The server honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, `BRIDGE_CONNECT_TIMEOUT_SECONDS`, `BRIDGE_MCP_READONLY`, and `BRIDGE_MCP_ALLOW_SENSITIVE`, and reads the same `bridge_token.txt`. Chrome with the loaded extension must be running and the native host registered (`./setup.sh` or `./setup-rs.sh`).
+
+### HTTP transport
+
+By default the server speaks stdio. Set `BRIDGE_MCP_TRANSPORT=http` to serve over streamable HTTP instead, bound to `BRIDGE_MCP_HTTP_HOST` (default `127.0.0.1`) and `BRIDGE_MCP_HTTP_PORT` (default `8723`). Note: the server forwards a single ambient bridge token, so all HTTP clients share one bridge identity. Cooperative leasing (below) arbitrates only between distinct token identities (e.g. separate stdio servers each pointed at their own named token); per-request token propagation over one HTTP endpoint is not yet implemented.
+
+## Multi-client tokens and leasing
+
+The bridge accepts multiple named client tokens and offers a cooperative, host-side lease so several agents can share one real Chrome profile without colliding. Both the Python and Rust hosts implement this identically; it is enforced entirely in the host (lease actions are never forwarded to the extension).
+
+### Named tokens
+
+`bridge_token.txt` (the legacy single token) is always accepted under the client name `default`. Additionally, if `bridge_tokens.txt` (override with `BRIDGE_TOKENS_FILE`) exists, each non-empty, non-`#` line is parsed as `name:token` (split on the first colon) and registered as an extra named client. See `bridge_tokens.txt.example`. A request is authorized if its token matches any known token; the matched token determines the requesting client's name. `bridge_tokens.txt` is a secret registry and is git-ignored.
+
+### Lease protocol
+
+Three host-answered actions (also exposed as MCP tools `browser_lease`, `browser_release`, `browser_lease_status`):
+
+- `lease` — payload optional `{"ttlMs": int}` (default 300000). Acquires the lease when free, expired, or already yours; otherwise returns `leased by <owner>`.
+- `release` — releases your lease (`released: true`); `released: false` when no live lease; `not lease owner` when another client holds it.
+- `leaseStatus` — non-mutating snapshot `{owner, expiresAt, now}` (epoch ms; `owner` null when unheld).
+
+While a live lease is held, every non-lease action from a different client (including `batch`) is rejected with `leased by <owner>` before forwarding, so the lease cannot be bypassed. Leases auto-expire after their TTL. `BRIDGE_SOCKET_IDLE_TIMEOUT` (default 300s) bounds how long a persistent connection may idle.
 
 ## Benchmarking against other browser automation surfaces
 

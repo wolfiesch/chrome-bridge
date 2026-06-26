@@ -1,10 +1,14 @@
 # Secrets — never commit
 bridge_token.txt
+bridge_tokens.txt
 extension_key.pem
 *.pem
 
-# Generated host manifest (contains absolute paths + your extension ID)
+# Generated host manifests (contain absolute paths + your extension ID)
 com.automation.bridge.json
+com.automation.bridge.rust.json
+# Generated Rust launcher (machine-specific absolute paths)
+bridge-host-launch.sh
 
 # Logs and caches
 bridge_debug.log
