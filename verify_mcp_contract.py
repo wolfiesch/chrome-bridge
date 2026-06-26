@@ -28,6 +28,9 @@ TOKEN_FIXTURE = "/tmp/chrome-bridge-mcp-token.txt"
 with open(TOKEN_FIXTURE, "w", encoding="utf-8") as f:
     f.write("mcp-token\n")
 os.environ["BRIDGE_TOKEN_FILE"] = TOKEN_FIXTURE
+# Hermetic gating: do not inherit scoping flags from the runner's environment.
+os.environ.pop("BRIDGE_MCP_READONLY", None)
+os.environ.pop("BRIDGE_MCP_ALLOW_SENSITIVE", None)
 
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "mcp"))
 from chrome_bridge_mcp import server  # noqa: E402

@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -197,15 +198,157 @@ def get_bridge_command():
     return [BRIDGE_COMMAND] if BRIDGE_COMMAND else [sys.executable, str(CLIENT)]
 
 
+def _load_bridge_token():
+    token_file = os.environ.get("BRIDGE_TOKEN_FILE", str(SCRIPT_DIR / "bridge_token.txt"))
+    with open(token_file) as f:
+        return f.read().strip()
+
+
+# Maps the harness's CLI-style verbs to (bridge action, payload-builder). This
+# mirrors test_client.py's argument handling so an in-process socket client can
+# speak the bridge protocol directly, without spawning python3 per operation.
+def _build_bridge_payload(verb, args):
+    if verb == "ping":
+        return "ping", {}
+    if verb == "navigate":
+        return "navigate", {"url": args[0]}
+    if verb == "waitForLoad":
+        return "waitForLoad", {"tabId": int(args[0]), "timeoutMs": int(args[1])}
+    if verb == "waitForSelector":
+        return "waitForSelector", {"tabId": int(args[0]), "selector": args[1], "timeoutMs": int(args[2])}
+    if verb == "click":
+        return "click", {"tabId": int(args[0]), "selector": args[1]}
+    if verb == "fill":
+        return "fill", {"tabId": int(args[0]), "selector": args[1], "text": args[2]}
+    if verb == "select":
+        return "select", {"tabId": int(args[0]), "selector": args[1], "value": args[2]}
+    if verb == "uploadFile":
+        return "uploadFile", {"tabId": int(args[0]), "selector": args[1], "files": [os.path.abspath(p) for p in args[2:]]}
+    if verb == "screenshot":
+        return "screenshot", {"tabId": int(args[0]), "format": "png"}
+    if verb == "extractText":
+        return "extractText", {"tabId": int(args[0]), "maxChars": int(args[1])}
+    if verb == "getHTML":
+        return "getHTML", {"tabId": int(args[0])}
+    if verb == "getCurrentState":
+        return "getCurrentState", {"tabId": int(args[0])}
+    if verb == "storageState":
+        return "storageState", {"tabId": int(args[0])}
+    if verb == "setGeolocation":
+        accuracy = float(args[3]) if len(args) > 3 else None
+        return "setGeolocation", {"tabId": int(args[0]), "latitude": float(args[1]), "longitude": float(args[2]), "accuracy": accuracy}
+    if verb == "clearGeolocation":
+        return "clearGeolocation", {"tabId": int(args[0])}
+    if verb in {"performanceMetrics", "closeTab", "startMonitoring", "stopMonitoring", "consoleMessages", "networkRequests"}:
+        return verb, {"tabId": int(args[0])}
+    if verb == "batch":
+        payload = {"steps": json.loads(args[0])}
+        if len(args) > 1:
+            payload["tabId"] = int(args[1])
+        return "batch", payload
+    raise ValueError(f"Unmapped bridge verb: {verb}")
+
+
+class BridgeClient:
+    """Persistent in-process bridge client.
+
+    Holds one keep-alive TCP connection to the native host and reuses it for
+    every request, eliminating the per-operation python3 subprocess spawn and
+    TCP handshake that dominated Chrome Bridge latency.
+    """
+
+    def __init__(self, timeout=20):
+        self._token = _load_bridge_token()
+        self._port = int(os.environ.get("BRIDGE_PORT", 9223))
+        self._timeout = timeout
+        self._sock = None
+        self._buffer = b""
+
+    def _connect(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self._timeout)
+        sock.connect(("127.0.0.1", self._port))
+        self._sock = sock
+        self._buffer = b""
+
+    def _recv_line(self):
+        while b"\n" not in self._buffer:
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("bridge closed the connection")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line
+
+    def request(self, action, payload):
+        cmd = json.dumps({"action": action, "payload": payload, "token": self._token}) + "\n"
+        # One transparent reconnect: the host may have idled the socket shut.
+        for attempt in range(2):
+            try:
+                if self._sock is None:
+                    self._connect()
+                self._sock.sendall(cmd.encode("utf-8"))
+                line = self._recv_line()
+                return json.loads(line.decode("utf-8"))
+            except (OSError, ConnectionError) as exc:
+                self.close()
+                if attempt == 1:
+                    raise RuntimeError(f"bridge request failed: {exc}")
+        raise RuntimeError("bridge request failed")
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+            self._buffer = b""
+
+
+# Lazily-created shared client so run_chrome_bridge_op need not change shape.
+_bridge_client = None
+
+
+def get_bridge_client():
+    global _bridge_client
+    if _bridge_client is None:
+        _bridge_client = BridgeClient()
+    return _bridge_client
+
+
+def reset_bridge_client():
+    global _bridge_client
+    if _bridge_client is not None:
+        _bridge_client.close()
+        _bridge_client = None
+
+
 def run_bridge_cmd(*args, timeout=20):
-    proc = subprocess.run([*get_bridge_command(), *map(str, args)], text=True, capture_output=True, timeout=timeout)
-    parsed = None
-    if proc.stdout:
-        try:
-            parsed = json.loads(proc.stdout)
-        except Exception:
-            pass
-    return {"exit": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "json": parsed}
+    # If an external launcher is configured, preserve the subprocess path so
+    # CHROME_BRIDGE_CLIENT still works; otherwise use the persistent client.
+    if BRIDGE_COMMAND:
+        proc = subprocess.run([BRIDGE_COMMAND, *map(str, args)], text=True, capture_output=True, timeout=timeout)
+        parsed = None
+        if proc.stdout:
+            try:
+                parsed = json.loads(proc.stdout)
+            except Exception:
+                pass
+        return {"exit": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "json": parsed}
+
+    verb = args[0]
+    rest = [str(a) for a in args[1:]]
+    try:
+        action, payload = _build_bridge_payload(verb, rest)
+        response = get_bridge_client().request(action, payload)
+    except Exception as exc:
+        return {"exit": 1, "stdout": "", "stderr": str(exc), "json": None}
+    exit_code = 0 if response.get("success") is True else 1
+    result = response.get("result")
+    if isinstance(result, dict) and result.get("success") is False:
+        exit_code = 1
+    return {"exit": exit_code, "stdout": json.dumps(response), "stderr": "", "json": response}
 
 
 def get_result(call):
@@ -677,6 +820,7 @@ def handle_run(args):
         output_path.write_text(json.dumps(output_data, indent=2), encoding="utf-8")
         print(f"Benchmark results successfully written to {args.output}")
     finally:
+        reset_bridge_client()
         if server:
             server.shutdown()
             server.server_close()

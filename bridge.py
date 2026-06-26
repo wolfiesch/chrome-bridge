@@ -7,6 +7,7 @@ import logging
 import socket
 import threading
 import uuid
+import queue
 
 # Resolve paths relative to this script so the install is location-independent.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -18,6 +19,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Maps in-flight request id -> queue.Queue the handler thread blocks on for
+# the extension's response. The reader thread (main) routes responses here.
 pending_requests = {}
 requests_lock = threading.Lock()
 stdout_lock = threading.Lock()
@@ -35,6 +38,11 @@ def load_token():
         return None
 
 AUTH_TOKEN = load_token()
+
+# Keep-alive: a single TCP connection may carry many newline-delimited
+# requests. Idle connections are closed after this many seconds so a
+# persistent client can reconnect transparently.
+SOCKET_IDLE_TIMEOUT = float(os.environ.get('BRIDGE_SOCKET_IDLE_TIMEOUT', 300))
 
 def read_message():
     raw_length = sys.stdin.buffer.read(4)
@@ -58,43 +66,60 @@ def write_message(message):
         sys.stdout.buffer.flush()
 
 def handle_socket_client(client_socket):
+    # Serve many newline-delimited requests on one connection. Each request is
+    # forwarded to the extension and its response awaited via a per-request
+    # queue before the next request is read, preserving request/response order.
+    buffer = b""
     try:
-        # Read a complete newline-delimited JSON request (TCP may split/coalesce)
-        client_socket.settimeout(30)
-        buffer = b""
-        while b"\n" not in buffer:
-            chunk = client_socket.recv(65536)
-            if not chunk:
-                break
-            buffer += chunk
-        if not buffer.strip():
-            client_socket.close()
-            return
-        line = buffer.split(b"\n", 1)[0]
-        cmd = json.loads(line.decode('utf-8'))
+        client_socket.settimeout(SOCKET_IDLE_TIMEOUT)
+        while True:
+            # Read until we have at least one complete line (TCP may split/coalesce).
+            while b"\n" not in buffer:
+                try:
+                    chunk = client_socket.recv(65536)
+                except socket.timeout:
+                    return  # idle too long; drop the connection
+                if not chunk:
+                    return  # client closed
+                buffer += chunk
 
-        # Reject any request missing or mismatching the shared token.
-        if not AUTH_TOKEN or cmd.get("token") != AUTH_TOKEN:
-            logging.warning("Rejected unauthenticated/invalid-token request.")
-            client_socket.sendall(
-                (json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode('utf-8'))
-            client_socket.close()
-            return
-        cmd.pop("token", None)  # never forward the secret to the extension
+            line, buffer = buffer.split(b"\n", 1)
+            if not line.strip():
+                continue  # tolerate blank keep-alive lines
+            cmd = json.loads(line.decode('utf-8'))
 
-        req_id = str(uuid.uuid4())
-        cmd["id"] = req_id
+            # Reject any request missing or mismatching the shared token.
+            if not AUTH_TOKEN or cmd.get("token") != AUTH_TOKEN:
+                logging.warning("Rejected unauthenticated/invalid-token request.")
+                client_socket.sendall(
+                    (json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode('utf-8'))
+                return
+            cmd.pop("token", None)  # never forward the secret to the extension
 
-        with requests_lock:
-            pending_requests[req_id] = client_socket
+            req_id = str(uuid.uuid4())
+            cmd["id"] = req_id
+            response_queue = queue.Queue(maxsize=1)
+            with requests_lock:
+                pending_requests[req_id] = response_queue
 
-        # Send to extension
-        write_message(cmd)
+            # Send to extension, then block this connection until its response.
+            write_message(cmd)
+            try:
+                response = response_queue.get(timeout=SOCKET_IDLE_TIMEOUT)
+            except queue.Empty:
+                logging.error(f"Timed out waiting for extension response to {req_id}.")
+                with requests_lock:
+                    pending_requests.pop(req_id, None)
+                client_socket.sendall(
+                    (json.dumps({"success": False, "error": "extension response timeout"}) + "\n").encode('utf-8'))
+                return
+            client_socket.sendall((json.dumps(response) + "\n").encode('utf-8'))
     except Exception as e:
         logging.error(f"Error handling socket client: {e}", exc_info=True)
+    finally:
         try:
             client_socket.close()
-        except:
+        except Exception:
             pass
 
 def socket_server_loop():
@@ -135,19 +160,14 @@ def main():
             # If the extension sent a response to a command we initiated
             msg_id = msg.get("id")
             if msg_id:
-                client_sock = None
+                response_queue = None
                 with requests_lock:
-                    if msg_id in pending_requests:
-                        client_sock = pending_requests.pop(msg_id)
-                if client_sock:
-                    try:
-                        client_sock.sendall((json.dumps(msg) + "\n").encode('utf-8'))
-                        client_sock.close()
-                        logging.info(f"Routed response for request ID {msg_id} back to socket client.")
-                    except Exception as e:
-                        logging.error(f"Error sending response to socket client: {e}", exc_info=True)
+                    response_queue = pending_requests.pop(msg_id, None)
+                if response_queue is not None:
+                    response_queue.put(msg)
+                    logging.info(f"Routed response for request ID {msg_id} to its socket handler.")
                 else:
-                    logging.info(f"Received message with ID {msg_id} but no pending socket client was found.")
+                    logging.info(f"Received message with ID {msg_id} but no pending request was found.")
             else:
                 logging.info(f"Received message from Chrome with no ID: {msg}")
         except Exception as e:
