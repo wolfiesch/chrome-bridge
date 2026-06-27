@@ -98,10 +98,10 @@ def run_against(label, cmd, port):
         # transport/coalescing path is exercised without live-tab policy checks.
         coalesced = (
             json.dumps({"action": "ping", "payload": {}, "token": TOKEN}) + "\n" +
-            json.dumps({"action": "click", "payload": {}, "token": TOKEN}) + "\n"
+            json.dumps({"action": "getTabs", "payload": {}, "token": TOKEN}) + "\n"
         ).encode()
         sock.sendall(coalesced)
-        for action in ("ping", "click"):
+        for action in ("ping", "getTabs"):
             line, buf = recv_line(sock, buf)
             expect(line is not None, f"no response for coalesced {action}")
             if line:

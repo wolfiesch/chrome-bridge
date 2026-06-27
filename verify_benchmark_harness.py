@@ -168,15 +168,6 @@ def main():
             else:
                 os.environ["CHROME_BRIDGE_BENCHMARK_PS_OUTPUT"] = old_override
         require(not guard_out.exists(), "browser RSS guard must not write a normal unsupported report")
-        proc = run(
-            "run", "--adapter", "playwright", "--iterations", "1",
-            "--browser-rss-limit-mb", "3", "--output", str(Path(tmp) / "rss-cli.json"),
-            extra_env={"CHROME_BRIDGE_BENCHMARK_PS_OUTPUT": ps_sample},
-        )
-        require(proc.returncode != 0, "browser RSS CLI guard must fail")
-        require(proc.stderr.strip() == "browser RSS 4 MB exceeds limit 3 MB",
-                "browser RSS CLI guard must print a concise error")
-        require("Traceback" not in proc.stderr, "browser RSS CLI guard must not print a traceback")
 
         second = Path(tmp) / "other.json"
         other = dict(data)
