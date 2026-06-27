@@ -410,6 +410,8 @@ Three host-answered actions (also exposed as MCP tools `browser_lease`, `browser
 
 While a live lease is held, every non-lease action from a different client (including `batch`) is rejected with `leased by <owner>` before forwarding, so the lease cannot be bypassed. Leases auto-expire after their TTL. `BRIDGE_SOCKET_IDLE_TIMEOUT` (default 300s) bounds how long a persistent connection may idle.
 
+`verify_lease_contract.py` covers the basic named-token and lease semantics. `verify_lease_stress_contract.py` adds race/load coverage for simultaneous lease acquisition, non-owner denial without extension forwarding, owner concurrency, TTL expiry, release races, and TCP disconnect behavior.
+
 ## Benchmarking against other browser automation surfaces
 
 The benchmark harness measures speed for selected adapters. `chrome-bridge`, `playwright`, `puppeteer`, and `chrome-devtools-mcp` are live-measurable; Claude in Chrome and Codex Chrome Extension remain manual/static capability metadata. The report also emits a normalized scorecard, claim-discipline note, and gap tickets.
