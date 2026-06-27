@@ -366,6 +366,21 @@ async function dispatchAction(action, payload) {
       case "setViewport":
         result = await setViewport(payload.tabId, payload.width, payload.height, payload.deviceScaleFactor);
         break;
+      case "setCpuThrottling":
+        result = await setCpuThrottling(payload.tabId, payload.rate);
+        break;
+      case "setNetworkConditions":
+        result = await setNetworkConditions(payload.tabId, payload.offline, payload.latency, payload.downloadThroughput, payload.uploadThroughput);
+        break;
+      case "clearNetworkConditions":
+        result = await clearNetworkConditions(payload.tabId);
+        break;
+      case "setColorScheme":
+        result = await setColorScheme(payload.tabId, payload.scheme);
+        break;
+      case "setUserAgent":
+        result = await setUserAgent(payload.tabId, payload.userAgent);
+        break;
       case "startMonitoring":
         result = await startMonitoring(payload.tabId);
         break;
@@ -878,6 +893,59 @@ async function setViewport(tabId, width, height, deviceScaleFactor) {
     const scale = deviceScaleFactor || 1;
     await debuggerCommand(target, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: scale, mobile: false });
     return { success: true, width, height, deviceScaleFactor: scale };
+  });
+}
+
+async function setCpuThrottling(tabId, rate) {
+  const throttlingRate = Number(rate);
+  if (!Number.isFinite(throttlingRate) || throttlingRate < 1) return { success: false, err: 'CPU throttling rate must be >= 1' };
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Emulation.setCPUThrottlingRate', { rate: throttlingRate });
+    return { success: true, tabId, rate: throttlingRate };
+  });
+}
+
+async function setNetworkConditions(tabId, offline, latency, downloadThroughput, uploadThroughput) {
+  const conditions = {
+    offline: !!offline,
+    latency: latency !== undefined && latency !== null ? Number(latency) : 0,
+    downloadThroughput: downloadThroughput !== undefined && downloadThroughput !== null ? Number(downloadThroughput) : -1,
+    uploadThroughput: uploadThroughput !== undefined && uploadThroughput !== null ? Number(uploadThroughput) : -1
+  };
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Network.enable', {});
+    await debuggerCommand(target, 'Network.emulateNetworkConditions', conditions);
+    return { success: true, tabId, offline: conditions.offline };
+  });
+}
+
+async function clearNetworkConditions(tabId) {
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Network.enable', {});
+    await debuggerCommand(target, 'Network.emulateNetworkConditions', {
+      offline: false,
+      latency: 0,
+      downloadThroughput: -1,
+      uploadThroughput: -1
+    });
+    return { success: true, tabId };
+  });
+}
+
+async function setColorScheme(tabId, scheme) {
+  if (!['light', 'dark', 'no-preference'].includes(scheme)) return { success: false, err: 'scheme must be light|dark|no-preference' };
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] });
+    return { success: true, tabId, scheme };
+  });
+}
+
+async function setUserAgent(tabId, userAgent) {
+  if (typeof userAgent !== 'string' || !userAgent.trim()) return { success: false, err: 'userAgent must be a non-empty string' };
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Network.enable', {});
+    await debuggerCommand(target, 'Network.setUserAgentOverride', { userAgent });
+    return { success: true, tabId };
   });
 }
 

@@ -376,8 +376,9 @@ fn mutating_actions() -> &'static [&'static str] {
         "navigate", "click", "type", "fill", "hover", "scroll", "press", "drag",
         "select", "uploadFile", "activateTab", "closeTab", "reload", "goBack",
         "goForward", "setViewport", "setGeolocation", "clearGeolocation",
-        "startInterception", "stopInterception", "startMonitoring", "stopMonitoring",
-        "handleDialog", "downloadUrl", "batch",
+        "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
+        "setColorScheme", "setUserAgent", "startInterception", "stopInterception",
+        "startMonitoring", "stopMonitoring", "handleDialog", "downloadUrl", "batch",
     ]
 }
 

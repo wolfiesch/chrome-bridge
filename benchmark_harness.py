@@ -2,6 +2,7 @@
 import argparse
 import http.server
 import json
+import re
 import os
 import shutil
 import socket
@@ -666,12 +667,13 @@ try {
 }
 let browser;
 try {
-  browser = await puppeteer.launch({headless: 'new'});
-} catch (launchError) {
-  // Bundled Chrome may be absent; fall back to the system Chrome stable
-  // channel (this is also how chrome-devtools-mcp launches Chrome).
-  browser = await puppeteer.launch({channel: 'chrome', headless: 'new'});
-}
+  try {
+    browser = await puppeteer.launch({headless: 'new'});
+  } catch (launchError) {
+    // Bundled Chrome may be absent; fall back to the system Chrome stable
+    // channel (this is also how chrome-devtools-mcp launches Chrome).
+    browser = await puppeteer.launch({channel: 'chrome', headless: 'new'});
+  }
   await browser.defaultBrowserContext().overridePermissions(baseUrl, ['geolocation']);
   for (let i = 0; i < iterations; i++) {
     const page = await browser.newPage();
@@ -773,8 +775,199 @@ def run_puppeteer(args, results, base_url):
     run_puppeteer_runner(args, results, base_url, "Puppeteer", ".chrome-bridge-puppeteer-")
 
 
+def _cdt_mcp_text(result):
+    parts = []
+    for item in getattr(result, "content", []) or []:
+        if hasattr(item, "text"):
+            parts.append(item.text)
+        elif hasattr(item, "model_dump_json"):
+            parts.append(item.model_dump_json())
+        else:
+            parts.append(str(item))
+    if not parts and hasattr(result, "structuredContent"):
+        parts.append(json.dumps(getattr(result, "structuredContent")))
+    return "\n".join(parts)
+
+
+async def _cdt_mcp_call(session, name, arguments=None):
+    result = await session.call_tool(name, arguments or {})
+    if getattr(result, "isError", False):
+        detail = _cdt_mcp_text(result) or "tool returned an error"
+        raise RuntimeError(f"{name} failed: {detail}")
+    return result
+
+
+def _cdt_mcp_uid_from_snapshot(snapshot, needles):
+    uid_patterns = [
+        r"\buid[=:]\s*[\"']?([^\"'\]\s,}]+)",
+        r"\[uid=[\"']?([^\"'\]]+)[\"']?\]",
+        r"\buid\s+[\"']([^\"']+)[\"']",
+    ]
+    lines = snapshot.splitlines()
+    lowered_needles = [needle.lower() for needle in needles]
+    for line in lines:
+        haystack = line.lower()
+        if not any(needle in haystack for needle in lowered_needles):
+            continue
+        for pattern in uid_patterns:
+            match = re.search(pattern, line)
+            if match:
+                return match.group(1).rstrip(".,")
+    for index, line in enumerate(lines):
+        haystack = line.lower()
+        if not any(needle in haystack for needle in lowered_needles):
+            continue
+        nearby = "\n".join(lines[index: index + 2])
+        for pattern in uid_patterns:
+            match = re.search(pattern, nearby)
+            if match:
+                return match.group(1).rstrip(".,")
+    return None
+
+
+async def _cdt_mcp_snapshot(session):
+    return _cdt_mcp_text(await _cdt_mcp_call(session, "take_snapshot"))
+
+
+async def _cdt_mcp_uid(session, *needles):
+    snapshot = await _cdt_mcp_snapshot(session)
+    uid = _cdt_mcp_uid_from_snapshot(snapshot, needles)
+    if not uid:
+        raise UnsupportedAdapter(f"could not find uid for {', '.join(needles)} in take_snapshot output")
+    return uid
+
+
+async def _run_chrome_devtools_mcp_op(session, context, op_name, base_url):
+    if op_name == "ping":
+        await _cdt_mcp_call(session, "list_pages")
+    elif op_name == "navigate":
+        if context.get("page_opened"):
+            await _cdt_mcp_call(session, "navigate_page", {"url": base_url})
+        else:
+            await _cdt_mcp_call(session, "new_page", {"url": base_url})
+            context["page_opened"] = True
+    elif op_name == "wait-load":
+        await _cdt_mcp_call(session, "wait_for", {"text": ["Benchmark Fixture"]})
+    elif op_name == "wait-selector":
+        await _cdt_mcp_call(session, "wait_for", {"text": ["ready"]})
+    elif op_name == "click":
+        uid = await _cdt_mcp_uid(session, "Click me")
+        await _cdt_mcp_call(session, "click", {"uid": uid})
+    elif op_name == "fill":
+        uid = await _cdt_mcp_uid(session, "textbox", "input")
+        await _cdt_mcp_call(session, "fill", {"uid": uid, "value": "hello"})
+    elif op_name == "select":
+        uid = await _cdt_mcp_uid(session, "combobox", "select", "Alpha", "Beta")
+        try:
+            await _cdt_mcp_call(session, "fill", {"uid": uid, "value": "Beta"})
+        except Exception as exc:
+            raise UnsupportedAdapter(f"select via fill is unsupported: {exc}") from exc
+    elif op_name == "upload":
+        uid = await _cdt_mcp_uid(session, "file")
+        with tempfile.NamedTemporaryFile(prefix="upload-", suffix=".txt", delete=False) as f:
+            f.write(b"upload fixture\n")
+            temp_path = f.name
+        try:
+            await _cdt_mcp_call(session, "upload_file", {"uid": uid, "filePath": temp_path})
+        finally:
+            with contextlib_suppress():
+                os.unlink(temp_path)
+    elif op_name == "screenshot":
+        await _cdt_mcp_call(session, "take_screenshot")
+    elif op_name == "extract-text":
+        snapshot = await _cdt_mcp_snapshot(session)
+        if "Benchmark Fixture" not in snapshot:
+            raise RuntimeError("snapshot did not include fixture text")
+    elif op_name == "get-html":
+        await _cdt_mcp_call(session, "evaluate_script", {"function": "() => document.documentElement.outerHTML"})
+    elif op_name == "observe-state":
+        await _cdt_mcp_call(session, "take_snapshot")
+    elif op_name == "console-monitoring":
+        await _cdt_mcp_call(
+            session,
+            "evaluate_script",
+            {"function": "() => new Promise(resolve => { document.querySelector('#log').click(); setTimeout(resolve, 100); })"},
+        )
+        messages = _cdt_mcp_text(await _cdt_mcp_call(session, "list_console_messages"))
+        if "bridge fixture console message" not in messages:
+            raise RuntimeError("no console messages captured")
+    elif op_name == "network-monitoring":
+        await _cdt_mcp_call(
+            session,
+            "evaluate_script",
+            {"function": "() => new Promise(resolve => { document.querySelector('#fetch').click(); setTimeout(resolve, 100); })"},
+        )
+        requests = _cdt_mcp_text(await _cdt_mcp_call(session, "list_network_requests"))
+        if "data.json" not in requests:
+            raise RuntimeError("no network requests captured")
+    elif op_name == "dialog-handling":
+        await _cdt_mcp_call(
+            session,
+            "evaluate_script",
+            {"function": "() => { setTimeout(() => alert('hello dialog'), 0); return 'scheduled'; }"},
+        )
+        await _cdt_mcp_call(session, "handle_dialog", {"action": "accept"})
+    elif op_name == "storage-state":
+        await _cdt_mcp_call(
+            session,
+            "evaluate_script",
+            {"function": "() => ({cookies: document.cookie, localStorage: {...localStorage}, sessionStorage: {...sessionStorage}})"},
+        )
+    elif op_name == "geolocation":
+        try:
+            await _cdt_mcp_call(session, "emulate", {"geolocation": "37.7749,-122.4194"})
+        except Exception as exc:
+            raise UnsupportedAdapter(f"emulate geolocation is unsupported: {exc}") from exc
+        await _cdt_mcp_call(session, "evaluate_script", {"function": "() => Boolean(navigator.geolocation)"})
+    elif op_name == "performance-metrics":
+        await _cdt_mcp_call(session, "evaluate_script", {"function": "() => JSON.stringify(performance.timing)"})
+    else:
+        raise ValueError(f"Unknown operation: {op_name}")
+
+
+async def _run_chrome_devtools_mcp_async(args, results, base_url):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    server_params = StdioServerParameters(
+        command="npx",
+        args=["-y", "chrome-devtools-mcp@1.2.0", "--headless=true", "--isolated=true", "--channel=stable"],
+    )
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            context = {"page_opened": False}
+            for _ in range(args.iterations):
+                for op in OPERATIONS:
+                    t0 = time.perf_counter()
+                    try:
+                        await _run_chrome_devtools_mcp_op(session, context, op, base_url)
+                        record_op(results, op, "pass", (time.perf_counter() - t0) * 1000)
+                    except UnsupportedAdapter as exc:
+                        record_op(results, op, "unsupported", (time.perf_counter() - t0) * 1000, exc)
+                    except Exception as exc:
+                        record_op(results, op, "fail", (time.perf_counter() - t0) * 1000, exc)
+            if context.get("page_opened"):
+                with contextlib_suppress():
+                    await _cdt_mcp_call(session, "close_page")
+
+
 def run_chrome_devtools_mcp(args, results, base_url):
-    run_puppeteer_runner(args, results, base_url, "Chrome DevTools MCP", ".chrome-devtools-mcp-")
+    if args.iterations == 0:
+        return
+    if not shutil.which("node") or not shutil.which("npx"):
+        mark_all(results, "unsupported", "node/npx executable is not available")
+        return
+    try:
+        import asyncio
+        import mcp  # noqa: F401
+    except Exception as exc:
+        mark_all(results, "unsupported", f"Python MCP SDK is not installed: {exc}")
+        return
+    try:
+        asyncio.run(_run_chrome_devtools_mcp_async(args, results, base_url))
+    except Exception as exc:
+        mark_all(results, "unsupported", f"Chrome DevTools MCP server launch failed: {exc}")
 
 
 def score_from_median(operations):

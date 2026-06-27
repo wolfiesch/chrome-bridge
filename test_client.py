@@ -272,6 +272,11 @@ def print_usage():
     print("  python3 test_client.py select <tabId> <selector> <value>")
     print("  python3 test_client.py uploadFile <tabId> <selector> <path...>")
     print("  python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
+    print("  python3 test_client.py setCpuThrottling <tabId> <rate>")
+    print("  python3 test_client.py setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]")
+    print("  python3 test_client.py clearNetworkConditions <tabId>")
+    print("  python3 test_client.py setColorScheme <tabId> light|dark|no-preference")
+    print("  python3 test_client.py setUserAgent <tabId> <userAgent...>")
     print("  python3 test_client.py startMonitoring <tabId>")
     print("  python3 test_client.py stopMonitoring <tabId>")
     print("  python3 test_client.py consoleMessages <tabId>")
@@ -478,6 +483,44 @@ def main():
         if len(args) > 6:
             payload["tabId"] = parse_int(args[6], "tabId")
         sys.exit(send_command("waitForHandoff", payload, read_timeout_ms=timeoutMs))
+    elif action == "setCpuThrottling":
+        require_args(args, 4, "Usage: python3 test_client.py setCpuThrottling <tabId> <rate>")
+        sys.exit(send_command("setCpuThrottling", {
+            "tabId": parse_int(args[2], "tabId"),
+            "rate": parse_float(args[3], "rate"),
+        }))
+    elif action == "setNetworkConditions":
+        require_args(args, 4, "Usage: python3 test_client.py setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]")
+        offline = args[3] in {"1", "true", "True"}
+        latency = parse_float(args[4], "latency") if len(args) > 4 else 0
+        down = parse_int(args[5], "downloadThroughput") if len(args) > 5 else -1
+        up = parse_int(args[6], "uploadThroughput") if len(args) > 6 else -1
+        sys.exit(send_command("setNetworkConditions", {
+            "tabId": parse_int(args[2], "tabId"),
+            "offline": offline,
+            "latency": latency,
+            "downloadThroughput": down,
+            "uploadThroughput": up,
+        }))
+    elif action == "clearNetworkConditions":
+        require_args(args, 3, "Usage: python3 test_client.py clearNetworkConditions <tabId>")
+        sys.exit(send_command("clearNetworkConditions", {"tabId": parse_int(args[2], "tabId")}))
+    elif action == "setColorScheme":
+        require_args(args, 4, "Usage: python3 test_client.py setColorScheme <tabId> light|dark|no-preference")
+        if args[3] not in {"light", "dark", "no-preference"}:
+            print("Color scheme must be light, dark, or no-preference", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("setColorScheme", {
+            "tabId": parse_int(args[2], "tabId"),
+            "scheme": args[3],
+        }))
+    elif action == "setUserAgent":
+        require_args(args, 4, "Usage: python3 test_client.py setUserAgent <tabId> <userAgent...>")
+        ua = " ".join(args[3:])
+        sys.exit(send_command("setUserAgent", {
+            "tabId": parse_int(args[2], "tabId"),
+            "userAgent": ua,
+        }))
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(64)

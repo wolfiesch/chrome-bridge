@@ -163,6 +163,47 @@ def browser_upload_file(
     tid = resolve_tab_id(tab_id)
     return _text(call("uploadFile", {"tabId": tid, "selector": selector, "files": expanded}))
 
+def browser_set_cpu_throttling(rate: float, tab_id: Optional[int] = None) -> str:
+    """Set CPU throttling rate for a tab; ``1`` disables throttling."""
+    tid = resolve_tab_id(tab_id)
+    return _text(call("setCpuThrottling", {"tabId": tid, "rate": rate}))
+
+
+def browser_set_network_conditions(
+    offline: bool = False,
+    latency: float = 0,
+    download_throughput: int = -1,
+    upload_throughput: int = -1,
+    tab_id: Optional[int] = None,
+) -> str:
+    """Set emulated network conditions for a tab."""
+    tid = resolve_tab_id(tab_id)
+    return _text(call("setNetworkConditions", {
+        "tabId": tid,
+        "offline": offline,
+        "latency": latency,
+        "downloadThroughput": download_throughput,
+        "uploadThroughput": upload_throughput,
+    }))
+
+
+def browser_clear_network_conditions(tab_id: Optional[int] = None) -> str:
+    """Clear emulated network conditions for a tab."""
+    tid = resolve_tab_id(tab_id)
+    return _text(call("clearNetworkConditions", {"tabId": tid}))
+
+
+def browser_set_color_scheme(scheme: str, tab_id: Optional[int] = None) -> str:
+    """Set the emulated ``prefers-color-scheme`` media feature."""
+    tid = resolve_tab_id(tab_id)
+    return _text(call("setColorScheme", {"tabId": tid, "scheme": scheme}))
+
+
+def browser_set_user_agent(user_agent: str, tab_id: Optional[int] = None) -> str:
+    """Override the tab's user agent."""
+    tid = resolve_tab_id(tab_id)
+    return _text(call("setUserAgent", {"tabId": tid, "userAgent": user_agent}))
+
 
 def browser_get_cookies(domain: str) -> str:
     """Return cookies for ``domain`` (sensitive)."""
@@ -338,6 +379,11 @@ _TOOLS = [
     (browser_drag, True, False),
     (browser_select, True, False),
     (browser_upload_file, True, False),
+    (browser_set_cpu_throttling, True, False),
+    (browser_set_network_conditions, True, False),
+    (browser_clear_network_conditions, True, False),
+    (browser_set_color_scheme, True, False),
+    (browser_set_user_agent, True, False),
     (browser_tab_control, True, False),
     (browser_wait_for_handoff, True, False),
     (browser_action, True, True),

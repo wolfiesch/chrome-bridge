@@ -128,6 +128,18 @@ chrome-bridge uploadFile <tabId> <selector> <path...>
 chrome-bridge setViewport <tabId> <width> <height> [deviceScaleFactor]
 ```
 
+### Emulation
+
+```bash
+chrome-bridge setCpuThrottling <tabId> <rate>
+chrome-bridge setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]
+chrome-bridge clearNetworkConditions <tabId>
+chrome-bridge setColorScheme <tabId> light|dark|no-preference
+chrome-bridge setUserAgent <tabId> <userAgent>
+```
+
+`setCpuThrottling` sets Chrome's CPU throttling rate; use `rate >= 1`, with `1` disabling throttling. `setNetworkConditions` applies CDP `Network.emulateNetworkConditions` and persists until `clearNetworkConditions` resets it. `setColorScheme` overrides `prefers-color-scheme`. `setUserAgent` overrides the tab's user agent string.
+
 ### Diagnostics, interception, downloads, storage, geolocation, and metrics
 
 ```bash
@@ -290,6 +302,7 @@ Mutating:
 - `browser_select`
 - `browser_upload_file` (validates local paths before contacting Chrome)
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
+- `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
 - `browser_wait_for_handoff` — pause automation, focus the real tab with an on-page banner, and wait for a human to finish login/2FA/captcha before resuming
 
 Escape hatch (sensitive):
@@ -461,7 +474,7 @@ tail -f bridge_debug.log
 - Cookie and storage-state redaction is enabled by default through policy (`redact`): cookie values and sensitive storage keys are replaced with `<redacted>` before responses reach the client. Page-derived content from `getHTML`, `extractText`, `executeScript`, and `executeScriptCDP` is additionally masked against the client policy's `redactPatterns` (a list of regexes; use inline flags like `(?i)` for case-insensitivity) before it reaches the client.
 - The Python and Rust native hosts enforce the same policy, audit, and redaction behavior; this parity is covered by the guardrails contract (`verify_guardrails_contract.py`).
 - `executeScript` uses `chrome.scripting` in the page MAIN world and can be blocked by strict page CSP.
-- `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, monitoring, interception, geolocation, and performance metrics use `chrome.debugger`.
+- `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, emulation, monitoring, interception, geolocation, and performance metrics use `chrome.debugger`.
 - `downloads`, `contentSettings`, `host_permissions: <all_urls>`, cookie access, debugger access, and script execution are powerful. Use this profile for trusted automation only.
 - `sessionStatus` reports cookie names and counts only, never cookie values; `waitForHandoff` only focuses a tab, shows a banner, and waits — neither reads, imports, nor overwrites cookies. Operating on the real profile is the bridge's design, not a leak, but `sessionStatus` output (which sites/accounts are logged in) is itself sensitive — keep it out of transcripts.
 - The bridge still intentionally lacks Playwright-style isolated browser contexts/profiles and multi-browser support; it controls the real Chrome profile. That ambient real-profile session is the point: it is what lets an agent reuse your existing logins and hand off to you for steps it should not do itself.

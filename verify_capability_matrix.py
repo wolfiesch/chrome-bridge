@@ -263,6 +263,33 @@ def main():
         })
         require(call["exit"] == 0 and viewport.get("width") == 800 and viewport.get("height") == 600, "setViewport failed")
 
+        # 17a. Set CPU Throttling
+        call = run_bridge("setCpuThrottling", tab_id, 4)
+        cpu = result(call) or {}
+        record(summary, "setCpuThrottling", call, {"rate": cpu.get("rate")})
+        require(call["exit"] == 0 and cpu.get("rate") == 4, "setCpuThrottling failed")
+
+        # 17b. Set Network Conditions
+        call = run_bridge("setNetworkConditions", tab_id, 0, 50, 100000, 50000)
+        record(summary, "setNetworkConditions", call)
+        require(call["exit"] == 0, "setNetworkConditions failed")
+
+        # 17c. Clear Network Conditions
+        call = run_bridge("clearNetworkConditions", tab_id)
+        record(summary, "clearNetworkConditions", call)
+        require(call["exit"] == 0, "clearNetworkConditions failed")
+
+        # 17d. Set Color Scheme
+        call = run_bridge("setColorScheme", tab_id, "dark")
+        color_scheme = result(call) or {}
+        record(summary, "setColorScheme", call, {"scheme": color_scheme.get("scheme")})
+        require(call["exit"] == 0 and color_scheme.get("scheme") == "dark", "setColorScheme failed")
+
+        # 17e. Set User Agent
+        call = run_bridge("setUserAgent", tab_id, "BenchUA/1.0")
+        record(summary, "setUserAgent", call)
+        require(call["exit"] == 0, "setUserAgent failed")
+
         # 18. Monitoring Start
         call = run_bridge("startMonitoring", tab_id)
         record(summary, "startMonitoring", call)
