@@ -5,9 +5,14 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import importlib.util
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HARNESS = SCRIPT_DIR / "benchmark_harness.py"
+spec = importlib.util.spec_from_file_location("benchmark_harness", HARNESS)
+benchmark_harness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(benchmark_harness)
+
 
 
 def run(*args):
@@ -29,6 +34,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="chrome-bridge-bench-") as tmp:
         out = Path(tmp) / "results.json"
         report = Path(tmp) / "report.md"
+        require(benchmark_harness.monitored_item_count({"json": {"result": {"messages": []}}}) == 0,
+                "empty console wrapper must not count as monitored data")
+        require(benchmark_harness.monitored_item_count({"json": {"result": {"requests": [{"url": "/"}]}}}) == 1,
+                "network wrapper must count nested request entries")
+
 
         proc = run("run", "--adapter", "noop", "--iterations", "2", "--output", str(out))
         require(proc.returncode == 0, f"benchmark run failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")

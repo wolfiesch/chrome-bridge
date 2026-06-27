@@ -228,6 +228,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   else if (alarm.name === RECONNECT_ALARM) connectToHost();
 });
 scheduleHeartbeat();
+connectToHost();
 
 async function handleMessageFromHost(message) {
   const { id, action, payload } = message;
@@ -614,24 +615,54 @@ async function waitForUrl(tabId, substring, timeoutMs) {
   return { success: false, err: "Timed out waiting for URL", substring, timeoutMs };
 }
 
+function parseLocatorToken(rawToken, rawLocator) {
+  const token = String(rawToken ?? "").trim();
+  if (!token) throw new Error(`Missing final selector in ${rawLocator}`);
+  if (token.startsWith("css=")) {
+    const selector = token.slice("css=".length).trim();
+    if (!selector) throw new Error(`Missing CSS selector in ${rawLocator}`);
+    return { kind: "css", selector };
+  }
+  if (token.startsWith("text=")) {
+    const text = token.slice("text=".length).trim();
+    if (!text) throw new Error(`Missing text in ${rawLocator}`);
+    return { kind: "text", text };
+  }
+  if (token.startsWith("label=")) {
+    const text = token.slice("label=".length).trim();
+    if (!text) throw new Error(`Missing label text in ${rawLocator}`);
+    return { kind: "label", text };
+  }
+  if (token.startsWith("role=")) {
+    const roleSpec = token.slice("role=".length).trim();
+    const match = roleSpec.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\[name=([^\]]+)\])?$/);
+    if (!match) throw new Error(`Invalid role locator in ${rawLocator}`);
+    return { kind: "role", role: match[1].toLowerCase(), name: match[2] };
+  }
+  return { kind: "css", selector: token };
+}
+
 function parseActionLocator(selector) {
   const raw = String(selector ?? "");
   if (raw.includes(">>>>") || raw.includes("<<<") || /["'][^"']*(?:>>>|>>)[^"']*["']/.test(raw)) {
     throw new Error(`Unsupported selector token in ${raw}`);
   }
   const shadowParts = raw.split(/\s*>>>\s*/);
+  if (!shadowParts[0]?.trim()) {
+    throw new Error(`Missing final selector in ${raw}`);
+  }
   if (shadowParts.some((part, index) => index > 0 && !part.trim())) {
     throw new Error(`Missing final selector in ${raw}`);
   }
   const frameParts = shadowParts[0].split(/\s*>>\s*/);
   const frames = [];
-  let finalSelector = null;
+  let target = null;
   for (let i = 0; i < frameParts.length; i++) {
     const part = frameParts[i].trim();
     if (!part) {
       throw new Error(`Missing final selector in ${raw}`);
     }
-    if (part.startsWith("frame=") && finalSelector === null) {
+    if (part.startsWith("frame=") && target === null) {
       const frameSelector = part.slice("frame=".length).trim();
       if (!frameSelector) {
         throw new Error(`Missing frame selector in ${raw}`);
@@ -642,101 +673,128 @@ function parseActionLocator(selector) {
     if (i < frameParts.length - 1) {
       throw new Error(`Unsupported selector token in ${raw}`);
     }
-    finalSelector = part;
+    target = parseLocatorToken(part, raw);
   }
-  if (!finalSelector) {
+  if (!target) {
     throw new Error(`Missing final selector in ${raw}`);
   }
+  const shadowSegments = shadowParts.slice(1).map((part) => parseLocatorToken(part, raw));
   return {
     frames,
-    selector: finalSelector,
-    shadowSegments: shadowParts.slice(1).map((part) => part.trim())
+    target,
+    selector: target.kind === "css" ? target.selector : null,
+    shadowSegments
   };
 }
 
-function frameTreeList(frameTree, out = []) {
-  if (!frameTree) return out;
-  out.push(frameTree);
-  for (const child of frameTree.childFrames || []) {
-    frameTreeList(child, out);
-  }
-  return out;
-}
-
-function findFrameTree(frameTree, frameId) {
-  return frameTreeList(frameTree).find((item) => item.frame?.id === frameId) || null;
-}
-
-function directChildFrames(frameTree, frameId) {
-  const item = findFrameTree(frameTree, frameId);
-  return item?.childFrames || [];
-}
-
-async function frameExecutionContext(target, frameId) {
-  const world = await debuggerCommand(target, 'Page.createIsolatedWorld', {
-    frameId,
-    worldName: 'chromeNativeBridgeActions',
-    grantUniveralAccess: true
-  });
-  return world.executionContextId;
-}
-
-async function evaluateInContext(target, expression, contextId) {
-  const params = {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-    allowUnsafeEvalBlockedByCSP: true
-  };
-  if (contextId !== null && contextId !== undefined) {
-    params.contextId = contextId;
-  }
-  const result = await debuggerCommand(target, 'Runtime.evaluate', params);
-  if (result.exceptionDetails) {
-    return { success: false, err: result.exceptionDetails.text || 'Runtime.evaluate exception', details: result.exceptionDetails };
-  }
-  return { success: true, val: result.result?.value ?? result.result?.description ?? null };
-}
-
-async function describeTopFrameElement(target, rootNodeId, frameSelector) {
-  const found = await debuggerCommand(target, 'DOM.querySelector', { nodeId: rootNodeId, selector: frameSelector });
-  if (!found.nodeId) return null;
-  const described = await debuggerCommand(target, 'DOM.describeNode', { nodeId: found.nodeId, depth: 1, pierce: false });
-  return described.node || null;
-}
-
-function frameSelectorProbeExpression(frameSelector) {
-  return `(() => {
-    const selector = ${JSON.stringify(frameSelector)};
-    const el = document.querySelector(selector);
-    if (!el) return { success: false };
-    const frames = Array.from(document.querySelectorAll('iframe,frame'));
-    const frameIndex = frames.indexOf(el);
-    const rect = el.getBoundingClientRect();
-    el.scrollIntoView({ block: 'center', inline: 'center' });
-    const scrolled = el.getBoundingClientRect();
-    return {
-      success: true,
-      frameIndex,
-      x: scrolled.left,
-      y: scrolled.top,
-      width: scrolled.width,
-      height: scrolled.height
+function locatorResolverSource() {
+  return `
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const visibleText = (el) => normalize(el.innerText || el.textContent || '');
+    const isVisible = (el) => {
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+      const style = getComputedStyle(el);
+      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 || rect.height > 0 || el.getClientRects().length > 0;
     };
-  })()`;
+    const byIdText = (id) => normalize((id || '').split(/\\s+/).map((part) => document.getElementById(part)?.innerText || document.getElementById(part)?.textContent || '').join(' '));
+    const labelText = (el) => {
+      const labels = el.labels ? Array.from(el.labels).map((label) => visibleText(label)).filter(Boolean) : [];
+      if (labels.length) return normalize(labels.join(' '));
+      const id = el.getAttribute('id');
+      if (id) {
+        const explicit = document.querySelector('label[for="' + CSS.escape(id) + '"]');
+        if (explicit) return visibleText(explicit);
+      }
+      const wrapped = el.closest('label');
+      if (wrapped) return visibleText(wrapped);
+      return '';
+    };
+    const accessibleName = (el) => normalize(
+      el.getAttribute('aria-label') ||
+      byIdText(el.getAttribute('aria-labelledby')) ||
+      labelText(el) ||
+      el.getAttribute('alt') ||
+      el.getAttribute('title') ||
+      el.getAttribute('placeholder') ||
+      visibleText(el)
+    );
+    const implicitRole = (el) => {
+      const tag = el.tagName ? el.tagName.toLowerCase() : '';
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (tag === 'button' || (tag === 'input' && ['button', 'submit', 'reset'].includes(type))) return 'button';
+      if (tag === 'textarea' || (tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden'].includes(type))) return 'textbox';
+      if (tag === 'select') return 'combobox';
+      if (tag === 'input' && type === 'checkbox') return 'checkbox';
+      if (tag === 'input' && type === 'radio') return 'radio';
+      if (tag === 'a' && el.hasAttribute('href')) return 'link';
+      if (tag === 'img') return 'img';
+      if (/^h[1-6]$/.test(tag)) return 'heading';
+      return '';
+    };
+    const candidateElements = (root) => {
+      const all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+      return all.filter(isVisible);
+    };
+    const deepestTextMatch = (root, expected) => {
+      const wanted = normalize(expected);
+      const candidates = candidateElements(root);
+      const pick = (contains) => candidates
+        .filter((el) => {
+          const text = visibleText(el);
+          if (contains ? !text.includes(wanted) : text !== wanted) return false;
+          return !Array.from(el.children || []).some((child) => isVisible(child) && (contains ? visibleText(child).includes(wanted) : visibleText(child) === wanted));
+        })
+        .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height))[0] || null;
+      return pick(false) || pick(true);
+    };
+    const resolveToken = (root, token) => {
+      if (!token || token.kind === 'css') {
+        const selector = token?.selector || '';
+        const el = root.querySelector(selector);
+        return el ? { success: true, el } : { success: false, err: 'No element found for selector ' + selector };
+      }
+      if (token.kind === 'text') {
+        const el = deepestTextMatch(root, token.text);
+        return el ? { success: true, el } : { success: false, err: 'No element found for text ' + token.text };
+      }
+      if (token.kind === 'label') {
+        const wanted = normalize(token.text);
+        const controls = candidateElements(root).filter((el) => /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName));
+        const el = controls.find((item) => labelText(item) === wanted || item.getAttribute('aria-label') === wanted || byIdText(item.getAttribute('aria-labelledby')) === wanted || item.getAttribute('placeholder') === wanted) ||
+          controls.find((item) => labelText(item).includes(wanted) || normalize(item.getAttribute('aria-label')).includes(wanted) || byIdText(item.getAttribute('aria-labelledby')).includes(wanted) || normalize(item.getAttribute('placeholder')).includes(wanted));
+        return el ? { success: true, el } : { success: false, err: 'No form control found for label ' + token.text };
+      }
+      if (token.kind === 'role') {
+        const name = normalize(token.name);
+        const matches = candidateElements(root).filter((el) => (el.getAttribute('role') || implicitRole(el)) === token.role);
+        const el = matches.find((item) => !name || accessibleName(item) === name) || matches.find((item) => name && accessibleName(item).includes(name));
+        return el ? { success: true, el } : { success: false, err: 'No element found for role ' + token.role + (name ? ' name ' + name : '') };
+      }
+      return { success: false, err: 'Unsupported locator kind ' + token.kind };
+    };
+    const resolveLocator = (locator) => {
+      let resolved = resolveToken(document, locator.target || { kind: 'css', selector: locator.selector });
+      if (!resolved.success) return resolved;
+      let el = resolved.el;
+      for (const segment of locator.shadowSegments || []) {
+        if (!el.shadowRoot) return { success: false, err: 'No open shadow root for selector segment ' + (segment.selector || segment.text || segment.role || segment.kind) };
+        resolved = resolveToken(el.shadowRoot, segment);
+        if (!resolved.success) return resolved;
+        el = resolved.el;
+      }
+      return { success: true, el };
+    };
+  `;
 }
 
-function actionTargetExpression(locator, mode) {
+function elementResolverExpression(locator, mode) {
   return `(() => {
-    const selector = ${JSON.stringify(locator.selector)};
-    const shadowSegments = ${JSON.stringify(locator.shadowSegments)};
-    let el = document.querySelector(selector);
-    if (!el) return { success: false, err: 'No element found for selector ' + selector };
-    for (const segment of shadowSegments) {
-      if (!el.shadowRoot) return { success: false, err: 'No open shadow root for selector segment ' + segment };
-      el = el.shadowRoot.querySelector(segment);
-      if (!el) return { success: false, err: 'No element found for selector ' + segment };
-    }
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
     el.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = el.getBoundingClientRect();
     if (${JSON.stringify(mode)} === 'focus' || ${JSON.stringify(mode)} === 'clear') {
@@ -760,6 +818,155 @@ function actionTargetExpression(locator, mode) {
     };
   })()`;
 }
+
+function actionTargetExpression(locator, mode) {
+  return elementResolverExpression(locator, mode);
+}
+
+function domClickExpression(locator) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = el.getBoundingClientRect();
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      button: 0,
+      buttons: 1,
+      clickCount: 1
+    };
+    el.dispatchEvent(new MouseEvent('mousedown', eventInit));
+    el.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
+    el.click();
+    return {
+      success: true,
+      tagName: el.tagName,
+      text: el.innerText || el.value || el.getAttribute('aria-label') || '',
+      value: 'value' in el ? el.value : el.textContent
+    };
+  })()`;
+}
+
+function domSelectExpression(locator, value) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    const value = ${JSON.stringify(value)};
+    if (el.tagName !== 'SELECT') return { success: false, err: 'Element is not a SELECT' };
+    const option = Array.from(el.options).find((item) => item.value === value || item.text === value);
+    if (!option) return { success: false, err: 'No option matched value/text: ' + value };
+    el.value = option.value;
+    option.selected = true;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { success: true, value: el.value, selectedText: option.text };
+  })()`;
+}
+
+function elementObjectExpression(locator) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) throw new Error(resolved.err || 'Element not found');
+    return resolved.el;
+  })()`;
+}
+
+function domDragExpression(fromLocator, toLocator) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const from = resolveLocator(${JSON.stringify(fromLocator)});
+    if (!from.success) return from;
+    const to = resolveLocator(${JSON.stringify(toLocator)});
+    if (!to.success) return to;
+    from.el.scrollIntoView({ block: 'center', inline: 'center' });
+    to.el.scrollIntoView({ block: 'center', inline: 'center' });
+    const fromRect = from.el.getBoundingClientRect();
+    const toRect = to.el.getBoundingClientRect();
+    const dataTransfer = new DataTransfer();
+    const eventInit = { bubbles: true, cancelable: true, composed: true, dataTransfer };
+    from.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true, clientX: fromRect.left + fromRect.width / 2, clientY: fromRect.top + fromRect.height / 2, button: 0, buttons: 1 }));
+    from.el.dispatchEvent(new DragEvent('dragstart', eventInit));
+    to.el.dispatchEvent(new DragEvent('dragenter', eventInit));
+    to.el.dispatchEvent(new DragEvent('dragover', eventInit));
+    const dropped = to.el.dispatchEvent(new DragEvent('drop', eventInit));
+    from.el.dispatchEvent(new DragEvent('dragend', eventInit));
+    to.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, composed: true, clientX: toRect.left + toRect.width / 2, clientY: toRect.top + toRect.height / 2, button: 0, buttons: 0 }));
+    return { success: true, from: from.el.tagName, to: to.el.tagName, dropped };
+  })()`;
+}
+
+async function evaluateInContext(target, expression, contextId) {
+  const params = {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    allowUnsafeEvalBlockedByCSP: true
+  };
+  if (contextId !== null && contextId !== undefined) {
+    params.contextId = contextId;
+  }
+  const result = await debuggerCommand(target, 'Runtime.evaluate', params);
+  if (result.exceptionDetails) {
+    return { success: false, err: result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'Runtime.evaluate exception', details: result.exceptionDetails };
+  }
+  return { success: true, val: result.result?.value };
+}
+
+function frameSelectorProbeExpression(selector) {
+  return `(() => {
+    const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return { success: false, err: 'No frame found for selector ' + ${JSON.stringify(selector)} };
+    const frames = Array.from(document.querySelectorAll('iframe,frame'));
+    const rect = el.getBoundingClientRect();
+    return {
+      success: true,
+      frameIndex: frames.indexOf(el),
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+      clientLeft: el.clientLeft || 0,
+      clientTop: el.clientTop || 0
+    };
+  })()`;
+}
+
+function directChildFrames(frameTree, frameId) {
+  if (!frameTree) return [];
+  if (frameTree.frame?.id === frameId) return frameTree.childFrames || [];
+  for (const child of frameTree.childFrames || []) {
+    const found = directChildFrames(child, frameId);
+    if (found.length || child.frame?.id === frameId) return found;
+  }
+  return [];
+}
+
+async function frameExecutionContext(target, frameId) {
+  const world = await debuggerCommand(target, 'Page.createIsolatedWorld', {
+    frameId,
+    worldName: 'chrome-native-bridge',
+    grantUniveralAccess: true
+  });
+  return world.executionContextId;
+}
+
+async function describeTopFrameElement(target, rootNodeId, selector) {
+  const queried = await debuggerCommand(target, 'DOM.querySelector', { nodeId: rootNodeId, selector });
+  if (!queried.nodeId) return null;
+  const described = await debuggerCommand(target, 'DOM.describeNode', { nodeId: queried.nodeId, depth: 1, pierce: false });
+  return described.node || null;
+}
+
+
 
 async function resolveActionTarget(tabId, locator, attachedTarget) {
   const run = async (target) => {
@@ -790,8 +997,8 @@ async function resolveActionTarget(tabId, locator, attachedTarget) {
       if (!childFrameId || !children.some((child) => child.frame.id === childFrameId)) {
         return { success: false, err: `No frame found for selector ${frameSelector}` };
       }
-      offsetX += frameInfo.x || 0;
-      offsetY += frameInfo.y || 0;
+      offsetX += (frameInfo.x || 0) + (frameInfo.clientLeft || 0);
+      offsetY += (frameInfo.y || 0) + (frameInfo.clientTop || 0);
       currentFrameId = childFrameId;
       currentContextId = await frameExecutionContext(target, currentFrameId);
       currentRootNodeId = null;
@@ -910,6 +1117,12 @@ async function clickSelector(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const lookup = await getElementCenter(target, selector);
     if (lookup.success === false) return lookup;
+    if (lookup.contextId !== null && lookup.contextId !== undefined) {
+      const click = await evaluateInContext(target, domClickExpression(lookup.locator), lookup.contextId);
+      const value = click.val || click;
+      if (!click.success || value.success === false) return value;
+      return { success: true, tagName: value.tagName, text: value.text };
+    }
     const { x, y } = lookup;
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
@@ -1009,20 +1222,19 @@ async function pressKey(tabId, keySpec) {
 
 async function dragSelector(tabId, fromSelector, toSelector) {
   return withDebugger(tabId, async (target) => {
-    const from = await getElementCenter(target, fromSelector);
+    const fromLocator = parseActionLocator(fromSelector);
+    const toLocator = parseActionLocator(toSelector);
+    const from = await resolveActionTarget(tabId, fromLocator, target);
     if (from.success === false) return from;
-    const to = await getElementCenter(target, toSelector);
+    const to = await resolveActionTarget(tabId, toLocator, target);
     if (to.success === false) return to;
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none', buttons: 0 });
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
-    for (let step = 1; step <= 5; step++) {
-      const x = from.x + ((to.x - from.x) * step) / 5;
-      const y = from.y + ((to.y - from.y) * step) / 5;
-      await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left', buttons: 1 });
+    if (from.contextId !== to.contextId) {
+      return { success: false, err: 'Drag source and target must be in the same frame context' };
     }
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'none', buttons: 0 });
-    return { success: true, from: fromSelector, to: toSelector };
+    const drag = await evaluateInContext(target, domDragExpression(fromLocator, toLocator), from.contextId);
+    const value = drag.val || drag;
+    if (!drag.success || value.success === false) return value;
+    return { success: true, from: fromSelector, to: toSelector, dom: value };
   });
 }
 
@@ -1041,30 +1253,46 @@ async function fillSelector(tabId, selector, text) {
 
 async function selectOption(tabId, selector, value) {
   return withDebugger(tabId, async (target) => {
-    const result = await evaluateWithDebugger(target, `(() => {
-      const selector = ${JSON.stringify(selector)};
-      const value = ${JSON.stringify(value)};
-      const el = document.querySelector(selector);
-      if (!el) return { success: false, err: 'No element matched selector: ' + selector };
-      if (el.tagName !== 'SELECT') return { success: false, err: 'Element is not a SELECT: ' + selector };
-      const option = Array.from(el.options).find((item) => item.value === value || item.text === value);
-      if (!option) return { success: false, err: 'No option matched value/text: ' + value };
-      el.value = option.value;
-      option.selected = true;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return { success: true, value: el.value, selectedText: option.text };
-    })()`);
+    let locator;
+    try {
+      locator = parseActionLocator(selector);
+    } catch (error) {
+      return { success: false, err: error.message };
+    }
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    const result = await evaluateInContext(target, domSelectExpression(locator, value), resolved.contextId);
     return result.val || result;
   });
 }
 
 async function uploadFile(tabId, selector, files) {
   return withDebugger(tabId, async (target) => {
-    const doc = await debuggerCommand(target, 'DOM.getDocument', { depth: 1, pierce: true });
-    const found = await debuggerCommand(target, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector });
-    if (!found.nodeId) return { success: false, err: 'No element matched selector: ' + selector };
-    await debuggerCommand(target, 'DOM.setFileInputFiles', { nodeId: found.nodeId, files });
+    let locator;
+    try {
+      locator = parseActionLocator(selector);
+    } catch (error) {
+      return { success: false, err: error.message };
+    }
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    const params = {
+      expression: elementObjectExpression(locator),
+      awaitPromise: true,
+      returnByValue: false,
+      allowUnsafeEvalBlockedByCSP: true
+    };
+    if (resolved.contextId !== null && resolved.contextId !== undefined) {
+      params.contextId = resolved.contextId;
+    }
+    const evaluated = await debuggerCommand(target, "Runtime.evaluate", params);
+    if (evaluated.exceptionDetails) {
+      return { success: false, err: evaluated.exceptionDetails.exception?.description || evaluated.exceptionDetails.text || 'Runtime.evaluate exception', details: evaluated.exceptionDetails };
+    }
+    if (!evaluated.result?.objectId) {
+      return { success: false, err: 'No element object resolved for selector: ' + selector };
+    }
+    await debuggerCommand(target, 'DOM.setFileInputFiles', { objectId: evaluated.result.objectId, files });
     return { success: true, selector, files: files.length };
   });
 }
@@ -1571,5 +1799,3 @@ async function waitForHandoff(payload) {
   }
   return await settle(false);
 }
-
-connectToHost();

@@ -23,6 +23,45 @@ HTML_PATH = "/tmp/chrome-bridge-live.html"
 STATE_PATH = "/tmp/chrome-bridge-state.json"
 DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
 LAST_SUMMARY = {}
+POLICY_PATH = Path(os.environ.get("BRIDGE_POLICY_FILE", os.path.join(SCRIPT_DIR, "bridge_policy.json")))
+
+
+def install_smoke_policy():
+    """Temporarily permit the local fixture actions this live verifier exercises."""
+    backup = None
+    if POLICY_PATH.exists():
+        backup = POLICY_PATH.read_bytes()
+    policy = {
+        "default": {
+            "allowedActions": [
+                "ping", "navigate", "waitForLoad", "waitForSelector", "click", "fill",
+                "select", "uploadFile", "screenshot", "extractText", "getHTML", "type", "drag",
+                "scroll", "press", "hover", "startMonitoring", "consoleMessages",
+                "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
+                "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
+                "handleDialog", "stopMonitoring", "getCurrentState", "startInterception",
+                "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
+                "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab"
+            ],
+            "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
+            "deniedActions": [],
+            "deniedOrigins": [],
+            "requireConfirmation": [],
+            "redact": True,
+            "audit": False,
+        }
+    }
+    POLICY_PATH.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
+    return backup
+
+
+def restore_policy(backup):
+    if backup is None:
+        with contextlib.suppress(FileNotFoundError):
+            POLICY_PATH.unlink()
+    else:
+        POLICY_PATH.write_bytes(backup)
+
 
 
 PAGE = b"""<!doctype html>
@@ -40,6 +79,7 @@ PAGE = b"""<!doctype html>
 </head>
 <body>
   <h1>Chrome Bridge Live Test</h1>
+  <label for="q">Search query</label>
   <input id="q" name="q" value="">
   <button id="btn">Click me</button>
   <button id="log">Log</button>
@@ -52,21 +92,26 @@ PAGE = b"""<!doctype html>
   <div id="to">to</div>
   <div id="panel"><div id="spacer">scroll panel</div></div>
   <div id="shadow-host"></div>
-  <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); });&lt;/script&gt;"></iframe>
+  <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;select id=&quot;frame-select&quot;&gt;&lt;option value=&quot;one&quot;&gt;One&lt;/option&gt;&lt;option value=&quot;two&quot;&gt;Two&lt;/option&gt;&lt;/select&gt;&lt;input id=&quot;frame-file&quot; type=&quot;file&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); }); document.getElementById(&quot;frame-select&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-select&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-file&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-file&quot;, count: this.files.length}, &quot;*&quot;); });&lt;/script&gt;"></iframe>
   <script>
     window.__shadowClicks = 0;
     window.__frameValue = '';
     window.__frameClicks = 0;
+    window.__frameSelect = '';
+    window.__frameFileCount = 0;
+    window.__dragDropped = false;
     const shadowRoot = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
-    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
+    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button><label>Shadow input<input id="shadow-input"></label><select id="shadow-kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>';
     shadowRoot.querySelector('#shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
-    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; });
+    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; if (event.data && event.data.type === 'frame-select') window.__frameSelect = event.data.value; if (event.data && event.data.type === 'frame-file') window.__frameFileCount = event.data.count; });
     document.querySelector('#btn').addEventListener('click', () => {
       document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
     });
     document.querySelector('#log').addEventListener('click', () => console.log('bridge fixture console message'));
     document.querySelector('#fetch').addEventListener('click', () => fetch('/data.json?secret=redact-me').then(r => r.json()).then(d => console.log('fetch', d.ok)));
     document.querySelector('#alert').addEventListener('click', () => alert('hello dialog'));
+    document.querySelector('#to').addEventListener('dragover', event => event.preventDefault());
+    document.querySelector('#to').addEventListener('drop', event => { event.preventDefault(); window.__dragDropped = true; document.querySelector('#status').textContent = 'dropped'; });
   </script>
 </body>
 </html>"""
@@ -150,7 +195,7 @@ def main():
     for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-
+    policy_backup = install_smoke_policy()
     server = start_server()
     summary = {}
     tab_id = None
@@ -227,8 +272,10 @@ def main():
 
         # 12. Drag
         call = run_bridge("drag", tab_id, "#from", "#to")
-        record(summary, "drag", call)
-        require(call["exit"] == 0, "drag failed")
+        dropped = run_bridge("executeScriptCDP", tab_id, "window.__dragDropped")
+        drag_ok = (result(dropped) or {}).get("val") is True
+        record(summary, "drag", call, {"dropped": drag_ok})
+        require(call["exit"] == 0 and drag_ok, "drag failed")
 
         # 13. Press
         call = run_bridge("press", tab_id, "Enter")
@@ -364,13 +411,67 @@ def main():
         frame_filled = (result(call) or {}).get("val")
         record(summary, "executeScriptCDP_verify_iframe_fill", call, {"filled": frame_filled})
         require(call["exit"] == 0 and frame_filled is True, "iframe fill did not update frame value")
+        before = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks")
+        before_count = (result(before) or {}).get("val") or 0
         call = run_bridge("click", tab_id, "frame=#frame >> #frame-button")
-        record(summary, "iframeClick", call)
-        require(call["exit"] == 0, "iframe click failed")
-        call = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks >= 1")
-        frame_clicked = (result(call) or {}).get("val")
-        record(summary, "executeScriptCDP_verify_iframe_click", call, {"clicked": frame_clicked})
-        require(call["exit"] == 0 and frame_clicked is True, "iframe click did not update counter")
+        after = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks")
+        after_count = (result(after) or {}).get("val") or 0
+        record(summary, "iframeClick", call, {"before": before_count, "after": after_count})
+        require(call["exit"] == 0 and after_count == before_count + 1, "iframe click fired zero or multiple times")
+        call = run_bridge("select", tab_id, "frame=#frame >> #frame-select", "two")
+        record(summary, "iframeSelect", call)
+        require(call["exit"] == 0, "iframe select failed")
+        call = run_bridge("executeScriptCDP", tab_id, "window.__frameSelect === 'two'")
+        frame_selected = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_iframe_select", call, {"selected": frame_selected})
+        require(call["exit"] == 0 and frame_selected is True, "iframe select did not update frame value")
+        call = run_bridge("uploadFile", tab_id, "frame=#frame >> #frame-file", UPLOAD_FIXTURE)
+        record(summary, "iframeUpload", call)
+        require(call["exit"] == 0, "iframe upload failed")
+        call = run_bridge("executeScriptCDP", tab_id, "window.__frameFileCount === 1")
+        frame_uploaded = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_iframe_upload", call, {"uploaded": frame_uploaded})
+        require(call["exit"] == 0 and frame_uploaded is True, "iframe upload did not update frame file count")
+        call = run_bridge("fill", tab_id, "#shadow-host >>> #shadow-input", "shadowed")
+        record(summary, "shadowFill", call)
+        require(call["exit"] == 0, "shadow fill failed")
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#shadow-host').shadowRoot.querySelector('#shadow-input').value === 'shadowed'")
+        shadow_filled = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_shadow_fill", call, {"filled": shadow_filled})
+        require(call["exit"] == 0 and shadow_filled is True, "shadow fill did not update value")
+        call = run_bridge("fill", tab_id, "label=Search query", "by-label")
+        record(summary, "semanticLabelFill", call)
+        require(call["exit"] == 0, "semantic label fill failed")
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#q').value === 'by-label'")
+        label_filled = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_semantic_label_fill", call, {"filled": label_filled})
+        require(call["exit"] == 0 and label_filled is True, "semantic label fill did not update value")
+        before = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        call = run_bridge("click", tab_id, "role=button[name=Click me]")
+        after = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        role_status = (result(after) or {}).get("val")
+        record(summary, "semanticRoleClick", call, {"before": (result(before) or {}).get("val"), "after": role_status})
+        require(call["exit"] == 0 and role_status == "clicked:by-label", "semantic role click did not update status")
+        before = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks")
+        before_count = (result(before) or {}).get("val") or 0
+        call = run_bridge("click", tab_id, "frame=#frame >> text=Frame click")
+        after = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks")
+        after_count = (result(after) or {}).get("val") or 0
+        record(summary, "semanticFrameTextClick", call, {"before": before_count, "after": after_count})
+        require(call["exit"] == 0 and after_count == before_count + 1, "semantic frame text click fired zero or multiple times")
+        call = run_bridge("fill", tab_id, "css=#q", "by-css-prefix")
+        record(summary, "semanticCssFill", call)
+        require(call["exit"] == 0, "semantic css fill failed")
+        call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#q').value === 'by-css-prefix'")
+        css_filled = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_semantic_css_fill", call, {"filled": css_filled})
+        require(call["exit"] == 0 and css_filled is True, "semantic css fill did not update value")
+
+        call = run_bridge("click", tab_id, "role=button[name=Click me")
+        semantic_error = result(call) or {}
+        semantic_rejected = call["exit"] != 0 and "Invalid role locator" in (semantic_error.get("err") or semantic_error.get("error") or "")
+        summary["semanticSyntaxRejected"] = {"rejected": semantic_rejected}
+        require(semantic_rejected, "semantic syntax error was not preserved")
 
         # 24. Start Interception
         call = run_bridge("startInterception", tab_id, "*data.json*", "fulfill", 200, '{"ok":true,"intercepted":true}')
@@ -464,6 +565,7 @@ def main():
             with contextlib.suppress(Exception):
                 run_bridge("closeTab", tab_id)
 
+        restore_policy(policy_backup)
         server.shutdown()
 
         for path in [UPLOAD_FIXTURE, SHOT_PATH, HTML_PATH, STATE_PATH]:

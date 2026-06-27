@@ -82,12 +82,6 @@ COMPARISON_METADATA = {
             "acceptance": "A live Chrome Bridge run writes a trace or video artifact path and the report links it without exposing private content.",
         },
         {
-            "gap": "rich locator semantics",
-            "description": "Add semantic selectors such as role/name/text wrappers on top of CSS selectors.",
-            "surface": "test_client.py CLI and extension/background.js selector helpers",
-            "acceptance": "Benchmark operations can click and fill by role/name on the fixture without CSS selectors.",
-        },
-        {
             "gap": "first-party ecosystem integrations",
             "description": "Expose benchmark output in test-runner and CI-friendly formats.",
             "surface": "benchmark_harness.py report exporters",
@@ -117,6 +111,12 @@ OPERATIONS = [
     "observe-state",
     "shadow-dom-click",
     "iframe-fill",
+    "role-click",
+    "label-fill",
+    "text-click",
+    "frame-select",
+    "frame-upload",
+    "shadow-fill",
     "console-monitoring",
     "network-monitoring",
     "dialog-handling",
@@ -134,6 +134,7 @@ FIXTURE_PAGE = b"""<!doctype html>
 </head>
 <body>
   <h1>Benchmark Fixture</h1>
+  <label for="q">Search query</label>
   <input id="q" value="">
   <select id="kind">
     <option value="alpha">Alpha</option>
@@ -146,15 +147,17 @@ FIXTURE_PAGE = b"""<!doctype html>
   <button id="alert">Alert</button>
   <div id="status">ready</div>
   <div id="shadow-host"></div>
-  <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
+  <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;select id=&quot;frame-select&quot;&gt;&lt;option value=&quot;one&quot;&gt;One&lt;/option&gt;&lt;option value=&quot;two&quot;&gt;Two&lt;/option&gt;&lt;/select&gt;&lt;input id=&quot;frame-file&quot; type=&quot;file&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); }); document.getElementById(&quot;frame-select&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-select&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-file&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-file&quot;, count: this.files.length}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
   <script>
     window.__shadowClicks = 0;
     window.__frameValue = '';
     window.__frameClicks = 0;
+    window.__frameSelect = '';
+    window.__frameFileCount = 0;
     const shadowRoot = document.getElementById('shadow-host').attachShadow({mode: 'open'});
-    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
+    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button><label>Shadow input<input id="shadow-input"></label><select id="shadow-kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>';
     shadowRoot.getElementById('shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
-    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; });
+    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; if (event.data && event.data.type === 'frame-select') window.__frameSelect = event.data.value; if (event.data && event.data.type === 'frame-file') window.__frameFileCount = event.data.count; });
     document.getElementById('btn').addEventListener('click', () => {
       document.getElementById('status').textContent = 'clicked:' + document.getElementById('q').value;
     });
@@ -248,6 +251,8 @@ def _build_bridge_payload(verb, args):
         return "extractText", {"tabId": int(args[0]), "maxChars": int(args[1])}
     if verb == "getHTML":
         return "getHTML", {"tabId": int(args[0])}
+    if verb == "executeScriptCDP":
+        return "executeScriptCDP", {"tabId": int(args[0]), "code": args[1]}
     if verb == "getCurrentState":
         return "getCurrentState", {"tabId": int(args[0])}
     if verb == "storageState":
@@ -259,6 +264,8 @@ def _build_bridge_payload(verb, args):
         return "clearGeolocation", {"tabId": int(args[0])}
     if verb in {"performanceMetrics", "closeTab", "startMonitoring", "stopMonitoring", "consoleMessages", "networkRequests"}:
         return verb, {"tabId": int(args[0])}
+    if verb == "handleDialog":
+        return "handleDialog", {"tabId": int(args[0]), "accept": args[1] == "accept", "promptText": args[2] if len(args) > 2 else None}
     if verb == "batch":
         payload = {"steps": json.loads(args[0])}
         if len(args) > 1:
@@ -373,6 +380,26 @@ def get_result(call):
     data = call.get("json") or {}
     return data.get("result") if data.get("result") is not None else data
 
+def monitored_items(call):
+    result = get_result(call)
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("messages", "requests", "events"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def monitored_item_count(call):
+    result = get_result(call)
+    if isinstance(result, dict):
+        count = result.get("count")
+        if isinstance(count, int):
+            return count
+    return len(monitored_items(call))
+
 
 def sanitize_error(message):
     text = str(message)
@@ -434,7 +461,9 @@ def run_chrome_bridge_op(op_name, context, base_url):
         nav = get_result(res) or {}
         if res["exit"] == 0 and nav.get("tabId") is not None:
             context["tab_id"] = nav["tabId"]
-            return "pass", (time.perf_counter() - t0) * 1000
+            duration_ms = (time.perf_counter() - t0) * 1000
+            time.sleep(0.1)
+            return "pass", duration_ms
         raise RuntimeError("navigate failed")
     if tab_id is None:
         raise RuntimeError("no active tab")
@@ -499,23 +528,102 @@ def run_chrome_bridge_op(op_name, context, base_url):
         if click_verify["exit"] == 0 and (get_result(click_verify) or {}).get("val") is True:
             return "pass", (time.perf_counter() - t0) * 1000
         raise RuntimeError("iframe frame-button click did not update window.__frameClicks")
+    elif op_name == "role-click":
+        unique = "role-click-bridge"
+        seed = run_bridge_cmd("fill", tab_id, "#q", unique)
+        if seed["exit"] != 0:
+            raise RuntimeError("role-click setup failed")
+        res = run_bridge_cmd("click", tab_id, "role=button[name=Click me]")
+        if res["exit"] != 0:
+            raise RuntimeError("role-click failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, f"document.querySelector('#status').textContent === 'clicked:{unique}'")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("role-click did not update status with seeded value")
+    elif op_name == "label-fill":
+        res = run_bridge_cmd("fill", tab_id, "label=Search query", "by-label")
+        if res["exit"] != 0:
+            raise RuntimeError("label-fill failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "document.querySelector('#q').value === 'by-label'")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("label-fill did not update #q")
+    elif op_name == "text-click":
+        before = run_bridge_cmd("executeScriptCDP", tab_id, "window.__frameClicks")
+        before_count = ((get_result(before) or {}).get("val") or 0) if before["exit"] == 0 else 0
+        res = run_bridge_cmd("click", tab_id, "frame=#frame >> text=Frame click")
+        if res["exit"] != 0:
+            raise RuntimeError("text-click failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, f"window.__frameClicks === {before_count + 1}")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("text-click did not update frame clicks once")
+    elif op_name == "frame-select":
+        res = run_bridge_cmd("select", tab_id, "frame=#frame >> #frame-select", "two")
+        if res["exit"] != 0:
+            raise RuntimeError("frame-select failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "window.__frameSelect === 'two'")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("frame-select did not update window.__frameSelect")
+    elif op_name == "frame-upload":
+        with tempfile.NamedTemporaryFile(prefix="frame-upload-", suffix=".txt", delete=False) as f:
+            f.write(b"frame upload fixture\n")
+            temp_path = f.name
+        try:
+            res = run_bridge_cmd("uploadFile", tab_id, "frame=#frame >> #frame-file", temp_path)
+        finally:
+            with contextlib_suppress():
+                os.unlink(temp_path)
+        if res["exit"] != 0:
+            raise RuntimeError("frame-upload failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "window.__frameFileCount === 1")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("frame-upload did not update window.__frameFileCount")
+    elif op_name == "shadow-fill":
+        res = run_bridge_cmd("fill", tab_id, "#shadow-host >>> #shadow-input", "shadowed")
+        if res["exit"] != 0:
+            raise RuntimeError("shadow-fill failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "document.querySelector('#shadow-host').shadowRoot.querySelector('#shadow-input').value === 'shadowed'")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("shadow-fill did not update shadow input")
     elif op_name == "console-monitoring":
-        res = run_bridge_cmd("batch", json.dumps([
-            {"action": "startMonitoring"},
-            {"action": "click", "payload": {"selector": "#log"}},
-            {"action": "consoleMessages", "delayMs": 100},
-        ]), tab_id)
+        start = run_bridge_cmd("startMonitoring", tab_id)
+        if start["exit"] != 0:
+            raise RuntimeError("console-monitoring start failed")
+        res = run_bridge_cmd("click", tab_id, "#log")
+        if res["exit"] != 0:
+            raise RuntimeError("console-monitoring click failed")
+        time.sleep(0.1)
+        messages = run_bridge_cmd("consoleMessages", tab_id)
+        if messages["exit"] == 0 and monitored_item_count(messages) >= 1:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("console-monitoring captured no messages")
     elif op_name == "network-monitoring":
-        res = run_bridge_cmd("batch", json.dumps([
-            {"action": "startMonitoring"},
-            {"action": "click", "payload": {"selector": "#fetch"}},
-            {"action": "networkRequests", "delayMs": 100},
-        ]), tab_id)
+        start = run_bridge_cmd("startMonitoring", tab_id)
+        if start["exit"] != 0:
+            raise RuntimeError("network-monitoring start failed")
+        before = run_bridge_cmd("networkRequests", tab_id)
+        before_count = monitored_item_count(before) if before["exit"] == 0 else 0
+        res = run_bridge_cmd("click", tab_id, "#fetch")
+        if res["exit"] != 0:
+            raise RuntimeError("network-monitoring click failed")
+        time.sleep(0.1)
+        requests = run_bridge_cmd("networkRequests", tab_id)
+        after_count = monitored_item_count(requests)
+        request_items = monitored_items(requests)
+        has_unredacted_query = any("secret=redact-me" in item.get("url", "") for item in request_items if isinstance(item, dict))
+        if requests["exit"] == 0 and after_count > before_count and not has_unredacted_query:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("network-monitoring captured no new redacted requests")
     elif op_name == "dialog-handling":
-        res = run_bridge_cmd("batch", json.dumps([
-            {"action": "executeScriptCDP", "payload": {"code": "setTimeout(() => alert('hello dialog'), 0); 'scheduled'"}},
-            {"action": "handleDialog", "delayMs": 100, "payload": {"accept": True}},
-        ]), tab_id)
+        scheduled = run_bridge_cmd("executeScriptCDP", tab_id, "setTimeout(() => alert('hello dialog'), 0); 'scheduled'")
+        if scheduled["exit"] != 0:
+            raise RuntimeError("dialog-handling schedule failed")
+        time.sleep(0.1)
+        res = run_bridge_cmd("handleDialog", tab_id, "accept")
     elif op_name == "storage-state":
         with tempfile.NamedTemporaryFile(prefix="state-", suffix=".json", delete=False) as f:
             temp_path = f.name
@@ -621,6 +729,33 @@ def run_playwright_iteration(results, state, base_url):
                 elif op == "iframe-fill":
                     page.frame_locator("#frame").locator("#frame-input").fill("framed")
                     page.wait_for_function("window.__frameValue === 'framed'")
+                elif op == "role-click":
+                    page.get_by_label("Search query").fill("role-click-playwright")
+                    page.get_by_role("button", name="Click me").click()
+                    page.wait_for_function("document.querySelector('#status').textContent === 'clicked:role-click-playwright'")
+                elif op == "label-fill":
+                    page.get_by_label("Search query").fill("by-label")
+                    page.wait_for_function("document.querySelector('#q').value === 'by-label'")
+                elif op == "text-click":
+                    before = page.evaluate("window.__frameClicks")
+                    page.frame_locator("#frame").get_by_text("Frame click", exact=True).click()
+                    page.wait_for_function(f"window.__frameClicks === {before + 1}")
+                elif op == "frame-select":
+                    page.frame_locator("#frame").locator("#frame-select").select_option("two")
+                    page.wait_for_function("window.__frameSelect === 'two'")
+                elif op == "frame-upload":
+                    with tempfile.NamedTemporaryFile(prefix="frame-upload-", suffix=".txt", delete=False) as f:
+                        f.write(b"frame upload fixture\n")
+                        temp_path = f.name
+                    try:
+                        page.frame_locator("#frame").locator("#frame-file").set_input_files(temp_path)
+                    finally:
+                        with contextlib_suppress():
+                            os.unlink(temp_path)
+                    page.wait_for_function("window.__frameFileCount === 1")
+                elif op == "shadow-fill":
+                    page.locator("#shadow-host").evaluate("(host, value) => { const input = host.shadowRoot.querySelector('#shadow-input'); input.value = value; input.dispatchEvent(new Event('input', {bubbles: true})); }", "shadowed")
+                    page.wait_for_function("document.querySelector('#shadow-host').shadowRoot.querySelector('#shadow-input').value === 'shadowed'")
                 elif op == "console-monitoring":
                     page.click("#log")
                     page.wait_for_timeout(50)
@@ -748,16 +883,22 @@ try {
         else if (op === 'observe-state') await page.$eval('body', el => el.innerText);
         else if (op === 'shadow-dom-click') { const clicked = await page.$eval('#shadow-host', host => { const btn = host.shadowRoot && host.shadowRoot.querySelector('#shadow-btn'); if (!btn) throw new Error('shadow button missing'); btn.click(); return window.__shadowClicks; }); if (clicked < 1) throw new Error('shadow click did not register'); }
         else if (op === 'iframe-fill') { const frameHandle = await page.$('#frame'); const frame = await frameHandle.contentFrame(); await frame.$eval('#frame-input', (el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles: true})); }, 'framed'); await page.waitForFunction(() => window.__frameValue === 'framed'); }
+        else if (op === 'role-click') { await page.$eval('#q', (el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles: true})); }, 'role-click-puppeteer'); await page.evaluate(() => { const btn = [...document.querySelectorAll('button')].find(el => el.textContent.trim() === 'Click me'); if (!btn) throw new Error('role button missing'); btn.click(); }); await page.waitForFunction(() => document.querySelector('#status').textContent === 'clicked:role-click-puppeteer'); }
+        else if (op === 'label-fill') { await page.$eval('#q', (el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles: true})); }, 'by-label'); await page.waitForFunction(() => document.querySelector('#q').value === 'by-label'); }
+        else if (op === 'text-click') { const before = await page.evaluate(() => window.__frameClicks); const frameHandle = await page.$('#frame'); const frame = await frameHandle.contentFrame(); await frame.evaluate(() => { const btn = [...document.querySelectorAll('*')].find(el => el.textContent.trim() === 'Frame click'); if (!btn) throw new Error('frame text target missing'); btn.click(); }); await page.waitForFunction(expected => window.__frameClicks === expected, {}, before + 1); }
+        else if (op === 'frame-select') { const frameHandle = await page.$('#frame'); const frame = await frameHandle.contentFrame(); await frame.select('#frame-select', 'two'); await page.waitForFunction(() => window.__frameSelect === 'two'); }
+        else if (op === 'frame-upload') { const tmp = `/tmp/chrome-bridge-puppeteer-frame-upload-${Date.now()}-${i}.txt`; fs.writeFileSync(tmp, 'frame upload fixture\n'); const frameHandle = await page.$('#frame'); const frame = await frameHandle.contentFrame(); const input = await frame.$('#frame-file'); await input.uploadFile(tmp); fs.unlinkSync(tmp); await page.waitForFunction(() => window.__frameFileCount === 1); }
+        else if (op === 'shadow-fill') { await page.$eval('#shadow-host', (host, value) => { const input = host.shadowRoot.querySelector('#shadow-input'); if (!input) throw new Error('shadow input missing'); input.value = value; input.dispatchEvent(new Event('input', {bubbles: true})); }, 'shadowed'); await page.waitForFunction(() => document.querySelector('#shadow-host').shadowRoot.querySelector('#shadow-input').value === 'shadowed'); }
         else if (op === 'console-monitoring') { await page.click('#log'); await new Promise(r => setTimeout(r, 50)); if (!consoleMessages.length) throw new Error('no console messages captured'); }
         else if (op === 'network-monitoring') { const before = requests.length; await page.click('#fetch'); await new Promise(r => setTimeout(r, 50)); if (requests.length <= before) throw new Error('no network requests captured'); }
         else if (op === 'dialog-handling') { page.once('dialog', dialog => dialog.accept()); await page.click('#alert'); }
         else if (op === 'storage-state') await page.cookies();
         else if (op === 'geolocation') { const latitude = await page.evaluate(() => new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(pos => resolve(pos.coords.latitude), err => reject(new Error(err.message)), {timeout: 1000}))); if (Math.abs(Number(latitude) - 37.7749) > 0.01) throw new Error(`unexpected latitude ${latitude}`); }
         else if (op === 'performance-metrics') await page.metrics();
-        else throw new Error(`unsupported operation ${op}`);
+        else { const error = new Error(`unsupported operation ${op}`); error.unsupported = true; throw error; }
         record(results, op, 'pass', started);
       } catch (error) {
-        record(results, op, 'fail', started, error);
+        record(results, op, error && error.unsupported ? 'unsupported' : 'fail', started, error);
       }
     }
     await page.close();
@@ -939,6 +1080,8 @@ async def _run_chrome_devtools_mcp_op(session, context, op_name, base_url):
         result = await _cdt_mcp_call(session, "evaluate_script", {"function": "() => window.__frameValue"})
         if "framed" not in _cdt_mcp_text(result):
             raise UnsupportedAdapter("iframe fill UID did not update page state")
+    elif op_name in {"role-click", "label-fill", "text-click", "frame-select", "frame-upload", "shadow-fill"}:
+        raise UnsupportedAdapter(f"chrome-devtools-mcp adapter does not expose reliable {op_name} semantics")
     elif op_name == "console-monitoring":
         await _cdt_mcp_call(
             session,
@@ -979,7 +1122,7 @@ async def _run_chrome_devtools_mcp_op(session, context, op_name, base_url):
     elif op_name == "performance-metrics":
         await _cdt_mcp_call(session, "evaluate_script", {"function": "() => JSON.stringify(performance.timing)"})
     else:
-        raise ValueError(f"Unknown operation: {op_name}")
+        raise UnsupportedAdapter(f"unsupported operation {op_name}")
 
 
 async def _run_chrome_devtools_mcp_async(args, results, base_url):
