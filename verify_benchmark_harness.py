@@ -175,6 +175,7 @@ def main():
             "--output", str(Path(tmp) / "rss-cli.json"),
             extra_env={"CHROME_BRIDGE_BENCHMARK_PS_OUTPUT": ps_sample},
         )
+        require(proc.returncode != 0, "browser RSS CLI guard must fail")
         require("browser RSS" in proc.stderr and "exceeds limit" in proc.stderr,
                 f"browser RSS CLI guard must print a concise message: stderr={proc.stderr!r}")
         require("Traceback" not in proc.stderr,
