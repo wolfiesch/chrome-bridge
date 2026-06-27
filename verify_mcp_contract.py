@@ -36,8 +36,9 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "mcp"))
 from chrome_bridge_mcp import server  # noqa: E402
 from chrome_bridge_mcp.transport import BridgeError  # noqa: E402
 
-# Captured (action, payload) of the LAST request the mock bridge received.
+# Captured requests the mock bridge received.
 received = []
+received_raw = []
 received_lock = threading.Lock()
 
 
@@ -74,6 +75,7 @@ def serve():
             action, payload = req.get("action"), req.get("payload")
             with received_lock:
                 received.append((action, payload))
+                received_raw.append(req)
             try:
                 result = _result_fn(action, payload)
                 resp = {"success": True, "result": result}
@@ -97,6 +99,11 @@ def expect(cond, msg):
 def last_request():
     with received_lock:
         return received[-1] if received else (None, None)
+
+
+def last_raw_request():
+    with received_lock:
+        return received_raw[-1] if received_raw else {}
 
 
 def _tool_names(srv):
@@ -206,6 +213,11 @@ def main():
     server.browser_action("performanceMetrics", {"tabId": 11})
     expect(last_request() == ("performanceMetrics", {"tabId": 11}), "browser_action passthrough mismatch")
 
+    # 9a. browser_confirm_action forwards the same action with top-level confirmation token.
+    server.browser_confirm_action("executeScript", "confirm-token", {"tabId": 11, "code": "1"})
+    expect(last_request() == ("executeScript", {"tabId": 11, "code": "1"}), "browser_confirm_action payload mismatch")
+    expect(last_raw_request().get("confirmationToken") == "confirm-token", "browser_confirm_action confirmation token mismatch")
+
     # 9b. browser_policy_check forwards policyCheck with action/payload, no tab resolve.
     with received_lock:
         received.clear()
@@ -273,6 +285,7 @@ def main():
     expect("browser_action" not in default_names, "browser_action must be hidden by default (sensitive)")
     expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
     expect("browser_policy_check" in default_names, "policy_check must be present by default (read-only, non-sensitive)")
+    expect("browser_confirm_action" in default_names, "confirm_action must be present by default (mutating, non-sensitive)")
 
     # 17. allow_sensitive exposes sensitive tools.
     sens_names = _tool_names(server.build_server(allow_sensitive=True))
@@ -282,6 +295,7 @@ def main():
     ro_names = _tool_names(server.build_server(readonly=True, allow_sensitive=True))
     expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
     expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
+    expect("browser_confirm_action" not in ro_names, "readonly must hide browser_confirm_action (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
     expect("browser_policy_check" in ro_names, "readonly must keep policy_check (read-only)")
 
@@ -289,6 +303,7 @@ def main():
     srv = server.build_server(allow_sensitive=True)
     tools = {t.name: t for t in srv._tool_manager.list_tools()}
     expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
+    expect(tools["browser_confirm_action"].annotations.destructiveHint is True, "confirm_action should be destructiveHint=True")
     expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
     res_uris = _resource_uris(srv)
     expect("browser://tabs" in res_uris, "browser://tabs resource missing")

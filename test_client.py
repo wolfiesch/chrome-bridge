@@ -56,7 +56,7 @@ def expand_output_path(path):
     return os.path.abspath(os.path.expanduser(path))
 
 
-def send_command_data(action, payload=None, read_timeout_ms=None):
+def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
     if payload is None:
         payload = {}
 
@@ -104,6 +104,8 @@ def send_command_data(action, payload=None, read_timeout_ms=None):
             "payload": payload,
             "token": token
         }
+        if isinstance(confirmation_token, str) and confirmation_token:
+            cmd["confirmationToken"] = confirmation_token
         sock.sendall((json.dumps(cmd) + "\n").encode('utf-8'))
 
         buffer = b""
@@ -140,8 +142,8 @@ def send_command_data(action, payload=None, read_timeout_ms=None):
                 pass
 
 
-def send_command(action, payload=None, read_timeout_ms=None):
-    exit_code, response, stderr = send_command_data(action, payload, read_timeout_ms)
+def send_command(action, payload=None, read_timeout_ms=None, confirmation_token=None):
+    exit_code, response, stderr = send_command_data(action, payload, read_timeout_ms, confirmation_token)
     if response is not None:
         print(json.dumps(response, indent=2))
     if stderr:
@@ -293,6 +295,7 @@ def print_usage():
     print("  python3 test_client.py sessionStatus <domain> [<domain> ...]")
     print("  python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
     print("  python3 test_client.py policyCheck <action> [payloadJson]")
+    print("  python3 test_client.py confirm <action> <confirmationToken> <payloadJson>")
 
 def main():
     if len(sys.argv) < 2:
@@ -453,6 +456,17 @@ def main():
         if len(args) > 3:
             payload["tabId"] = parse_int(args[3], "tabId")
         sys.exit(send_command("batch", payload))
+    elif action == "confirm":
+        require_args(args, 5, "Usage: python3 test_client.py confirm <action> <confirmationToken> <payloadJson>")
+        try:
+            payload = json.loads(args[4])
+        except Exception as exc:
+            print(f"Invalid payload JSON: {exc}", file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(payload, dict):
+            print("payloadJson must be a JSON object", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command(args[2], payload, confirmation_token=args[3]))
     elif action == "policyCheck":
         require_args(args, 3, "Usage: python3 test_client.py policyCheck <action> [payloadJson]")
         target_payload = {}

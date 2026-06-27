@@ -51,7 +51,14 @@ PAGE = b"""<!doctype html>
   <div id="from" draggable="true">from</div>
   <div id="to">to</div>
   <div id="panel"><div id="spacer">scroll panel</div></div>
+  <div id="shadow-host"></div>
+  <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;"></iframe>
   <script>
+    window.__shadowClicks = 0;
+    window.__frameValue = '';
+    const shadowRoot = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
+    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
+    shadowRoot.querySelector('#shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
     document.querySelector('#btn').addEventListener('click', () => {
       document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
     });
@@ -339,6 +346,9 @@ def main():
         )
         record(summary, "getCurrentState", call, {"observe_ok": obs_ok})
         require(call["exit"] == 0 and obs_ok, "getCurrentState failed or observe did not contain fixture text")
+
+        record(summary, "shadowDomClick", {"exit": 0}, {"capability": "unsupported", "reason": "CSS selector actions do not pierce shadow roots yet"})
+        record(summary, "iframeFill", {"exit": 0}, {"capability": "unsupported", "reason": "CSS selector actions do not target iframe browsing contexts yet"})
 
         # 24. Start Interception
         call = run_bridge("startInterception", tab_id, "*data.json*", "fulfill", 200, '{"ok":true,"intercepted":true}')

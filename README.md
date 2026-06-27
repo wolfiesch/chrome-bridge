@@ -8,34 +8,37 @@ The bridge exposes an agent-ready browser-control surface: navigation and histor
 
 ```text
 chrome-native-bridge/
-├── extension/                          <- LOAD THIS in chrome://extensions
+├── extension/                          <- public unkeyed extension source copy
 │   ├── manifest.json
 │   └── background.js
-├── background.js                       <- editable source, sync into extension/ after edits
-├── manifest.json                       <- editable source, sync into extension/ after edits
+├── background.js                       <- editable service-worker source
+├── manifest.json                       <- public unkeyed source manifest
+├── extension_identity.py               <- local key and extension ID helper
 ├── bridge.py                           <- native host
+├── bridge_policy.example.json          <- explicit opt-in policy template
 ├── com.automation.bridge.json.template <- host-manifest template (setup.sh fills it in)
-├── setup.sh                            <- generates token, renders + registers host manifest
+├── setup.sh                            <- generates token/policy, deploys extension, registers host
 ├── test_client.py                      <- CLI client
 ├── benchmark_harness.py                <- benchmark and comparison harness
 ├── verify_bridge.py                    <- offline framing/auth test
 ├── verify_cli_contract.py              <- offline CLI dispatch test
 ├── verify_heartbeat_contract.py        <- offline heartbeat/structure test
 ├── verify_benchmark_harness.py         <- offline benchmark contract test
+├── verify_install_contract.py           <- offline install/identity contract test
 ├── verify_agent_actions_live.py        <- manual live browser gate
 └── README.md
 ```
 
-`setup.sh` generates `bridge_token.txt` (0600 shared secret) and `com.automation.bridge.json`; `setup-rs.sh` additionally generates `com.automation.bridge.rust.json` and the `bridge-host-launch.sh` wrapper. The optional `bridge_tokens.txt` named-token registry (see Multi-client tokens and leasing) is also a local secret. All of these are git-ignored and stay local. Keep Python files out of `extension/`: running them creates `__pycache__`, and Chrome refuses to load extension folders containing `_`-prefixed names.
+`setup.sh` generates `bridge_token.txt` (0600 shared secret), installs `bridge_policy.json` from `bridge_policy.example.json` when absent, deploys a local keyed extension manifest, and writes `com.automation.bridge.json`. `setup-rs.sh` additionally generates `com.automation.bridge.rust.json` and the `bridge-host-launch.sh` wrapper. The optional `bridge_tokens.txt` named-token registry (see Multi-client tokens and leasing) is also a local secret. All of these are git-ignored and stay local. Keep Python files out of Chrome-loaded extension directories: running them creates `__pycache__`, and Chrome refuses folders containing `_`-prefixed names.
 
 ## Components
 
 | File | Role |
 |---|---|
-| `extension/manifest.json` | MV3 extension manifest. No fixed `key`, so Chrome assigns your own extension ID on load. |
+| `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
 | `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
-| `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute `bridge.py` path and your extension ID. |
+| `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
 
 ## Requirements
@@ -46,19 +49,42 @@ chrome-native-bridge/
 
 ## Setup
 
+Default local install:
+
+```bash
+./setup.sh
+```
+
+The script generates or reuses `extension_key.pem`, deploys `background.js` plus a keyed manifest into a per-user extension directory, registers the native host for that deterministic extension ID, creates `bridge_token.txt` when absent, and installs `bridge_policy.json` from the example template when absent. It prints the extension directory at the end.
+
+Then:
+
 1. Open `chrome://extensions/` and enable Developer mode.
-2. Load unpacked extension folder: this repo's `extension/`. Copy the assigned extension ID.
-3. Register the native host with that ID:
-   ```bash
-   ./setup.sh <extension-id>
-   ```
-   This generates a fresh local token and registers the host for your OS.
-4. Enable only one bridge extension at a time. Duplicate bridge extensions race to bind port `9223`.
-5. Verify:
+2. Load unpacked: the extension directory printed by `./setup.sh`.
+3. Enable only one bridge extension at a time. Duplicate bridge extensions race to bind port `9223`.
+4. Verify:
    ```bash
    python3 test_client.py ping
+   python3 test_client.py policyCheck getTabs '{}'
    ```
-   Expected: `{"success": true, "result": "pong"}`.
+   Expected: `ping` succeeds. `policyCheck getTabs '{}'` is allowed when setup installed the example policy.
+
+Advanced setup:
+
+```bash
+./setup.sh --extension-id <id>
+```
+
+Use this for an already-packaged or future Web Store extension ID. It registers that ID and does not generate or inject a local extension key.
+
+```bash
+cargo build --release --manifest-path host-rs/Cargo.toml
+./setup-rs.sh
+```
+
+Use this to register the Rust host with the same extension-ID resolution flow.
+
+`extension_key.pem` is a private local identity key. Keep it git-ignored and never commit it. A future Web Store extension will have a separate store-managed ID.
 
 ## Command reference
 
@@ -220,8 +246,9 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
 python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_agent_actions_live.py verify_capability_matrix.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py
 node --check background.js
 diff -q manifest.json extension/manifest.json
 diff -q background.js extension/background.js
@@ -233,6 +260,22 @@ Manual live gates after reloading the unpacked extension (opens real Chrome tabs
 python3 test_client.py ping
 PYTHONDONTWRITEBYTECODE=1 ./verify_agent_actions_live.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
+```
+
+The default sample policy is intentionally fail-closed and denies loopback URLs. For these localhost live gates, temporarily use an explicit smoke-test policy, then restore your normal policy:
+
+```json
+{
+  "default": {
+    "allowedActions": ["*"],
+    "allowedOrigins": ["http://127.0.0.1:*"],
+    "deniedActions": [],
+    "deniedOrigins": [],
+    "requireConfirmation": [],
+    "redact": true,
+    "audit": true
+  }
+}
 ```
 
 `verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
@@ -304,6 +347,7 @@ Mutating:
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
 - `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
 - `browser_wait_for_handoff` — pause automation, focus the real tab with an on-page banner, and wait for a human to finish login/2FA/captcha before resuming
+- `browser_confirm_action` — resend an action with a host-issued confirmation token
 
 Escape hatch (sensitive):
 
@@ -318,8 +362,8 @@ Escape hatch (sensitive):
 
 The server reads two env flags to scope the exposed surface:
 
-- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, and `browser_action`.
-- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, and the `browser_action` escape hatch), which are hidden by default.
+- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, `browser_confirm_action`, and `browser_action`.
+- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
 
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately.
 
@@ -368,7 +412,7 @@ While a live lease is held, every non-lease action from a different client (incl
 
 ## Benchmarking against other browser automation surfaces
 
-The benchmark harness measures speed for the selected adapter. `chrome-bridge`, `playwright`, and `puppeteer` are live-measurable; Claude in Chrome, Codex Chrome extension, and Chrome DevTools MCP remain static capability metadata until adapters exist. The report also emits a normalized scorecard and gap tickets.
+The benchmark harness measures speed for selected adapters. `chrome-bridge`, `playwright`, `puppeteer`, and `chrome-devtools-mcp` are live-measurable; Claude in Chrome and Codex Chrome Extension remain manual/static capability metadata. The report also emits a normalized scorecard, claim-discipline note, and gap tickets.
 
 Run the offline contract adapter:
 
@@ -382,20 +426,22 @@ Run measured adapters:
 python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --output /tmp/chrome-bridge-results.json
 python3 benchmark_harness.py run --adapter playwright --iterations 5 --output /tmp/playwright-results.json
 python3 benchmark_harness.py run --adapter puppeteer --iterations 5 --output /tmp/puppeteer-results.json
+python3 benchmark_harness.py run --adapter chrome-devtools-mcp --iterations 5 --output /tmp/chrome-devtools-results.json
 ```
 
-`chrome-bridge`, `playwright`, and `puppeteer` start a local HTTP fixture by default. To benchmark another page, pass `--base-url`:
+`chrome-bridge`, `playwright`, `puppeteer`, and `chrome-devtools-mcp` start a local HTTP fixture by default. To benchmark another page, pass `--base-url`:
 
 ```bash
 python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --base-url http://127.0.0.1:PORT/ --output /tmp/results.json
 ```
 
-Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks.
+Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks. Shadow DOM and iframe user-action parity are measured as explicit capability rows; Chrome Bridge currently reports them as unsupported until a later locator/iframe phase implements first-class support.
 
 Generate the Markdown report:
 
 ```bash
 python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md
+python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --input /tmp/chrome-devtools-results.json --output /tmp/head-to-head.md
 ```
 
 ### Persistent in-process client
@@ -471,7 +517,7 @@ tail -f bridge_debug.log
 
 - `Connection refused` after retry: Chrome is closed, no bridge extension is enabled, or the service worker did not wake.
 - `FATAL: could not bind 127.0.0.1:9223`: two bridge extensions are enabled.
-- `unauthorized`: token mismatch. Re-run `./setup.sh <extension-id>` and reload the extension.
+- `unauthorized`: token mismatch, or the native-host manifest authorized the wrong extension ID. Re-run `./setup.sh`, reload the printed extension directory, and disable duplicate bridge extensions.
 
 ## Security notes
 
@@ -479,6 +525,8 @@ tail -f bridge_debug.log
 - Payload bodies such as cookies and DOM are not logged by the host.
 - Host policy in `bridge_policy.json` (`BRIDGE_POLICY_FILE`) is the enforcement layer for every raw TCP/CLI/MCP client: the TCP API is localhost-only and token-gated, but token holders bypass MCP scoping, so deny/allow/confirmation rules are enforced in the native host before any action reaches the extension.
 - MCP `readonly`/`allow_sensitive` controls are usability scoping, not the security boundary, because a client with the token can call the raw TCP API directly. Use `bridge_policy.json` for real restrictions; use `browser_policy_check` (or `test_client.py policyCheck`) to see what the host would decide.
+- Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in.
+- Actions listed in `requireConfirmation` return an opaque `confirmationToken`; clients must resend the same action and payload through `browser_confirm_action` or `test_client.py confirm` before the host forwards it.
 - Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
 - Audit logs are JSONL at `BRIDGE_AUDIT_LOG_FILE` / `bridge_audit.jsonl`, one event per request with `ts`, `client`, `action`, `targets`, `decision`, `reason`, `requestId`. They intentionally omit payload and response bodies.
 - Cookie and storage-state redaction is enabled by default through policy (`redact`): cookie values and sensitive storage keys are replaced with `<redacted>` before responses reach the client. Page-derived content from `getHTML`, `extractText`, `executeScript`, and `executeScriptCDP` is additionally masked against the client policy's `redactPatterns` (a list of regexes; use inline flags like `(?i)` for case-insensitivity) before it reaches the client.

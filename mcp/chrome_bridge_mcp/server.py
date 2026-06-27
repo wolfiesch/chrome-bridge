@@ -280,6 +280,10 @@ def browser_action(action: str, payload: Optional[dict] = None) -> str:
     """
     return _text(call(action, payload or {}))
 
+def browser_confirm_action(action: str, confirmation_token: str, payload: Optional[dict] = None) -> str:
+    """Resend a bridge action with a host-issued confirmation token."""
+    return _text(call(action, payload or {}, confirmation_token=confirmation_token))
+
 
 def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
     """Ask the host what its policy would decide for ``action``/``payload``.
@@ -387,6 +391,7 @@ _TOOLS = [
     (browser_tab_control, True, False),
     (browser_wait_for_handoff, True, False),
     (browser_action, True, True),
+    (browser_confirm_action, True, False),
     (browser_lease, True, False),
     (browser_release, True, False),
     (browser_lease_status, False, False),

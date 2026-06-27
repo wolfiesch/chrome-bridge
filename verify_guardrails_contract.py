@@ -80,8 +80,10 @@ class Client:
         self.sock.settimeout(10)
         self.sock.connect(("127.0.0.1", PORT))
 
-    def req(self, action, payload=None):
+    def req(self, action, payload=None, confirmation_token=None):
         cmd = {"action": action, "payload": payload or {}, "token": self.token}
+        if confirmation_token:
+            cmd["confirmationToken"] = confirmation_token
         self.sock.sendall((json.dumps(cmd) + "\n").encode())
         while b"\n" not in self.buf:
             chunk = self.sock.recv(65536)
@@ -174,14 +176,45 @@ PERMISSIVE = {"default": {"allowedActions": ["*"], "deniedActions": [],
                           "allowedOrigins": ["*"], "deniedOrigins": [],
                           "requireConfirmation": [], "redact": True, "audit": True}}
 
+
+def permissive_with(**overrides):
+    default = dict(PERMISSIVE["default"])
+    default.update(overrides)
+    return {"default": default}
+
+
+EXAMPLE_DENIED_ORIGINS = [
+    "file://*", "chrome://*", "chrome-extension://*",
+    "*://localhost", "*://localhost:*",
+    "*://127.0.0.1", "*://127.0.0.1:*",
+    "*://0.0.0.0", "*://0.0.0.0:*",
+    "*://*.local", "*://*.local:*",
+    "*://[[]::1[]]", "*://[[]::1[]]:*",
+]
+
 AUDIT_KEYS = {"ts", "client", "action", "targets", "decision", "reason", "requestId"}
 
 
 def run_against(label, cmd, env):
     print(f"\n=== host: {label} ===")
 
+    # --- Missing policy file uses fail-closed built-in defaults ---
+    try:
+        os.remove(POLICY_FILE)
+    except FileNotFoundError:
+        pass
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: action getTabs not allowed",
+               f"{label}: missing policy should deny getTabs, got {r}")
+        r = c.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: missing policy should allow ping, got {r}")
+        c.close()
+
     # --- Denied action ---
-    write_policy({"default": {"deniedActions": ["getCookies"]}})
+    write_policy(permissive_with(deniedActions=["getCookies"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("getCookies", {"domain": "x.test"})
@@ -192,7 +225,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Target deny for cookies ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("getCookies", {"domain": "mail.google.com"})
@@ -203,7 +236,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Target deny for downloads ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("downloadUrl", {"url": "https://mail.google.com/a/file"})
@@ -214,7 +247,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Explicit default port preserved in targets (Python/Rust parity) ---
-    write_policy({"default": {"deniedOrigins": ["*://example.com:443"]}})
+    write_policy(permissive_with(deniedOrigins=["*://example.com:443"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("downloadUrl", {"url": "https://example.com:443/file"})
@@ -224,15 +257,43 @@ def run_against(label, cmd, env):
                f"{label}: explicit default port deny must not forward")
         c.close()
 
-    # --- Malformed URL port must not crash the handler (fail-closed targets) ---
-    write_policy(PERMISSIVE)
+    # --- Required target actions fail closed when payload target is unresolved ---
+    write_policy(permissive_with(allowedActions=["*"], allowedOrigins=["*"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
-        r = c.req("navigate", {"url": "https://example.com:99999/x"})
-        expect(r and r.get("success") is True,
-               f"{label}: malformed-port URL should still get a clean response, got {r}")
-        expect("navigate" in forwarded_actions(),
-               f"{label}: malformed-port navigate (no valid target) should forward under permissive policy")
+        r = c.req("navigate", {"url": "file:///tmp/a.html"})
+        expect(r and r.get("success") is False and "target unresolved" in str(r.get("error", "")),
+               f"{label}: file navigate should be target-unresolved, got {r}")
+        r = c.req("downloadUrl", {"url": "https://example.com:99999/file"})
+        expect(r and r.get("success") is False and "target unresolved" in str(r.get("error", "")),
+               f"{label}: malformed-port download should be target-unresolved, got {r}")
+        for payload in ({}, {"domain": ""}, {"domain": "."}, {"domain": "   "}):
+            r = c.req("getCookies", payload)
+            expect(r and r.get("success") is False and "target unresolved" in str(r.get("error", "")),
+                   f"{label}: invalid getCookies target should be denied for {payload}, got {r}")
+        r = c.req("batch", {"steps": [{"action": "getCookies", "payload": {"domain": ""}}]})
+        expect(r and r.get("success") is False and "batch step 0: target unresolved" in str(r.get("error", "")),
+               f"{label}: batch invalid target should identify step, got {r}")
+        expect(all(a not in forwarded_actions() for a in ("navigate", "downloadUrl", "getCookies", "batch")),
+               f"{label}: unresolved target actions must not forward, got {forwarded_actions()}")
+        c.close()
+
+    # --- Example deny-list blocks local/private origins even under wildcard allow ---
+    write_policy(permissive_with(allowedActions=["*"], allowedOrigins=["*"], deniedOrigins=EXAMPLE_DENIED_ORIGINS))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for url in [
+            "http://localhost:9223/",
+            "http://127.0.0.1:9223/",
+            "http://0.0.0.0:9223/",
+            "http://foo.local:9223/",
+            "http://[::1]:9223/",
+        ]:
+            r = c.req("navigate", {"url": url})
+            expect(r and r.get("success") is False and "target denied" in str(r.get("error", "")),
+                   f"{label}: example deny-list should block {url}, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: local/private denied navigations must not forward")
         c.close()
 
     # --- Policy hot-reload ---
@@ -243,26 +304,42 @@ def run_against(label, cmd, env):
         expect(r and r.get("success"), f"{label}: ping should forward under permissive policy")
         # Rewrite to deny ping; ensure mtime advances.
         time.sleep(1.1)
-        write_policy({"default": {"deniedActions": ["ping"]}})
+        write_policy(permissive_with(deniedActions=["ping"]))
         time.sleep(0.2)
         r = c.req("ping")
         expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
                f"{label}: ping should be denied after hot-reload, got {r}")
         c.close()
 
-    # --- Confirmation ---
-    write_policy({"default": {"requireConfirmation": ["executeScript"]}})
+    # --- Confirmation token is bound to client/action/payload/targets ---
+    write_policy(permissive_with(requireConfirmation=["executeScript"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
-        r = c.req("executeScript", {"tabId": 1, "code": "1"})
-        expect(r and r.get("confirmationRequired") is True and r.get("success") is False,
-               f"{label}: executeScript should require confirmation, got {r}")
+        payload = {"tabId": 1, "code": "1"}
+        r = c.req("executeScript", payload)
+        token = (r or {}).get("confirmationToken")
+        expect(r and r.get("confirmationRequired") is True and r.get("success") is False and isinstance(token, str) and token,
+               f"{label}: executeScript should return a confirmation token, got {r}")
         expect("executeScript" not in forwarded_actions(),
-               f"{label}: confirmation-required action must not forward")
+               f"{label}: unconfirmed action must not forward")
+        r = c.req("executeScript", payload, confirmation_token=token)
+        expect(r and r.get("success") is True,
+               f"{label}: confirmed executeScript should succeed, got {r}")
+        expect("executeScript" in forwarded_actions(),
+               f"{label}: confirmed executeScript should forward")
+        r = c.req("executeScript", {"tabId": 1, "code": "2"}, confirmation_token=token)
+        expect(r and r.get("confirmationRequired") is True and r.get("confirmationToken") != token,
+               f"{label}: reused token with different payload should require fresh confirmation, got {r}")
         c.close()
+        time.sleep(0.3)
+        exec_events = [e for e in audit_events() if e["action"] == "executeScript"]
+        decisions = [e["decision"] for e in exec_events]
+        expected_order = ["confirmation_required", "confirmation_accepted", "allow", "extension_success", "confirmation_required"]
+        expect(decisions == expected_order,
+               f"{label}: confirmation audit order = {decisions}")
 
     # --- Batch action denial (batch itself denied, steps not inspected) ---
-    write_policy({"default": {"deniedActions": ["batch"]}})
+    write_policy(permissive_with(deniedActions=["batch"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("batch", {"steps": [{"action": "ping", "payload": {}}]})
@@ -273,7 +350,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Batch step denial ---
-    write_policy({"default": {"deniedActions": ["executeScript"]}})
+    write_policy(permissive_with(deniedActions=["executeScript"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("batch", {"steps": [{"action": "executeScript", "payload": {"tabId": 1, "code": "1"}}]})
@@ -284,7 +361,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Audit ---
-    write_policy({"default": {"deniedActions": ["getCookies"], "requireConfirmation": ["executeScript"]}})
+    write_policy(permissive_with(deniedActions=["getCookies"], requireConfirmation=["executeScript"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         c.req("ping")
@@ -333,7 +410,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- policyCheck ---
-    write_policy({"default": {"requireConfirmation": ["executeScript"]}})
+    write_policy(permissive_with(requireConfirmation=["executeScript"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("policyCheck", {"action": "getCookies", "payload": {"domain": "mail.google.com"}})
@@ -385,7 +462,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Tab-origin enforcement: deny tab-scoped action on a denied origin ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     set_tab_origins({7: "https://mail.google.com"})
     with Host(label, cmd, env):
         c = Client("tok-alpha")
@@ -400,7 +477,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Tab-origin enforcement: allow tab-scoped action on an allowed origin ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     set_tab_origins({7: "https://github.com"})
     with Host(label, cmd, env):
         c = Client("tok-alpha")
@@ -412,7 +489,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Tab-origin allow-list with explicit default port (parity) ---
-    write_policy({"default": {"allowedOrigins": ["https://example.com:443"]}})
+    write_policy(permissive_with(allowedOrigins=["https://example.com:443"]))
     set_tab_origins({7: "https://example.com:443"})
     with Host(label, cmd, env):
         c = Client("tok-alpha")
@@ -422,7 +499,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Fail closed when the tab origin cannot be resolved ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     set_tab_origins({7: None})
     with Host(label, cmd, env):
         c = Client("tok-alpha")
@@ -446,7 +523,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Batch tabId defaulting is origin-checked ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     set_tab_origins({7: "https://mail.google.com"})
     with Host(label, cmd, env):
         c = Client("tok-alpha")
@@ -459,7 +536,7 @@ def run_against(label, cmd, env):
     set_tab_origins({None: "https://github.com"})
 
     # --- policyCheck reports originDependent for tab-scoped actions ---
-    write_policy({"default": {"deniedOrigins": ["*://mail.google.com"]}})
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("policyCheck", {"action": "click", "payload": {"tabId": 7}})
@@ -471,7 +548,7 @@ def run_against(label, cmd, env):
         c.close()
 
     # --- Content redaction: redactPatterns mask getHTML/extractText/script ---
-    write_policy({"default": {"redactPatterns": [r"\d{3}-\d{2}-\d{4}", "(?i)bearer [a-z0-9]+"]}})
+    write_policy(permissive_with(redactPatterns=[r"\d{3}-\d{2}-\d{4}", "(?i)bearer [a-z0-9]+"]))
     html_result = lambda a, p: {"success": True, "html": "<p>SSN 123-45-6789</p>"} if a == "getHTML" else (
         {"success": True, "text": "auth Bearer abc123 token"} if a == "extractText" else (
         {"success": True, "val": "SSN 999-88-7777"} if a == "executeScript" else {"echo": a}))

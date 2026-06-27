@@ -41,7 +41,10 @@ def main():
         require(len(data.get("operations", [])) >= 10, "expected broad browser operation coverage")
         require("navigate" in {op.get("name") for op in data.get("operations", [])}, "navigate operation missing")
         require("fill" in {op.get("name") for op in data.get("operations", [])}, "fill operation missing")
-        require("network-monitoring" in {op.get("name") for op in data.get("operations", [])}, "network monitoring operation missing")
+        op_names = {op.get("name") for op in data.get("operations", [])}
+        require("network-monitoring" in op_names, "network monitoring operation missing")
+        require("shadow-dom-click" in op_names, "shadow DOM operation missing")
+        require("iframe-fill" in op_names, "iframe fill operation missing")
         for op in data.get("operations", []):
             require(op.get("capability") in {"pass", "fail", "manual", "unsupported"}, f"bad capability status for {op}")
             require(isinstance(op.get("durationsMs"), list), f"durationsMs missing for {op.get('name')}")
@@ -80,8 +83,21 @@ def main():
             adapter_data = json.loads(adapter_out.read_text(encoding="utf-8"))
             require(adapter_data.get("adapter") == adapter, f"{adapter} adapter name not recorded")
 
+        second = Path(tmp) / "other.json"
+        other = dict(data)
+        other["adapter"] = "unknown-adapter"
+        second.write_text(json.dumps(other), encoding="utf-8")
+        multi_report = Path(tmp) / "multi-report.md"
+        proc = run("compare", "--input", str(out), "--input", str(second), "--output", str(multi_report))
+        require(proc.returncode == 0, f"multi-input compare failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        multi_text = multi_report.read_text(encoding="utf-8")
+        require("noop status" in multi_text and "unknown-adapter status" in multi_text, "multi-input operation columns missing")
+        proc = run("compare", "--input", str(out), "--input", str(out), "--output", str(Path(tmp) / "dupe.md"))
+        require(proc.returncode != 0 and "duplicate benchmark adapter noop" in proc.stderr, "duplicate adapter should fail")
+
         require("## Normalized Scorecard" in text, "normalized scorecard missing")
         require("## Gap Tickets" in text, "gap tickets missing")
+        require("## Claim Discipline" in text, "claim discipline section missing")
         require("| Tool | Speed | Capability | Auth Reuse | Ergonomics | Overall |" in text, "scorecard table missing")
 
     print("Benchmark harness contract OK")

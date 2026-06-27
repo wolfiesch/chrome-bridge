@@ -11,6 +11,7 @@ import queue
 import time
 import re
 import fnmatch
+import hashlib
 from urllib.parse import urlparse
 
 # Resolve paths relative to this script so the install is location-independent.
@@ -108,6 +109,55 @@ def now_ms():
 # requests. Idle connections are closed after this many seconds so a
 # persistent client can reconnect transparently.
 SOCKET_IDLE_TIMEOUT = float(os.environ.get('BRIDGE_SOCKET_IDLE_TIMEOUT', 300))
+CONFIRMATION_TTL_MS = int(os.environ.get('BRIDGE_CONFIRMATION_TTL_MS', '60000'))
+_confirmation_lock = threading.Lock()
+_pending_confirmations = {}
+
+
+def confirmation_fingerprint(name, action, payload, targets):
+    data = {
+        "client": name,
+        "action": action,
+        "payload": payload,
+        "targets": list(targets),
+    }
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prune_confirmations_locked(now=None):
+    now = now_ms() if now is None else now
+    expired = [tok for tok, entry in _pending_confirmations.items()
+               if entry["expires_at"] <= now]
+    for tok in expired:
+        _pending_confirmations.pop(tok, None)
+
+
+def issue_confirmation(name, action, payload, targets):
+    expires_at = now_ms() + CONFIRMATION_TTL_MS
+    token = uuid.uuid4().hex
+    fingerprint = confirmation_fingerprint(name, action, payload, targets)
+    with _confirmation_lock:
+        _prune_confirmations_locked()
+        _pending_confirmations[token] = {
+            "fingerprint": fingerprint,
+            "expires_at": expires_at,
+        }
+    return token, expires_at
+
+
+def consume_confirmation(token, name, action, payload, targets):
+    if not isinstance(token, str) or not token:
+        return False
+    fingerprint = confirmation_fingerprint(name, action, payload, targets)
+    with _confirmation_lock:
+        _prune_confirmations_locked()
+        entry = _pending_confirmations.get(token)
+        if not entry or entry["fingerprint"] != fingerprint:
+            return False
+        _pending_confirmations.pop(token, None)
+        return True
+
 
 def read_message():
     raw_length = sys.stdin.buffer.read(4)
@@ -213,13 +263,23 @@ ORIGIN_EXEMPT_ACTIONS = {
 # "unknown action" so the reserved surface is not externally reachable.
 RESERVED_ACTIONS = {'__tabOrigin'}
 
-# Built-in permissive default. The policy file's "default"/"clients" overlay it.
+TARGET_REQUIRED_ACTIONS = {'navigate', 'downloadUrl', 'getCookies'}
+
+# Built-in fail-closed default. A policy file must explicitly opt into browser
+# automation beyond host-side liveness/policy/lease operations.
 DEFAULT_POLICY = {
     "default": {
-        "allowedActions": ["*"],
+        "allowedActions": ["ping", "policyCheck", "lease", "release", "leaseStatus"],
         "deniedActions": [],
-        "allowedOrigins": ["*"],
-        "deniedOrigins": [],
+        "allowedOrigins": [],
+        "deniedOrigins": [
+            "file://*", "chrome://*", "chrome-extension://*",
+            "*://localhost", "*://localhost:*",
+            "*://127.0.0.1", "*://127.0.0.1:*",
+            "*://0.0.0.0", "*://0.0.0.0:*",
+            "*://*.local", "*://*.local:*",
+            "*://[[]::1[]]", "*://[[]::1[]]:*",
+        ],
         "requireConfirmation": [],
         "redactPatterns": [],
         "redact": True,
@@ -230,19 +290,19 @@ DEFAULT_POLICY = {
 
 _policy_lock = threading.Lock()
 _policy_cache = DEFAULT_POLICY
-_policy_mtime = None
+_policy_mtime = object()
 
 
 def load_policy():
-    # Read and parse the policy file. Missing/malformed file falls back to the
-    # permissive default and logs one error, preserving current behavior.
+    # fail-closed default and logs parse/load errors.
     try:
         with open(POLICY_FILE) as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("policy root must be an object")
         return data
-    except FileNotFoundError:
+    except FileNotFoundError as e:
+        logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
         return DEFAULT_POLICY
     except Exception as e:
         logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
@@ -298,10 +358,11 @@ def normalize_url_targets(raw_url):
         return []
     if not scheme or not host:
         return []
+    host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
     if port is not None:
-        netloc = f"{host}:{port}"
+        netloc = f"{host_part}:{port}"
     else:
-        netloc = host
+        netloc = host_part
     return [f"{scheme}://{netloc}", f"*://{netloc}"]
 
 
@@ -314,11 +375,18 @@ def targets_from_payload(action, payload):
         return normalize_url_targets(url) if isinstance(url, str) else []
     if action == 'getCookies':
         domain = payload.get('domain')
-        if isinstance(domain, str) and domain:
-            if domain.startswith('.'):
-                domain = domain[1:]
-            return [f"*://{domain.lower()}"]
-        return []
+        if not isinstance(domain, str):
+            return []
+        domain = domain.strip()
+        while domain.startswith('.'):
+            domain = domain[1:].strip()
+        domain = domain.lower()
+        if not domain or any(ch.isspace() for ch in domain) or any(ch in domain for ch in '/\\:'):
+            return []
+        parsed = urlparse(f"https://{domain}")
+        if (parsed.hostname or "").lower() != domain:
+            return []
+        return [f"*://{domain}"]
     if action == 'batch':
         targets = []
         steps = payload.get('steps')
@@ -423,6 +491,9 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     # batch step (runBatch would otherwise dispatch them). Deny centrally here.
     if action in RESERVED_ACTIONS:
         return (False, f"action {action} denied", False, redact_enabled, audit_enabled, targets)
+    if action in TARGET_REQUIRED_ACTIONS and not targets:
+        return (False, "target unresolved", False, redact_enabled, audit_enabled, targets)
+
 
     # Apply action-level policy to the action itself first.
     if action_matches(cp.get('deniedActions'), action):
@@ -660,6 +731,7 @@ def handle_socket_client(client_socket):
                     (json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode('utf-8'))
                 return
             cmd.pop("token", None)  # never forward the secret to the extension
+            confirmation_token = cmd.pop("confirmationToken", None)
 
             action = cmd.get("action")
 
@@ -771,11 +843,21 @@ def handle_socket_client(client_socket):
                     continue
 
             if confirm:
-                _audit(audit_enabled, name, action, targets, "confirmation_required", None, None)
-                client_socket.sendall((json.dumps({
-                    "success": False, "error": "confirmation required",
-                    "confirmationRequired": True, "action": action}) + "\n").encode('utf-8'))
-                continue
+                if consume_confirmation(confirmation_token, name, action, payload, targets):
+                    _audit(audit_enabled, name, action, targets, "confirmation_accepted", None, None)
+                else:
+                    token, expires_at = issue_confirmation(name, action, payload, targets)
+                    _audit(audit_enabled, name, action, targets, "confirmation_required", None, None)
+                    client_socket.sendall((json.dumps({
+                        "success": False,
+                        "error": "confirmation required",
+                        "confirmationRequired": True,
+                        "action": action,
+                        "targets": targets,
+                        "confirmationToken": token,
+                        "expiresAt": expires_at,
+                    }) + "\n").encode('utf-8'))
+                    continue
 
             # Enforcement gate: a live lease held by another client blocks others.
             with lease_lock:

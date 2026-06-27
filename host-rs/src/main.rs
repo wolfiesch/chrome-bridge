@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// Directory of the current executable; base for default token/log paths.
@@ -188,6 +189,14 @@ fn value_field(v: Option<&Value>) -> String {
 /// responses here.
 type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 
+#[derive(Clone)]
+struct Confirmation {
+    fingerprint: String,
+    expires_at: u128,
+}
+
+type Confirmations = Arc<Mutex<HashMap<String, Confirmation>>>;
+
 /// token -> client name registry plus the recorded mtimes of the two token
 /// files, shared across connections and reloadable under a write lock.
 struct TokenRegistry {
@@ -261,6 +270,69 @@ fn socket_idle_timeout() -> Duration {
         .filter(|s| *s > 0.0)
         .unwrap_or(300.0);
     Duration::from_secs_f64(secs)
+}
+
+fn confirmation_ttl_ms() -> u128 {
+    std::env::var("BRIDGE_CONFIRMATION_TTL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u128>().ok())
+        .unwrap_or(60_000)
+}
+
+fn confirmation_fingerprint(client: &str, action: &str, payload: &Value, targets: &[String]) -> String {
+    let data = json!({
+        "client": client,
+        "action": action,
+        "payload": payload,
+        "targets": targets,
+    });
+    let encoded = serde_json::to_vec(&data).unwrap_or_default();
+    let digest = Sha256::digest(&encoded);
+    format!("{:x}", digest)
+}
+
+fn prune_confirmations_locked(map: &mut HashMap<String, Confirmation>, now: u128) {
+    map.retain(|_, entry| entry.expires_at > now);
+}
+
+fn issue_confirmation(
+    confirmations: &Confirmations,
+    client: &str,
+    action: &str,
+    payload: &Value,
+    targets: &[String],
+) -> (String, u128) {
+    let expires_at = now_ms() + confirmation_ttl_ms();
+    let token = uuid::Uuid::new_v4().to_string();
+    let fingerprint = confirmation_fingerprint(client, action, payload, targets);
+    if let Ok(mut map) = confirmations.lock() {
+        prune_confirmations_locked(&mut map, now_ms());
+        map.insert(token.clone(), Confirmation { fingerprint, expires_at });
+    }
+    (token, expires_at)
+}
+
+fn consume_confirmation(
+    confirmations: &Confirmations,
+    token: Option<&str>,
+    client: &str,
+    action: &str,
+    payload: &Value,
+    targets: &[String],
+) -> bool {
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => return false,
+    };
+    let fingerprint = confirmation_fingerprint(client, action, payload, targets);
+    if let Ok(mut map) = confirmations.lock() {
+        prune_confirmations_locked(&mut map, now_ms());
+        if map.get(token).map(|entry| entry.fingerprint.as_str()) == Some(fingerprint.as_str()) {
+            map.remove(token);
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve the live lease owner, clearing the lease in place if its TTL expired.
@@ -402,6 +474,8 @@ fn origin_exempt_action(action: &str) -> bool {
     )
 }
 
+const TARGET_REQUIRED_ACTIONS: [&str; 3] = ["navigate", "downloadUrl", "getCookies"];
+
 /// Actions reserved for host-internal use (tab-origin lookup). A socket client
 /// may never invoke these; they are rejected as unknown.
 fn reserved_action(action: &str) -> bool {
@@ -424,14 +498,22 @@ fn audit_log_path(host_dir: &Path) -> PathBuf {
     }
 }
 
-/// Built-in permissive default; the policy file's default/clients overlay it.
+/// Built-in fail-closed default. A policy file must explicitly opt into browser
+/// automation beyond host-side liveness/policy/lease operations.
 fn default_policy() -> Value {
     json!({
         "default": {
-            "allowedActions": ["*"],
+            "allowedActions": ["ping", "policyCheck", "lease", "release", "leaseStatus"],
             "deniedActions": [],
-            "allowedOrigins": ["*"],
-            "deniedOrigins": [],
+            "allowedOrigins": [],
+            "deniedOrigins": [
+                "file://*", "chrome://*", "chrome-extension://*",
+                "*://localhost", "*://localhost:*",
+                "*://127.0.0.1", "*://127.0.0.1:*",
+                "*://0.0.0.0", "*://0.0.0.0:*",
+                "*://*.local", "*://*.local:*",
+                "*://[[]::1[]]", "*://[[]::1[]]:*"
+            ],
             "requireConfirmation": [],
             "redactPatterns": [],
             "redact": true,
@@ -440,9 +522,6 @@ fn default_policy() -> Value {
         "clients": {}
     })
 }
-
-/// Read and parse the policy file. Missing/malformed file falls back to the
-/// permissive default and logs one error, preserving current behavior.
 fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
     let path = policy_file_path(host_dir);
     match std::fs::read_to_string(&path) {
@@ -457,7 +536,10 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
                 default_policy()
             }
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => default_policy(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
+            default_policy()
+        },
         Err(e) => {
             log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
             default_policy()
@@ -569,9 +651,14 @@ fn normalize_url_targets(raw_url: &str) -> Vec<String> {
     if scheme.is_empty() || host.is_empty() {
         return Vec::new();
     }
+    let host_part = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host
+    };
     let netloc = match explicit_port(raw_url) {
-        Some(p) => format!("{}:{}", host, p),
-        None => host,
+        Some(p) => format!("{}:{}", host_part, p),
+        None => host_part,
     };
     vec![format!("{}://{}", scheme, netloc), format!("*://{}", netloc)]
 }
@@ -588,15 +675,30 @@ fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
             .and_then(|u| u.as_str())
             .map(normalize_url_targets)
             .unwrap_or_default(),
-        "getCookies" => {
-            match payload.get("domain").and_then(|d| d.as_str()) {
-                Some(d) if !d.is_empty() => {
-                    let d = d.strip_prefix('.').unwrap_or(d);
-                    vec![format!("*://{}", d.to_lowercase())]
+        "getCookies" => match payload.get("domain").and_then(|d| d.as_str()) {
+            Some(d) => {
+                let mut domain = d.trim().to_string();
+                while domain.starts_with('.') {
+                    domain = domain[1..].trim().to_string();
                 }
-                _ => Vec::new(),
+                domain = domain.to_lowercase();
+                if domain.is_empty()
+                    || domain.chars().any(|ch| ch.is_whitespace())
+                    || domain.chars().any(|ch| matches!(ch, '/' | '\\' | ':'))
+                {
+                    return Vec::new();
+                }
+                let parsed = match url::Url::parse(&format!("https://{}", domain)) {
+                    Ok(u) => u,
+                    Err(_) => return Vec::new(),
+                };
+                if parsed.host_str().map(|h| h.to_lowercase()) != Some(domain.clone()) {
+                    return Vec::new();
+                }
+                vec![format!("*://{}", domain)]
             }
-        }
+            _ => Vec::new(),
+        },
         "batch" => {
             let mut targets = Vec::new();
             if let Some(Value::Array(steps)) = payload.get("steps") {
@@ -752,6 +854,10 @@ fn evaluate_policy(
     if reserved_action(action) {
         return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
     }
+    if TARGET_REQUIRED_ACTIONS.contains(&action) && targets.is_empty() {
+        return (false, Some("target unresolved".to_string()), false, redact_enabled, audit_enabled, targets);
+    }
+
 
     if action_matches(cp.get("deniedActions"), action) {
         return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
@@ -1055,6 +1161,7 @@ fn handle_socket_client(
     tokens: &Tokens,
     pending: &Pending,
     lease: &LeaseState,
+    confirmations: &Confirmations,
     policy: &Policy,
     stdout: &Arc<Mutex<io::Stdout>>,
     logger: &Arc<Logger>,
@@ -1112,10 +1219,14 @@ fn handle_socket_client(
             }
         };
 
-        // Never forward the secret to the extension.
-        if let Value::Object(map) = &mut cmd {
+        // Never forward secrets or host-only confirmation fields to the extension.
+        let confirmation_token = if let Value::Object(map) = &mut cmd {
             map.remove("token");
-        }
+            map.remove("confirmationToken")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        } else {
+            None
+        };
 
         let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
         let payload = cmd.get("payload").cloned();
@@ -1247,12 +1358,36 @@ fn handle_socket_client(
         };
 
         if confirm {
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_required", None, None);
-            let _ = write_line(&mut stream, &json!({
-                "success": false, "error": "confirmation required",
-                "confirmationRequired": true, "action": action
-            }));
-            continue;
+            let confirm_payload = payload.clone().unwrap_or_else(|| json!({}));
+            if consume_confirmation(
+                confirmations,
+                confirmation_token.as_deref(),
+                &client_name,
+                &action,
+                &confirm_payload,
+                &targets,
+            ) {
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_accepted", None, None);
+            } else {
+                let (token, expires_at) = issue_confirmation(
+                    confirmations,
+                    &client_name,
+                    &action,
+                    &confirm_payload,
+                    &targets,
+                );
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_required", None, None);
+                let _ = write_line(&mut stream, &json!({
+                    "success": false,
+                    "error": "confirmation required",
+                    "confirmationRequired": true,
+                    "action": action,
+                    "targets": targets,
+                    "confirmationToken": token,
+                    "expiresAt": expires_at
+                }));
+                continue;
+            }
         }
 
         // A live lease held by another client blocks every other action.
@@ -1310,6 +1445,7 @@ fn socket_server_loop(
     tokens: Tokens,
     pending: Pending,
     lease: LeaseState,
+    confirmations: Confirmations,
     policy: Policy,
     stdout: Arc<Mutex<io::Stdout>>,
     logger: Arc<Logger>,
@@ -1362,11 +1498,12 @@ fn socket_server_loop(
                 let tokens = Arc::clone(&tokens);
                 let pending = Arc::clone(&pending);
                 let lease = Arc::clone(&lease);
+                let confirmations = Arc::clone(&confirmations);
                 let policy = Arc::clone(&policy);
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &policy, &stdout, &logger);
+                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &confirmations, &policy, &stdout, &logger);
                 });
             }
             Err(e) => {
@@ -1394,6 +1531,7 @@ fn main() {
         owner: None,
         expires_at: None,
     }));
+    let confirmations: Confirmations = Arc::new(Mutex::new(HashMap::new()));
     let policy: Policy = Arc::new(RwLock::new(build_policy_registry(&host_dir, &logger)));
 
     {
@@ -1401,11 +1539,12 @@ fn main() {
         let tokens = Arc::clone(&tokens);
         let pending = Arc::clone(&pending);
         let lease = Arc::clone(&lease);
+        let confirmations = Arc::clone(&confirmations);
         let policy = Arc::clone(&policy);
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(host_dir, tokens, pending, lease, policy, stdout, logger);
+            socket_server_loop(host_dir, tokens, pending, lease, confirmations, policy, stdout, logger);
         });
     }
 

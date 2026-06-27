@@ -115,10 +115,11 @@ _spec.loader.exec_module(test_client)
 
 captured = {}
 
-def _fake_send_command_data(action, payload=None, read_timeout_ms=None):
+def _fake_send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
     captured["action"] = action
     captured["payload"] = payload
     captured["read_timeout_ms"] = read_timeout_ms
+    captured["confirmation_token"] = confirmation_token
     # Mimic a successful response so send_command returns exit code 0.
     return 0, {"success": True}, ""
 

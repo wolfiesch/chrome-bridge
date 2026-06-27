@@ -58,7 +58,7 @@ COMPARISON_METADATA = {
             "name": "Chrome DevTools MCP",
             "strengths": "Standardized MCP surface for controlling Chrome DevTools from agents.",
             "limits": "Depends on a separate MCP server and lacks the native-host file/profile conveniences of this bridge.",
-            "capability_status": "pass",
+            "capability_status": "measured-adapter",
             "scores": {"speed": 3, "capability": 4, "authReuse": 4, "ergonomics": 3},
         },
     },
@@ -115,6 +115,8 @@ OPERATIONS = [
     "extract-text",
     "get-html",
     "observe-state",
+    "shadow-dom-click",
+    "iframe-fill",
     "console-monitoring",
     "network-monitoring",
     "dialog-handling",
@@ -143,7 +145,15 @@ FIXTURE_PAGE = b"""<!doctype html>
   <button id="fetch">Fetch</button>
   <button id="alert">Alert</button>
   <div id="status">ready</div>
+  <div id="shadow-host"></div>
+  <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
   <script>
+    window.__shadowClicks = 0;
+    window.__frameValue = '';
+    const shadowRoot = document.getElementById('shadow-host').attachShadow({mode: 'open'});
+    shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
+    shadowRoot.getElementById('shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
+    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; });
     document.getElementById('btn').addEventListener('click', () => {
       document.getElementById('status').textContent = 'clicked:' + document.getElementById('q').value;
     });
@@ -466,6 +476,8 @@ def run_chrome_bridge_op(op_name, context, base_url):
                 os.unlink(temp_path)
     elif op_name == "observe-state":
         res = run_bridge_cmd("getCurrentState", tab_id)
+    elif op_name in {"shadow-dom-click", "iframe-fill"}:
+        raise UnsupportedAdapter("Chrome Bridge does not yet expose shadow DOM or iframe user-action locators")
     elif op_name == "console-monitoring":
         res = run_bridge_cmd("batch", json.dumps([
             {"action": "startMonitoring"},
@@ -528,6 +540,8 @@ def run_chrome_bridge_iteration(results, base_url):
             try:
                 capability, duration = run_chrome_bridge_op(op, context, base_url)
                 record_op(results, op, capability, duration)
+            except UnsupportedAdapter as exc:
+                record_op(results, op, "unsupported", 0.0, exc)
             except Exception as exc:
                 record_op(results, op, "fail", 0.0, exc)
     finally:
@@ -578,6 +592,14 @@ def run_playwright_iteration(results, state, base_url):
                     page.content()
                 elif op == "observe-state":
                     page.locator("body").inner_text()
+                elif op == "shadow-dom-click":
+                    page.locator("#shadow-btn").click()
+                    clicks = page.evaluate("window.__shadowClicks")
+                    if clicks < 1:
+                        raise RuntimeError("shadow click did not register")
+                elif op == "iframe-fill":
+                    page.frame_locator("#frame").locator("#frame-input").fill("framed")
+                    page.wait_for_function("window.__frameValue === 'framed'")
                 elif op == "console-monitoring":
                     page.click("#log")
                     page.wait_for_timeout(50)
@@ -703,6 +725,8 @@ try {
         else if (op === 'extract-text') await page.$eval('body', el => el.innerText);
         else if (op === 'get-html') await page.content();
         else if (op === 'observe-state') await page.$eval('body', el => el.innerText);
+        else if (op === 'shadow-dom-click') { const clicked = await page.$eval('#shadow-host', host => { const btn = host.shadowRoot && host.shadowRoot.querySelector('#shadow-btn'); if (!btn) throw new Error('shadow button missing'); btn.click(); return window.__shadowClicks; }); if (clicked < 1) throw new Error('shadow click did not register'); }
+        else if (op === 'iframe-fill') { const frameHandle = await page.$('#frame'); const frame = await frameHandle.contentFrame(); await frame.$eval('#frame-input', (el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles: true})); }, 'framed'); await page.waitForFunction(() => window.__frameValue === 'framed'); }
         else if (op === 'console-monitoring') { await page.click('#log'); await new Promise(r => setTimeout(r, 50)); if (!consoleMessages.length) throw new Error('no console messages captured'); }
         else if (op === 'network-monitoring') { const before = requests.length; await page.click('#fetch'); await new Promise(r => setTimeout(r, 50)); if (requests.length <= before) throw new Error('no network requests captured'); }
         else if (op === 'dialog-handling') { page.once('dialog', dialog => dialog.accept()); await page.click('#alert'); }
@@ -882,6 +906,18 @@ async def _run_chrome_devtools_mcp_op(session, context, op_name, base_url):
         await _cdt_mcp_call(session, "evaluate_script", {"function": "() => document.documentElement.outerHTML"})
     elif op_name == "observe-state":
         await _cdt_mcp_call(session, "take_snapshot")
+    elif op_name == "shadow-dom-click":
+        uid = await _cdt_mcp_uid(session, "Shadow click")
+        await _cdt_mcp_call(session, "click", {"uid": uid})
+        result = await _cdt_mcp_call(session, "evaluate_script", {"function": "() => window.__shadowClicks"})
+        if "1" not in _cdt_mcp_text(result):
+            raise UnsupportedAdapter("shadow click UID did not update page state")
+    elif op_name == "iframe-fill":
+        uid = await _cdt_mcp_uid(session, "Frame input")
+        await _cdt_mcp_call(session, "fill", {"uid": uid, "value": "framed"})
+        result = await _cdt_mcp_call(session, "evaluate_script", {"function": "() => window.__frameValue"})
+        if "framed" not in _cdt_mcp_text(result):
+            raise UnsupportedAdapter("iframe fill UID did not update page state")
     elif op_name == "console-monitoring":
         await _cdt_mcp_call(
             session,
@@ -1040,38 +1076,98 @@ def handle_run(args):
             server.server_close()
 
 
+def _load_compare_inputs(paths):
+    by_adapter = {}
+    for raw in paths:
+        input_path = Path(raw)
+        if not input_path.is_file():
+            print(f"Error: input file {raw} does not exist", file=sys.stderr)
+            sys.exit(1)
+        data = json.loads(input_path.read_text(encoding="utf-8"))
+        adapter = data.get("adapter", "unknown")
+        if adapter in by_adapter:
+            print(f"Error: duplicate benchmark adapter {adapter}", file=sys.stderr)
+            sys.exit(1)
+        by_adapter[adapter] = data
+    return by_adapter
+
+
+def _scorecard_for_inputs(inputs):
+    measured_keys = {"chrome-native-bridge" if adapter == "chrome-bridge" else adapter: data
+                     for adapter, data in inputs.items()}
+    scorecard = {}
+    for key, tool in COMPARISON_METADATA["tools"].items():
+        scores = dict(tool.get("scores", {}))
+        data = measured_keys.get(key)
+        if data is not None:
+            operations = data.get("operations", [])
+            scores["speed"] = score_from_median(operations)
+            scores["capability"] = round(
+                5 * sum(1 for op in operations if op.get("capability") == "pass") / max(1, len(operations)), 1
+            )
+            source = "measured"
+        else:
+            source = "metadata"
+        overall = round((scores["speed"] + scores["capability"] + scores["authReuse"] + scores["ergonomics"]) / 4, 1)
+        scorecard[key] = {**scores, "overall": overall, "source": source}
+    for adapter, data in inputs.items():
+        key = "chrome-native-bridge" if adapter == "chrome-bridge" else adapter
+        if key in scorecard:
+            continue
+        operations = data.get("operations", [])
+        capability = round(5 * sum(1 for op in operations if op.get("capability") == "pass") / max(1, len(operations)), 1)
+        speed = score_from_median(operations)
+        scorecard[key] = {"speed": speed, "capability": capability, "authReuse": "", "ergonomics": "", "overall": "", "source": "measured"}
+    return scorecard
+
+
 def handle_compare(args):
-    input_path = Path(args.input)
-    if not input_path.is_file():
-        print(f"Error: input file {args.input} does not exist", file=sys.stderr)
-        sys.exit(1)
-    data = json.loads(input_path.read_text(encoding="utf-8"))
-    adapter = data.get("adapter", "unknown")
-    iterations = data.get("iterations", 0)
-    operations = data.get("operations", [])
-    comparison = data.get("comparison", {})
-    tools = comparison.get("tools", {})
+    inputs = _load_compare_inputs(args.input)
+    first = next(iter(inputs.values()))
+    comparison = first.get("comparison", {})
+    tools = dict(comparison.get("tools", {}))
     gaps = comparison.get("gaps", [])
-    scorecard = data.get("scorecard") or build_scorecard(adapter, operations)
+    scorecard = _scorecard_for_inputs(inputs)
+
+    for adapter in inputs:
+        key = "chrome-native-bridge" if adapter == "chrome-bridge" else adapter
+        tools.setdefault(key, {"name": adapter, "strengths": "Measured adapter supplied by input JSON.", "limits": "No static metadata available.", "capability_status": "measured-adapter"})
+
+    adapters = list(inputs.keys())
+    op_names = []
+    for data in inputs.values():
+        for op in data.get("operations", []):
+            name = op.get("name", "")
+            if name and name not in op_names:
+                op_names.append(name)
 
     lines = [
         "# Browser Automation Benchmark Report",
         "",
-        "This report contains measured timings for the selected adapter run and static capability metadata for the other browser automation surfaces.",
+        "This report separates measured benchmark rows from static capability metadata.",
         "",
         "## Run Configuration",
-        f"- **Measured adapter:** `{adapter}`",
-        f"- **Iterations:** {iterations}",
+        f"- **Measured adapters:** {', '.join(f'`{a}`' for a in adapters)}",
+        "",
+        "## Claim Discipline",
+        "Only rows marked measured support speed or capability claims. Metadata rows describe expected strengths and limits but are not benchmark evidence.",
         "",
         "## Operation Timings",
-        "Timings below come only from the selected adapter run.",
         "",
-        "| Operation | Status | Durations (ms) | Median Time (ms) |",
-        "| --- | --- | --- | --- |",
     ]
-    for op in operations:
-        durations = ", ".join(f"{d:.2f}" for d in op.get("durationsMs", []))
-        lines.append(f"| {op.get('name', '')} | {op.get('capability', '')} | {durations} | {op.get('medianMs', 0.0):.2f} |")
+    header = ["Operation"]
+    for adapter in adapters:
+        header.extend([f"{adapter} status", f"{adapter} median ms"])
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---"] + ["---", "---:"] * len(adapters)) + " |")
+    op_maps = {adapter: {op.get("name"): op for op in data.get("operations", [])} for adapter, data in inputs.items()}
+    for op_name in op_names:
+        row = [op_name]
+        for adapter in adapters:
+            op = op_maps[adapter].get(op_name, {})
+            row.extend([op.get("capability", ""), f"{op.get('medianMs', 0.0):.2f}" if op else ""])
+        lines.append("| " + " | ".join(row) + " |")
+
     lines.extend(["", "## Normalized Scorecard", "Scores are 1-5. Source marks measured rows versus static metadata rows.", ""])
     lines.append("| Tool | Speed | Capability | Auth Reuse | Ergonomics | Overall | Source |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
@@ -1081,6 +1177,10 @@ def handle_compare(args):
             f"| **{tool_info.get('name', tool_key)}** | {scores.get('speed', '')} | {scores.get('capability', '')} | "
             f"{scores.get('authReuse', '')} | {scores.get('ergonomics', '')} | {scores.get('overall', '')} | {scores.get('source', 'metadata')} |"
         )
+    for key, scores in scorecard.items():
+        if key not in tools:
+            lines.append(f"| **{key}** | {scores.get('speed', '')} | {scores.get('capability', '')} |  |  |  | measured |")
+
     lines.extend(["", "## Tool Capability Comparison Matrix", "", "| Tool | Strengths | Limits | Status |", "| --- | --- | --- | --- |"])
     for tool_key, tool_info in tools.items():
         lines.append(
@@ -1091,10 +1191,11 @@ def handle_compare(args):
     for gap_item in gaps:
         lines.append(f"- **{gap_item.get('gap', '').capitalize()}**: {gap_item.get('description', '')}")
     lines.extend(["", "## Gap Tickets", ""])
+    primary_adapter = adapters[0] if adapters else "unknown"
     for idx, gap_item in enumerate(gaps, start=1):
         title = gap_item.get("gap", "gap").capitalize()
         lines.append(f"### BENCH-{idx:03d}: {title}")
-        lines.append(f"- Benchmark signal: `{adapter}` report currently tracks this as a gap against stronger surfaces.")
+        lines.append(f"- Benchmark signal: `{primary_adapter}` report currently tracks this as a gap against stronger surfaces.")
         lines.append(f"- Acceptance target: {gap_item.get('acceptance', 'Measured pass in benchmark harness.')}")
         lines.append(f"- Likely surface: {gap_item.get('surface', 'benchmark_harness.py')}")
         lines.append("")
@@ -1118,7 +1219,7 @@ def main():
     run_parser.add_argument("--output", required=True, help="Path to write JSON results")
     run_parser.add_argument("--base-url", help="Base URL of target page for live benchmarking")
     compare_parser = subparsers.add_parser("compare", help="Compare benchmark results and generate report")
-    compare_parser.add_argument("--input", required=True, help="Path to JSON results file")
+    compare_parser.add_argument("--input", action="append", required=True, help="Path to JSON results file; may be provided multiple times")
     compare_parser.add_argument("--output", required=True, help="Path to write markdown report")
     args = parser.parse_args()
     if args.command == "run":

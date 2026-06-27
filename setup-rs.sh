@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Generate per-user secrets and register the RUST native-messaging host.
-# Safe to re-run: never overwrites an existing token.
+# Generate per-user secrets, deploy a deterministic local extension, and
+# register the Rust native-messaging host. Safe to re-run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOKEN_FILE="$SCRIPT_DIR/bridge_token.txt"
+POLICY_FILE="$SCRIPT_DIR/bridge_policy.json"
 HOST_MANIFEST="$SCRIPT_DIR/com.automation.bridge.rust.json"
 TEMPLATE="$SCRIPT_DIR/com.automation.bridge.json.template"
 RUST_BIN="$SCRIPT_DIR/host-rs/target/release/bridge-host"
+KEY_FILE="$SCRIPT_DIR/extension_key.pem"
+EXTENSION_ID=""
+
 if command -v cargo >/dev/null 2>&1; then
   TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
     --manifest-path "$SCRIPT_DIR/host-rs/Cargo.toml" 2>/dev/null \
@@ -17,7 +21,21 @@ if command -v cargo >/dev/null 2>&1; then
   fi
 fi
 
-# 1. Generate a fresh 0600 shared token if absent.
+case "$(uname -s)" in
+  Darwin) EXT_DIR="$HOME/Library/Application Support/chrome-native-bridge/extension" ;;
+  Linux) EXT_DIR="$HOME/.local/share/chrome-native-bridge/extension" ;;
+  *) EXT_DIR="$SCRIPT_DIR/extension" ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ext) EXT_DIR="${2:-}"; shift 2 ;;
+    --extension-id) EXTENSION_ID="${2:-}"; shift 2 ;;
+    --key-file) KEY_FILE="${2:-}"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; echo "Usage: ./setup-rs.sh [--ext <extension-dir>] [--extension-id <id>] [--key-file <path>]" >&2; exit 1 ;;
+  esac
+done
+
 if [[ ! -f "$TOKEN_FILE" ]]; then
   python3 -c "import secrets; print(secrets.token_hex(32))" > "$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
@@ -26,23 +44,26 @@ else
   echo "Existing bridge token kept at $TOKEN_FILE"
 fi
 
-# 2. Resolve the extension ID.
-EXTENSION_ID="${1:-}"
-if [[ -z "$EXTENSION_ID" ]]; then
-  echo "Usage: ./setup-rs.sh <unpacked-extension-id>"
-  echo "Load ./extension in chrome://extensions (Developer mode) to get the ID, then re-run."
-  exit 1
+if [[ ! -f "$POLICY_FILE" ]]; then
+  cp "$SCRIPT_DIR/bridge_policy.example.json" "$POLICY_FILE"
+  chmod 600 "$POLICY_FILE"
+  echo "Installed default bridge policy at $POLICY_FILE"
+else
+  echo "Existing bridge_policy.json kept"
 fi
 
-# 3. Require the compiled Rust binary before registering.
+if [[ -z "$EXTENSION_ID" ]]; then
+  "$SCRIPT_DIR/deploy.sh" --ext "$EXT_DIR" --with-local-key --key-file "$KEY_FILE"
+  EXTENSION_ID="$(python3 "$SCRIPT_DIR/extension_identity.py" id --key "$KEY_FILE")"
+else
+  echo "Using provided extension ID: $EXTENSION_ID"
+fi
+
 if [[ ! -x "$RUST_BIN" ]]; then
   echo "Build the Rust host first: cargo build --release --manifest-path host-rs/Cargo.toml"
   exit 1
 fi
 
-# 4. Generate a launcher that pins the repo-root token paths, since native-host
-#    manifests cannot pass env and the binary otherwise resolves paths relative
-#    to its own (cargo target) directory.
 LAUNCHER="$SCRIPT_DIR/bridge-host-launch.sh"
 cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
@@ -56,13 +77,16 @@ EOF
 chmod +x "$LAUNCHER"
 echo "Wrote launcher $LAUNCHER"
 
-# 5. Render the host manifest from the template (registers the launcher).
-sed -e "s#__BRIDGE_PY_PATH__#$LAUNCHER#g" \
-    -e "s#__EXTENSION_ID__#$EXTENSION_ID#g" \
-    "$TEMPLATE" > "$HOST_MANIFEST"
+python3 - "$TEMPLATE" "$HOST_MANIFEST" "$LAUNCHER" "$EXTENSION_ID" <<'PY'
+import sys
+from pathlib import Path
+template, out, bridge, ext_id = sys.argv[1:]
+text = Path(template).read_text(encoding="utf-8")
+text = text.replace("__BRIDGE_PY_PATH__", bridge).replace("__EXTENSION_ID__", ext_id)
+Path(out).write_text(text, encoding="utf-8")
+PY
 echo "Wrote host manifest $HOST_MANIFEST"
 
-# 6. Register the host for every installed Chrome/Chromium variant on this OS.
 case "$(uname -s)" in
   Darwin)
     BASE="$HOME/Library/Application Support"
@@ -80,12 +104,13 @@ case "$(uname -s)" in
     ) ;;
   *)
     echo "Unsupported OS for auto-registration; copy $HOST_MANIFEST into your browser's NativeMessagingHosts directory manually."
+    echo "Load unpacked: $EXT_DIR"
+    echo "Then run: python3 test_client.py ping"
     exit 0 ;;
 esac
 
 REGISTERED=0
 for HOST_DIR in "${HOST_DIRS[@]}"; do
-  # Register where the browser profile root already exists, plus the default Chrome dir.
   if [[ -d "$(dirname "$HOST_DIR")" || "$HOST_DIR" == *"/Google/Chrome/"* || "$HOST_DIR" == *"/google-chrome/"* ]]; then
     mkdir -p "$HOST_DIR"
     ln -sf "$HOST_MANIFEST" "$HOST_DIR/com.automation.bridge.json"
@@ -93,5 +118,7 @@ for HOST_DIR in "${HOST_DIRS[@]}"; do
     REGISTERED=$((REGISTERED + 1))
   fi
 done
+
 echo "Registered with $REGISTERED browser variant(s)."
-echo "Done. Run: python3 test_client.py ping"
+echo "Load unpacked: $EXT_DIR"
+echo "Then run: python3 test_client.py ping"
