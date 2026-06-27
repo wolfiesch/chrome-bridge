@@ -175,10 +175,12 @@ def collect_codex(sessions_dir, server_re, since=None):
 
 # --- Bridge audit log --------------------------------------------------------
 # bridge_audit.jsonl is already source-specific (every row is a bridge action),
-# so --server-match is NOT applied here. Forwarded actions emit two rows sharing
-# a requestId (allow + extension_success); we collapse those to one logical
-# call. Lease-family / pre-forward decisions have a null requestId and each such
-# row is counted as its own event (never collapsed together).
+# so --server-match is NOT applied here. A forwarded action emits two rows
+# sharing a requestId: "allow" first, then a terminal "extension_success" or
+# "extension_error". We group rows by requestId and count one logical call per
+# request, deciding allowed/denied from the *terminal* decision so a
+# forwarded-then-failed request is correctly treated as denied. Lease-family /
+# pre-forward decisions carry a null requestId; each such row is its own event.
 
 _BRIDGE_DENY_DECISIONS = ("deny", "lease_deny", "extension_error", "confirmation_required")
 
@@ -186,13 +188,17 @@ _BRIDGE_DENY_DECISIONS = ("deny", "lease_deny", "extension_error", "confirmation
 def collect_bridge(audit_path, since=None, include_denied=True):
     counts = collections.Counter()
     report = _new_source_report()
-    seen_requests = set()
 
     path = Path(audit_path).expanduser()
     try:
         handle = open(path, "rb")
     except OSError:
         return _finalize_source(report, counts)
+
+    # Each entry: a list of (decision, timestamp) rows for one logical call.
+    # Real requestIds aggregate their rows; null-id rows each get a unique key.
+    grouped = collections.OrderedDict()
+    null_seq = 0
 
     with handle:
         for raw_line in handle:
@@ -206,24 +212,33 @@ def collect_bridge(audit_path, since=None, include_denied=True):
             action = record.get("action")
             if not isinstance(action, str):
                 continue
-            decision = record.get("decision")
-            if not include_denied and decision in _BRIDGE_DENY_DECISIONS:
-                continue
 
             timestamp = _bridge_ts_to_iso(record.get("ts"))
-            if not timestamp_in_range(timestamp, since):
-                continue
-
-            # Only collapse on a real requestId; null-id rows (lease/deny) each
-            # count individually rather than collapsing into one.
+            decision = record.get("decision")
             request_id = record.get("requestId")
             if isinstance(request_id, str):
-                if request_id in seen_requests:
-                    continue
-                seen_requests.add(request_id)
+                key = ("req", request_id)
+            else:
+                key = ("row", null_seq)
+                null_seq += 1
 
-            counts[action] += 1
-            _track_ts(report, timestamp)
+            entry = grouped.get(key)
+            if entry is None:
+                entry = {"action": action, "decisions": [], "timestamp": timestamp}
+                grouped[key] = entry
+            entry["decisions"].append(decision)
+            # Prefer the latest non-null timestamp for the call.
+            if timestamp is not None:
+                entry["timestamp"] = timestamp
+
+    for entry in grouped.values():
+        if not timestamp_in_range(entry["timestamp"], since):
+            continue
+        denied = any(d in _BRIDGE_DENY_DECISIONS for d in entry["decisions"])
+        if denied and not include_denied:
+            continue
+        counts[entry["action"]] += 1
+        _track_ts(report, entry["timestamp"])
 
     if counts:
         report["sessions"].add(str(path))
