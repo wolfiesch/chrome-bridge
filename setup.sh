@@ -4,11 +4,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR=""
+PRINT_JSON=0
+KEY_FILE_PROVIDED=0
 TOKEN_FILE="$SCRIPT_DIR/bridge_token.txt"
+TOKENS_FILE="$SCRIPT_DIR/bridge_tokens.txt"
 POLICY_FILE="$SCRIPT_DIR/bridge_policy.json"
 HOST_MANIFEST="$SCRIPT_DIR/com.automation.bridge.json"
 TEMPLATE="$SCRIPT_DIR/com.automation.bridge.json.template"
 KEY_FILE="$SCRIPT_DIR/extension_key.pem"
+LAUNCHER="$SCRIPT_DIR/bridge.py"
 EXTENSION_ID=""
 
 case "$(uname -s)" in
@@ -17,14 +22,42 @@ case "$(uname -s)" in
   *) EXT_DIR="$SCRIPT_DIR/extension" ;;
 esac
 
+usage() {
+  echo "Usage: ./setup.sh [--ext <extension-dir>] [--extension-id <id>] [--key-file <path>] [--state-dir <path>] [--print-json]" >&2
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ext) EXT_DIR="${2:-}"; shift 2 ;;
-    --extension-id) EXTENSION_ID="${2:-}"; shift 2 ;;
-    --key-file) KEY_FILE="${2:-}"; shift 2 ;;
-    *) echo "Unknown arg: $1" >&2; echo "Usage: ./setup.sh [--ext <extension-dir>] [--extension-id <id>] [--key-file <path>]" >&2; exit 1 ;;
+    --ext)
+      if [[ $# -lt 2 ]]; then echo "ERROR: --ext requires a path" >&2; exit 2; fi
+      EXT_DIR="$2"; shift 2 ;;
+    --extension-id)
+      if [[ $# -lt 2 ]]; then echo "ERROR: --extension-id requires an id" >&2; exit 2; fi
+      EXTENSION_ID="$2"; shift 2 ;;
+    --key-file)
+      if [[ $# -lt 2 ]]; then echo "ERROR: --key-file requires a path" >&2; exit 2; fi
+      KEY_FILE="$2"; KEY_FILE_PROVIDED=1; shift 2 ;;
+    --state-dir)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then echo "ERROR: --state-dir requires a path" >&2; exit 2; fi
+      STATE_DIR="$2"; shift 2 ;;
+    --print-json)
+      PRINT_JSON=1; shift ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+if [[ -n "$STATE_DIR" ]]; then
+  mkdir -p "$STATE_DIR"
+  STATE_DIR="$(cd "$STATE_DIR" && pwd)"
+  TOKEN_FILE="$STATE_DIR/bridge_token.txt"
+  TOKENS_FILE="$STATE_DIR/bridge_tokens.txt"
+  POLICY_FILE="$STATE_DIR/bridge_policy.json"
+  HOST_MANIFEST="$STATE_DIR/com.automation.bridge.json"
+  LAUNCHER="$STATE_DIR/bridge-host-python-launch.sh"
+  if [[ "$KEY_FILE_PROVIDED" -eq 0 ]]; then
+    KEY_FILE="$STATE_DIR/extension_key.pem"
+  fi
+fi
 
 if [[ ! -f "$TOKEN_FILE" ]]; then
   python3 -c "import secrets; print(secrets.token_hex(32))" > "$TOKEN_FILE"
@@ -34,12 +67,20 @@ else
   echo "Existing bridge token kept at $TOKEN_FILE"
 fi
 
+if [[ ! -f "$TOKENS_FILE" ]]; then
+  : > "$TOKENS_FILE"
+  chmod 600 "$TOKENS_FILE"
+  echo "Created empty bridge tokens registry at $TOKENS_FILE"
+else
+  echo "Existing bridge_tokens.txt kept at $TOKENS_FILE"
+fi
+
 if [[ ! -f "$POLICY_FILE" ]]; then
   cp "$SCRIPT_DIR/bridge_policy.example.json" "$POLICY_FILE"
   chmod 600 "$POLICY_FILE"
   echo "Installed default bridge policy at $POLICY_FILE"
 else
-  echo "Existing bridge_policy.json kept"
+  echo "Existing bridge_policy.json kept at $POLICY_FILE"
 fi
 
 if [[ -z "$EXTENSION_ID" ]]; then
@@ -49,7 +90,24 @@ else
   echo "Using provided extension ID: $EXTENSION_ID"
 fi
 
-python3 - "$TEMPLATE" "$HOST_MANIFEST" "$SCRIPT_DIR/bridge.py" "$EXTENSION_ID" <<'PY'
+if [[ -n "$STATE_DIR" ]]; then
+  cat > "$LAUNCHER" <<EOF
+#!/usr/bin/env bash
+export BRIDGE_PORT="\${BRIDGE_PORT:-9223}"
+export BRIDGE_TOKEN_FILE="$TOKEN_FILE"
+export BRIDGE_TOKENS_FILE="$TOKENS_FILE"
+export BRIDGE_POLICY_FILE="$POLICY_FILE"
+export BRIDGE_LOG_FILE="$STATE_DIR/bridge_debug.log"
+export BRIDGE_AUDIT_LOG_FILE="$STATE_DIR/bridge_audit.jsonl"
+exec "$SCRIPT_DIR/bridge.py" "\$@"
+EOF
+  chmod 0755 "$LAUNCHER"
+  echo "Wrote launcher $LAUNCHER"
+else
+  chmod +x "$SCRIPT_DIR/bridge.py"
+fi
+
+python3 - "$TEMPLATE" "$HOST_MANIFEST" "$LAUNCHER" "$EXTENSION_ID" <<'PY'
 import sys
 from pathlib import Path
 template, out, bridge, ext_id = sys.argv[1:]
@@ -69,29 +127,42 @@ case "$(uname -s)" in
       "$BASE/Chromium/NativeMessagingHosts"
     ) ;;
   Linux)
+    CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
     HOST_DIRS=(
-      "$HOME/.config/google-chrome/NativeMessagingHosts"
-      "$HOME/.config/google-chrome-beta/NativeMessagingHosts"
-      "$HOME/.config/chromium/NativeMessagingHosts"
+      "$CONFIG_HOME/google-chrome/NativeMessagingHosts"
+      "$CONFIG_HOME/google-chrome-beta/NativeMessagingHosts"
+      "$CONFIG_HOME/chromium/NativeMessagingHosts"
     ) ;;
   *)
     echo "Unsupported OS for auto-registration; copy $HOST_MANIFEST into your browser's NativeMessagingHosts directory manually."
     echo "Load unpacked: $EXT_DIR"
     echo "Then run: python3 test_client.py ping"
+    if [[ "$PRINT_JSON" -eq 1 ]]; then
+      python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" <<'PY'
+import json, sys
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher")
+print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
+PY
+    fi
     exit 0 ;;
 esac
 
-chmod +x "$SCRIPT_DIR/bridge.py"
 REGISTERED=0
 for HOST_DIR in "${HOST_DIRS[@]}"; do
-  if [[ -d "$(dirname "$HOST_DIR")" || "$HOST_DIR" == *"/Google/Chrome/"* || "$HOST_DIR" == *"/google-chrome/"* ]]; then
-    mkdir -p "$HOST_DIR"
-    ln -sf "$HOST_MANIFEST" "$HOST_DIR/com.automation.bridge.json"
-    echo "Registered native host at $HOST_DIR/com.automation.bridge.json"
-    REGISTERED=$((REGISTERED + 1))
-  fi
+  mkdir -p "$HOST_DIR"
+  ln -sf "$HOST_MANIFEST" "$HOST_DIR/com.automation.bridge.json"
+  echo "Registered native host at $HOST_DIR/com.automation.bridge.json"
+  REGISTERED=$((REGISTERED + 1))
 done
 
 echo "Registered with $REGISTERED browser variant(s)."
 echo "Load unpacked: $EXT_DIR"
 echo "Then run: python3 test_client.py ping"
+
+if [[ "$PRINT_JSON" -eq 1 ]]; then
+  python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" <<'PY'
+import json, sys
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher")
+print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
+PY
+fi

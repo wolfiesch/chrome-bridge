@@ -258,9 +258,12 @@ Manual live gates after reloading the unpacked extension (opens real Chrome tabs
 
 ```bash
 python3 test_client.py ping
+PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_agent_actions_live.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
 ```
+
+`verify_live_install_smoke.py` uses a temporary HOME/XDG_CONFIG_HOME and exits 0 with `SKIP live install smoke: Chrome/Chromium executable not found` only when no Chrome/Chromium executable is available.
 
 The default sample policy is intentionally fail-closed and denies loopback URLs. For these localhost live gates, temporarily use an explicit smoke-test policy, then restore your normal policy:
 
