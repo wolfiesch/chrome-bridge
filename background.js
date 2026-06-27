@@ -614,11 +614,223 @@ async function waitForUrl(tabId, substring, timeoutMs) {
   return { success: false, err: "Timed out waiting for URL", substring, timeoutMs };
 }
 
+function parseActionLocator(selector) {
+  const raw = String(selector ?? "");
+  if (raw.includes(">>>>") || raw.includes("<<<") || /["'][^"']*(?:>>>|>>)[^"']*["']/.test(raw)) {
+    throw new Error(`Unsupported selector token in ${raw}`);
+  }
+  const shadowParts = raw.split(/\s*>>>\s*/);
+  if (shadowParts.some((part, index) => index > 0 && !part.trim())) {
+    throw new Error(`Missing final selector in ${raw}`);
+  }
+  const frameParts = shadowParts[0].split(/\s*>>\s*/);
+  const frames = [];
+  let finalSelector = null;
+  for (let i = 0; i < frameParts.length; i++) {
+    const part = frameParts[i].trim();
+    if (!part) {
+      throw new Error(`Missing final selector in ${raw}`);
+    }
+    if (part.startsWith("frame=") && finalSelector === null) {
+      const frameSelector = part.slice("frame=".length).trim();
+      if (!frameSelector) {
+        throw new Error(`Missing frame selector in ${raw}`);
+      }
+      frames.push(frameSelector);
+      continue;
+    }
+    if (i < frameParts.length - 1) {
+      throw new Error(`Unsupported selector token in ${raw}`);
+    }
+    finalSelector = part;
+  }
+  if (!finalSelector) {
+    throw new Error(`Missing final selector in ${raw}`);
+  }
+  return {
+    frames,
+    selector: finalSelector,
+    shadowSegments: shadowParts.slice(1).map((part) => part.trim())
+  };
+}
+
+function frameTreeList(frameTree, out = []) {
+  if (!frameTree) return out;
+  out.push(frameTree);
+  for (const child of frameTree.childFrames || []) {
+    frameTreeList(child, out);
+  }
+  return out;
+}
+
+function findFrameTree(frameTree, frameId) {
+  return frameTreeList(frameTree).find((item) => item.frame?.id === frameId) || null;
+}
+
+function directChildFrames(frameTree, frameId) {
+  const item = findFrameTree(frameTree, frameId);
+  return item?.childFrames || [];
+}
+
+async function frameExecutionContext(target, frameId) {
+  const world = await debuggerCommand(target, 'Page.createIsolatedWorld', {
+    frameId,
+    worldName: 'chromeNativeBridgeActions',
+    grantUniveralAccess: true
+  });
+  return world.executionContextId;
+}
+
+async function evaluateInContext(target, expression, contextId) {
+  const params = {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    allowUnsafeEvalBlockedByCSP: true
+  };
+  if (contextId !== null && contextId !== undefined) {
+    params.contextId = contextId;
+  }
+  const result = await debuggerCommand(target, 'Runtime.evaluate', params);
+  if (result.exceptionDetails) {
+    return { success: false, err: result.exceptionDetails.text || 'Runtime.evaluate exception', details: result.exceptionDetails };
+  }
+  return { success: true, val: result.result?.value ?? result.result?.description ?? null };
+}
+
+async function describeTopFrameElement(target, rootNodeId, frameSelector) {
+  const found = await debuggerCommand(target, 'DOM.querySelector', { nodeId: rootNodeId, selector: frameSelector });
+  if (!found.nodeId) return null;
+  const described = await debuggerCommand(target, 'DOM.describeNode', { nodeId: found.nodeId, depth: 1, pierce: false });
+  return described.node || null;
+}
+
+function frameSelectorProbeExpression(frameSelector) {
+  return `(() => {
+    const selector = ${JSON.stringify(frameSelector)};
+    const el = document.querySelector(selector);
+    if (!el) return { success: false };
+    const frames = Array.from(document.querySelectorAll('iframe,frame'));
+    const frameIndex = frames.indexOf(el);
+    const rect = el.getBoundingClientRect();
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const scrolled = el.getBoundingClientRect();
+    return {
+      success: true,
+      frameIndex,
+      x: scrolled.left,
+      y: scrolled.top,
+      width: scrolled.width,
+      height: scrolled.height
+    };
+  })()`;
+}
+
+function actionTargetExpression(locator, mode) {
+  return `(() => {
+    const selector = ${JSON.stringify(locator.selector)};
+    const shadowSegments = ${JSON.stringify(locator.shadowSegments)};
+    let el = document.querySelector(selector);
+    if (!el) return { success: false, err: 'No element found for selector ' + selector };
+    for (const segment of shadowSegments) {
+      if (!el.shadowRoot) return { success: false, err: 'No open shadow root for selector segment ' + segment };
+      el = el.shadowRoot.querySelector(segment);
+      if (!el) return { success: false, err: 'No element found for selector ' + segment };
+    }
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = el.getBoundingClientRect();
+    if (${JSON.stringify(mode)} === 'focus' || ${JSON.stringify(mode)} === 'clear') {
+      el.focus();
+    }
+    if (${JSON.stringify(mode)} === 'clear') {
+      if ('value' in el) {
+        el.value = '';
+      } else {
+        el.textContent = '';
+      }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+    }
+    return {
+      success: true,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      tagName: el.tagName,
+      text: el.innerText || el.value || el.getAttribute('aria-label') || '',
+      value: 'value' in el ? el.value : el.textContent
+    };
+  })()`;
+}
+
+async function resolveActionTarget(tabId, locator, attachedTarget) {
+  const run = async (target) => {
+    const pageTree = await debuggerCommand(target, 'Page.getFrameTree', {});
+    const topFrameId = pageTree.frameTree.frame.id;
+    const doc = await debuggerCommand(target, 'DOM.getDocument', { depth: 1, pierce: false });
+    let currentFrameId = topFrameId;
+    let currentContextId = null;
+    let currentRootNodeId = doc.root.nodeId;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    for (const frameSelector of locator.frames) {
+      let describedNode = null;
+      if (currentRootNodeId !== null) {
+        describedNode = await describeTopFrameElement(target, currentRootNodeId, frameSelector);
+      }
+      const frameProbe = await evaluateInContext(target, frameSelectorProbeExpression(frameSelector), currentContextId);
+      const frameInfo = frameProbe.val || {};
+      if (!frameProbe.success || frameInfo.success === false) {
+        return { success: false, err: `No frame found for selector ${frameSelector}` };
+      }
+      let childFrameId = describedNode?.frameId || describedNode?.contentDocument?.frameId || null;
+      const children = directChildFrames(pageTree.frameTree, currentFrameId);
+      if (!childFrameId && frameInfo.frameIndex >= 0 && children[frameInfo.frameIndex]) {
+        childFrameId = children[frameInfo.frameIndex].frame.id;
+      }
+      if (!childFrameId || !children.some((child) => child.frame.id === childFrameId)) {
+        return { success: false, err: `No frame found for selector ${frameSelector}` };
+      }
+      offsetX += frameInfo.x || 0;
+      offsetY += frameInfo.y || 0;
+      currentFrameId = childFrameId;
+      currentContextId = await frameExecutionContext(target, currentFrameId);
+      currentRootNodeId = null;
+    }
+
+    const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), currentContextId);
+    const value = lookup.val || lookup;
+    if (!lookup.success || value.success === false) return value;
+    return {
+      ...value,
+      x: (value.x || 0) + offsetX,
+      y: (value.y || 0) + offsetY,
+      frameId: currentFrameId,
+      contextId: currentContextId,
+      locator
+    };
+  };
+  if (attachedTarget) return run(attachedTarget);
+  return withDebugger(tabId, run);
+}
+
+async function focusActionTarget(target, resolved, clear) {
+  const lookup = await evaluateInContext(target, actionTargetExpression(resolved.locator, clear ? 'clear' : 'focus'), resolved.contextId);
+  const value = lookup.val || lookup;
+  if (!lookup.success || value.success === false) return value;
+  return value;
+}
+
 async function waitForSelector(tabId, selector, timeoutMs) {
+  let locator;
+  try {
+    locator = parseActionLocator(selector);
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
-    const found = await withDebugger(tabId, (target) => evaluateWithDebugger(target, `Boolean(document.querySelector(${JSON.stringify(selector)}))`));
-    if (found.success && found.val === true) return { success: true, selector };
+    const found = await resolveActionTarget(tabId, locator);
+    if (found.success !== false) return { success: true, selector };
     await sleep(250);
   }
   return { success: false, err: "Timed out waiting for selector", selector, timeoutMs };
@@ -685,23 +897,13 @@ async function getHTML(tabId) {
 }
 
 async function getElementCenter(target, selector) {
-  const lookup = await evaluateWithDebugger(target, `(() => {
-    const selector = ${JSON.stringify(selector)};
-    const el = document.querySelector(selector);
-    if (!el) return { success: false, err: 'No element matched selector: ' + selector };
-    el.scrollIntoView({ block: 'center', inline: 'center' });
-    const rect = el.getBoundingClientRect();
-    return {
-      success: true,
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-      tagName: el.tagName,
-      text: el.innerText || el.value || el.getAttribute('aria-label') || '',
-      value: 'value' in el ? el.value : null
-    };
-  })()`);
-  if (!lookup.success || lookup.val?.success === false) return lookup.val || lookup;
-  return lookup.val;
+  let locator;
+  try {
+    locator = parseActionLocator(selector);
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+  return resolveActionTarget(target.tabId, locator, target);
 }
 
 async function clickSelector(tabId, selector) {
@@ -718,21 +920,14 @@ async function clickSelector(tabId, selector) {
 
 async function typeSelector(tabId, selector, text) {
   return withDebugger(tabId, async (target) => {
-    const focus = await evaluateWithDebugger(target, `(() => {
-      const selector = ${JSON.stringify(selector)};
-      const el = document.querySelector(selector);
-      if (!el) return { success: false, err: 'No element matched selector: ' + selector };
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.focus();
-      return { success: true, tagName: el.tagName };
-    })()`);
-    if (!focus.success || focus.val?.success === false) return focus.val || focus;
+    const lookup = await getElementCenter(target, selector);
+    if (lookup.success === false) return lookup;
+    const focus = await focusActionTarget(target, lookup, false);
+    if (focus.success === false) return focus;
     await debuggerCommand(target, 'Input.insertText', { text });
-    const value = await evaluateWithDebugger(target, `(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      return el ? ('value' in el ? el.value : el.textContent) : null;
-    })()`);
-    return { success: true, tagName: focus.val.tagName, value: value.val };
+    const value = await focusActionTarget(target, lookup, false);
+    if (value.success === false) return value;
+    return { success: true, tagName: focus.tagName, value: value.value };
   });
 }
 
@@ -833,27 +1028,14 @@ async function dragSelector(tabId, fromSelector, toSelector) {
 
 async function fillSelector(tabId, selector, text) {
   return withDebugger(tabId, async (target) => {
-    const focus = await evaluateWithDebugger(target, `(() => {
-      const selector = ${JSON.stringify(selector)};
-      const el = document.querySelector(selector);
-      if (!el) return { success: false, err: 'No element matched selector: ' + selector };
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.focus();
-      if ('value' in el) {
-        el.value = '';
-      } else {
-        el.textContent = '';
-      }
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
-      return { success: true, tagName: el.tagName };
-    })()`);
-    if (!focus.success || focus.val?.success === false) return focus.val || focus;
+    const lookup = await getElementCenter(target, selector);
+    if (lookup.success === false) return lookup;
+    const focus = await focusActionTarget(target, lookup, true);
+    if (focus.success === false) return focus;
     await debuggerCommand(target, 'Input.insertText', { text });
-    const value = await evaluateWithDebugger(target, `(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      return el ? ('value' in el ? el.value : el.textContent) : null;
-    })()`);
-    return { success: true, tagName: focus.val.tagName, value: value.val };
+    const value = await focusActionTarget(target, lookup, false);
+    if (value.success === false) return value;
+    return { success: true, tagName: focus.tagName, value: value.value };
   });
 }
 

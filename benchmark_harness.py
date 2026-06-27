@@ -146,14 +146,15 @@ FIXTURE_PAGE = b"""<!doctype html>
   <button id="alert">Alert</button>
   <div id="status">ready</div>
   <div id="shadow-host"></div>
-  <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
+  <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
   <script>
     window.__shadowClicks = 0;
     window.__frameValue = '';
+    window.__frameClicks = 0;
     const shadowRoot = document.getElementById('shadow-host').attachShadow({mode: 'open'});
     shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
     shadowRoot.getElementById('shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
-    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; });
+    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; });
     document.getElementById('btn').addEventListener('click', () => {
       document.getElementById('status').textContent = 'clicked:' + document.getElementById('q').value;
     });
@@ -476,8 +477,28 @@ def run_chrome_bridge_op(op_name, context, base_url):
                 os.unlink(temp_path)
     elif op_name == "observe-state":
         res = run_bridge_cmd("getCurrentState", tab_id)
-    elif op_name in {"shadow-dom-click", "iframe-fill"}:
-        raise UnsupportedAdapter("Chrome Bridge does not yet expose shadow DOM or iframe user-action locators")
+    elif op_name == "shadow-dom-click":
+        res = run_bridge_cmd("click", tab_id, "#shadow-host >>> #shadow-btn")
+        if res["exit"] != 0:
+            raise RuntimeError("shadow-dom-click failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "window.__shadowClicks >= 1")
+        if verify["exit"] == 0 and (get_result(verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("shadow-dom-click did not update window.__shadowClicks")
+    elif op_name == "iframe-fill":
+        res = run_bridge_cmd("fill", tab_id, "frame=#frame >> #frame-input", "framed")
+        if res["exit"] != 0:
+            raise RuntimeError("iframe-fill failed")
+        verify = run_bridge_cmd("executeScriptCDP", tab_id, "window.__frameValue === 'framed'")
+        if verify["exit"] != 0 or (get_result(verify) or {}).get("val") is not True:
+            raise RuntimeError("iframe-fill did not update window.__frameValue")
+        click = run_bridge_cmd("click", tab_id, "frame=#frame >> #frame-button")
+        if click["exit"] != 0:
+            raise RuntimeError("iframe frame-button click failed")
+        click_verify = run_bridge_cmd("executeScriptCDP", tab_id, "window.__frameClicks >= 1")
+        if click_verify["exit"] == 0 and (get_result(click_verify) or {}).get("val") is True:
+            return "pass", (time.perf_counter() - t0) * 1000
+        raise RuntimeError("iframe frame-button click did not update window.__frameClicks")
     elif op_name == "console-monitoring":
         res = run_bridge_cmd("batch", json.dumps([
             {"action": "startMonitoring"},

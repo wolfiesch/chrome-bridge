@@ -52,13 +52,15 @@ PAGE = b"""<!doctype html>
   <div id="to">to</div>
   <div id="panel"><div id="spacer">scroll panel</div></div>
   <div id="shadow-host"></div>
-  <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;"></iframe>
+  <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); });&lt;/script&gt;"></iframe>
   <script>
     window.__shadowClicks = 0;
     window.__frameValue = '';
+    window.__frameClicks = 0;
     const shadowRoot = document.querySelector('#shadow-host').attachShadow({mode: 'open'});
     shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button>';
     shadowRoot.querySelector('#shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
+    window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; });
     document.querySelector('#btn').addEventListener('click', () => {
       document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
     });
@@ -347,8 +349,28 @@ def main():
         record(summary, "getCurrentState", call, {"observe_ok": obs_ok})
         require(call["exit"] == 0 and obs_ok, "getCurrentState failed or observe did not contain fixture text")
 
-        record(summary, "shadowDomClick", {"exit": 0}, {"capability": "unsupported", "reason": "CSS selector actions do not pierce shadow roots yet"})
-        record(summary, "iframeFill", {"exit": 0}, {"capability": "unsupported", "reason": "CSS selector actions do not target iframe browsing contexts yet"})
+        call = run_bridge("click", tab_id, "#shadow-host >>> #shadow-btn")
+        record(summary, "shadowDomClick", call)
+        require(call["exit"] == 0, "shadow DOM click failed")
+        call = run_bridge("executeScriptCDP", tab_id, "window.__shadowClicks >= 1")
+        shadow_clicked = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_shadow_click", call, {"clicked": shadow_clicked})
+        require(call["exit"] == 0 and shadow_clicked is True, "shadow DOM click did not update counter")
+
+        call = run_bridge("fill", tab_id, "frame=#frame >> #frame-input", "framed")
+        record(summary, "iframeFill", call)
+        require(call["exit"] == 0, "iframe fill failed")
+        call = run_bridge("executeScriptCDP", tab_id, "window.__frameValue === 'framed'")
+        frame_filled = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_iframe_fill", call, {"filled": frame_filled})
+        require(call["exit"] == 0 and frame_filled is True, "iframe fill did not update frame value")
+        call = run_bridge("click", tab_id, "frame=#frame >> #frame-button")
+        record(summary, "iframeClick", call)
+        require(call["exit"] == 0, "iframe click failed")
+        call = run_bridge("executeScriptCDP", tab_id, "window.__frameClicks >= 1")
+        frame_clicked = (result(call) or {}).get("val")
+        record(summary, "executeScriptCDP_verify_iframe_click", call, {"clicked": frame_clicked})
+        require(call["exit"] == 0 and frame_clicked is True, "iframe click did not update counter")
 
         # 24. Start Interception
         call = run_bridge("startInterception", tab_id, "*data.json*", "fulfill", 200, '{"ok":true,"intercepted":true}')
