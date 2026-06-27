@@ -49,6 +49,8 @@ cat > "$LAUNCHER" <<EOF
 export BRIDGE_TOKEN_FILE="\${BRIDGE_TOKEN_FILE:-$SCRIPT_DIR/bridge_token.txt}"
 export BRIDGE_TOKENS_FILE="\${BRIDGE_TOKENS_FILE:-$SCRIPT_DIR/bridge_tokens.txt}"
 export BRIDGE_LOG_FILE="\${BRIDGE_LOG_FILE:-$SCRIPT_DIR/bridge_debug.log}"
+export BRIDGE_POLICY_FILE="\${BRIDGE_POLICY_FILE:-$SCRIPT_DIR/bridge_policy.json}"
+export BRIDGE_AUDIT_LOG_FILE="\${BRIDGE_AUDIT_LOG_FILE:-$SCRIPT_DIR/bridge_audit.jsonl}"
 exec "$RUST_BIN" "\$@"
 EOF
 chmod +x "$LAUNCHER"

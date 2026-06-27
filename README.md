@@ -144,9 +144,12 @@ chrome-bridge storageState <tabId> <outputPath>
 chrome-bridge setGeolocation <tabId> <latitude> <longitude> [accuracy]
 chrome-bridge clearGeolocation <tabId>
 chrome-bridge performanceMetrics <tabId>
+chrome-bridge policyCheck <action> [payloadJson]
 ```
 
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
+
+`policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time.
 
 ### Real-profile moat: session probe and human handoff
 
@@ -204,6 +207,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
 python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_agent_actions_live.py verify_capability_matrix.py
 node --check background.js
@@ -251,7 +255,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
 
 This runs the same framing/auth/large-payload parity checks (ping/pong, 500KB round-trip, invalid-token rejection) against the Rust host on port `9225`.
 
-The Rust host honors the same env vars: `BRIDGE_PORT` (default 9223), `BRIDGE_TOKEN_FILE`, `BRIDGE_LOG_FILE`.
+The Rust host honors the same env vars: `BRIDGE_PORT` (default 9223), `BRIDGE_TOKEN_FILE`, `BRIDGE_TOKENS_FILE`, `BRIDGE_LOG_FILE`, and in addition `BRIDGE_POLICY_FILE` (default `bridge_policy.json`) and `BRIDGE_AUDIT_LOG_FILE` (default `bridge_audit.jsonl`). It enforces the same host policy, audit logging, and response redaction as the Python host.
 
 ## MCP server
 
@@ -270,6 +274,7 @@ Read-only:
 - `browser_extract_text`
 - `browser_screenshot` (returned inline as an image)
 - `browser_get_html`, `browser_lease_status`
+- `browser_policy_check` — ask the host what its policy would decide for an action/payload without forwarding it
 - `browser_wait_for` (`mode`: `load|selector|text|url`)
 
 Sensitive:
@@ -423,6 +428,16 @@ Median ms per operation, 5 iterations, identical local HTTP fixture, all three a
 
 Median-of-medians: Chrome Bridge ~6.2 ms, Playwright ~5.7 ms, Puppeteer ~4.0 ms. With the persistent client, Chrome Bridge is competitive with the in-process drivers rather than multiples slower; it wins `wait-selector` outright and beats Playwright on `click` (though it trails Puppeteer there slightly). Two real gaps remain: `wait-load` (~256 ms — `waitForLoad` polls more conservatively than Playwright's load-state signal) and the monitoring ops (the 100 ms settle window). The earlier "~41 ms, 4x slower" figure was per-operation subprocess spawn, now eliminated. Timings vary with machine load; rerun locally for current numbers.
 
+## Usage telemetry
+
+`usage_telemetry.py` mines local Claude Code transcripts to count how often the bridge's MCP tools are actually used. It reads `~/.claude/projects` (override with `--projects-dir`), matches tool names against `--server-match` (default `chrome[-_]devtools`), and emits a `text` or `json` report.
+
+```bash
+python3 usage_telemetry.py --format json --since 2025-01-01
+```
+
+It only reads transcript files and never contacts the bridge or Chrome.
+
 ## Troubleshooting
 
 The host writes a local `bridge_debug.log` (git-ignored) next to `bridge.py`:
@@ -439,6 +454,12 @@ tail -f bridge_debug.log
 
 - TCP API is localhost-only and requires the shared token.
 - Payload bodies such as cookies and DOM are not logged by the host.
+- Host policy in `bridge_policy.json` (`BRIDGE_POLICY_FILE`) is the enforcement layer for every raw TCP/CLI/MCP client: the TCP API is localhost-only and token-gated, but token holders bypass MCP scoping, so deny/allow/confirmation rules are enforced in the native host before any action reaches the extension.
+- MCP `readonly`/`allow_sensitive` controls are usability scoping, not the security boundary, because a client with the token can call the raw TCP API directly. Use `bridge_policy.json` for real restrictions; use `browser_policy_check` (or `test_client.py policyCheck`) to see what the host would decide.
+- Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
+- Audit logs are JSONL at `BRIDGE_AUDIT_LOG_FILE` / `bridge_audit.jsonl`, one event per request with `ts`, `client`, `action`, `targets`, `decision`, `reason`, `requestId`. They intentionally omit payload and response bodies.
+- Cookie and storage-state redaction is enabled by default through policy (`redact`): cookie values and sensitive storage keys are replaced with `<redacted>` before responses reach the client. Page-derived content from `getHTML`, `extractText`, `executeScript`, and `executeScriptCDP` is additionally masked against the client policy's `redactPatterns` (a list of regexes; use inline flags like `(?i)` for case-insensitivity) before it reaches the client.
+- The Python and Rust native hosts enforce the same policy, audit, and redaction behavior; this parity is covered by the guardrails contract (`verify_guardrails_contract.py`).
 - `executeScript` uses `chrome.scripting` in the page MAIN world and can be blocked by strict page CSP.
 - `executeScriptCDP`, browser interactions, waits, screenshots, viewport control, monitoring, interception, geolocation, and performance metrics use `chrome.debugger`.
 - `downloads`, `contentSettings`, `host_permissions: <all_urls>`, cookie access, debugger access, and script execution are powerful. Use this profile for trusted automation only.

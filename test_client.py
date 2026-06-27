@@ -287,6 +287,7 @@ def print_usage():
     print("  python3 test_client.py performanceMetrics <tabId>")
     print("  python3 test_client.py sessionStatus <domain> [<domain> ...]")
     print("  python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
+    print("  python3 test_client.py policyCheck <action> [payloadJson]")
 
 def main():
     if len(sys.argv) < 2:
@@ -447,6 +448,16 @@ def main():
         if len(args) > 3:
             payload["tabId"] = parse_int(args[3], "tabId")
         sys.exit(send_command("batch", payload))
+    elif action == "policyCheck":
+        require_args(args, 3, "Usage: python3 test_client.py policyCheck <action> [payloadJson]")
+        target_payload = {}
+        if len(args) > 3:
+            try:
+                target_payload = json.loads(args[3])
+            except Exception as exc:
+                print(f"Invalid payload JSON: {exc}", file=sys.stderr)
+                sys.exit(2)
+        sys.exit(send_command("policyCheck", {"action": args[2], "payload": target_payload}))
     elif action == "sessionStatus":
         require_args(args, 3, "Usage: python3 test_client.py sessionStatus <domain> [<domain> ...]")
         sys.exit(send_command("sessionStatus", {"domains": list(args[2:])}))

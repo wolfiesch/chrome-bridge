@@ -16,6 +16,7 @@ bridge-host-launch.sh
 
 # Logs and caches
 bridge_debug.log
+bridge_audit.jsonl
 *.log
 __pycache__/
 *.pyc

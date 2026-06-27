@@ -411,6 +411,9 @@ async function dispatchAction(action, payload) {
       case "waitForHandoff":
         result = await waitForHandoff(payload);
         break;
+      case "__tabOrigin":
+        result = await tabOrigin(payload.tabId);
+        break;
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
@@ -441,6 +444,32 @@ async function getTabs() {
     url: tab.url,
     status: tab.status
   }));
+}
+
+// Reserved internal action used by the native host's tab-origin policy check.
+// Returns only the target tab's URL/origin (no page content) so the host can
+// evaluate site policy for tab-scoped actions before forwarding them. When no
+// tabId is given, resolves the active tab, then the first tab.
+async function tabOrigin(tabId) {
+  let tab;
+  if (tabId === undefined || tabId === null) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tab = tabs && tabs[0];
+    if (!tab) {
+      const all = await chrome.tabs.query({});
+      tab = all && all[0];
+    }
+  } else {
+    tab = await chrome.tabs.get(tabId);
+  }
+  if (!tab) throw new Error("no such tab");
+  let origin = null;
+  try {
+    origin = tab.url ? new URL(tab.url).origin : null;
+  } catch (e) {
+    origin = null;
+  }
+  return { tabId: tab.id ?? null, url: tab.url || null, origin };
 }
 
 async function activateTab(tabId) {

@@ -92,6 +92,12 @@ COMPARISON_METADATA = {
             "surface": "benchmark_harness.py report exporters",
             "acceptance": "The harness emits JSON, Markdown, and JUnit or GitHub Step Summary output for the same run.",
         },
+        {
+            "gap": "interactive destructive approval",
+            "description": "Provide an interactive approve/deny path for actions the policy marks requireConfirmation, instead of failing closed with confirmationRequired.",
+            "surface": "bridge.py, host-rs/src/main.rs, mcp/chrome_bridge_mcp/server.py",
+            "acceptance": "A confirmation-required action can be approved through an explicit client prompt and then proceeds, while denial blocks it, with the decision audited.",
+        },
     ],
 }
 
@@ -661,6 +667,11 @@ try {
 let browser;
 try {
   browser = await puppeteer.launch({headless: 'new'});
+} catch (launchError) {
+  // Bundled Chrome may be absent; fall back to the system Chrome stable
+  // channel (this is also how chrome-devtools-mcp launches Chrome).
+  browser = await puppeteer.launch({channel: 'chrome', headless: 'new'});
+}
   await browser.defaultBrowserContext().overridePermissions(baseUrl, ['geolocation']);
   for (let i = 0; i < iterations; i++) {
     const page = await browser.newPage();
@@ -726,13 +737,13 @@ def npm_root():
     return root if root else None
 
 
-def run_puppeteer(args, results, base_url):
+def run_puppeteer_runner(args, results, base_url, runner_name, temp_prefix):
     if args.iterations == 0:
         return
     if not shutil.which("node"):
         mark_all(results, "unsupported", "node executable is not available")
         return
-    with tempfile.TemporaryDirectory(prefix=".chrome-bridge-puppeteer-", dir=SCRIPT_DIR) as tmp:
+    with tempfile.TemporaryDirectory(prefix=temp_prefix, dir=SCRIPT_DIR) as tmp:
         script_path = Path(tmp) / "bench.mjs"
         output_path = Path(tmp) / "results.json"
         script_path.write_text(puppeteer_script(), encoding="utf-8")
@@ -748,7 +759,7 @@ def run_puppeteer(args, results, base_url):
             env=env,
         )
         if proc.returncode != 0:
-            mark_all(results, "unsupported", f"Puppeteer runner failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            mark_all(results, "unsupported", f"{runner_name} runner failed: {proc.stderr.strip() or proc.stdout.strip()}")
             return
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         for op in OPERATIONS:
@@ -756,6 +767,14 @@ def run_puppeteer(args, results, base_url):
             results[op]["capability"] = item.get("capability", "unsupported")
             results[op]["durationsMs"].extend(item.get("durationsMs", []))
             results[op]["errors"].extend(sanitize_error(error) for error in item.get("errors", []))
+
+
+def run_puppeteer(args, results, base_url):
+    run_puppeteer_runner(args, results, base_url, "Puppeteer", ".chrome-bridge-puppeteer-")
+
+
+def run_chrome_devtools_mcp(args, results, base_url):
+    run_puppeteer_runner(args, results, base_url, "Chrome DevTools MCP", ".chrome-devtools-mcp-")
 
 
 def score_from_median(operations):
@@ -798,7 +817,7 @@ def initial_results():
 def handle_run(args):
     base_url = args.base_url
     server = None
-    if args.adapter in {"chrome-bridge", "playwright", "puppeteer"} and args.iterations > 0 and not base_url:
+    if args.adapter in {"chrome-bridge", "playwright", "puppeteer", "chrome-devtools-mcp"} and args.iterations > 0 and not base_url:
         server, base_url = start_fixture_server()
     results = initial_results()
     try:
@@ -812,6 +831,8 @@ def handle_run(args):
             run_playwright(args, results, base_url)
         elif args.adapter == "puppeteer":
             run_puppeteer(args, results, base_url)
+        elif args.adapter == "chrome-devtools-mcp":
+            run_chrome_devtools_mcp(args, results, base_url)
         else:
             raise ValueError(f"Unknown adapter: {args.adapter}")
         output_data = finish_results(args.adapter, args.iterations, results)
@@ -896,7 +917,7 @@ def main():
     run_parser = subparsers.add_parser("run", help="Run benchmarks")
     run_parser.add_argument(
         "--adapter",
-        choices=["noop", "chrome-bridge", "playwright", "puppeteer"],
+        choices=["noop", "chrome-bridge", "playwright", "puppeteer", "chrome-devtools-mcp"],
         default="noop",
         help="Harness adapter to use",
     )

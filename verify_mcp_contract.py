@@ -206,6 +206,16 @@ def main():
     server.browser_action("performanceMetrics", {"tabId": 11})
     expect(last_request() == ("performanceMetrics", {"tabId": 11}), "browser_action passthrough mismatch")
 
+    # 9b. browser_policy_check forwards policyCheck with action/payload, no tab resolve.
+    with received_lock:
+        received.clear()
+    server.browser_policy_check("getCookies", {"domain": "x.test"})
+    expect(last_request() == ("policyCheck", {"action": "getCookies", "payload": {"domain": "x.test"}}),
+           "policy_check payload mismatch")
+    with received_lock:
+        expect([a for a, _ in received] == ["policyCheck"],
+               "policy_check must not resolve a tab")
+
     # 10. screenshot returns inline image content from the data URL.
     shot = server.browser_screenshot(tab_id=11)
     expect(getattr(shot, "type", None) == "image" and shot.data == "QUJD" and shot.mimeType == "image/png",
@@ -262,6 +272,7 @@ def main():
     expect("browser_get_cookies" not in default_names, "cookies must be hidden by default")
     expect("browser_action" not in default_names, "browser_action must be hidden by default (sensitive)")
     expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
+    expect("browser_policy_check" in default_names, "policy_check must be present by default (read-only, non-sensitive)")
 
     # 17. allow_sensitive exposes sensitive tools.
     sens_names = _tool_names(server.build_server(allow_sensitive=True))
@@ -272,6 +283,7 @@ def main():
     expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
     expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
+    expect("browser_policy_check" in ro_names, "readonly must keep policy_check (read-only)")
 
     # 19. Annotations + resources are registered.
     srv = server.build_server(allow_sensitive=True)

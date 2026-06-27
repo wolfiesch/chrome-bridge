@@ -52,6 +52,13 @@ def main():
             require(name in matrix, f"comparison missing {name}")
         gaps = data.get("comparison", {}).get("gaps", [])
         require(any("isolated contexts" in gap.get("gap", "") for gap in gaps), "expected isolated-context gap")
+        gap_names = {gap.get("gap", "") for gap in gaps}
+        require("interactive destructive approval" in gap_names, "expected interactive approval residual gap")
+        # Implemented this sprint, so they must no longer be listed as gaps.
+        require("html text and script-result redaction" not in gap_names,
+                "html/script redaction was implemented; must not remain a gap")
+        require("tab-origin-aware policy enforcement" not in gap_names,
+                "tab-origin policy was implemented; must not remain a gap")
 
         proc = run("compare", "--input", str(out), "--output", str(report))
         require(proc.returncode == 0, f"compare failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")

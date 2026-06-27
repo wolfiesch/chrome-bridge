@@ -355,6 +355,622 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
     None
 }
 
+// --- Host-enforced guardrails: policy, audit, redaction --------------------
+// Mirrors bridge.py so the Rust native host governs every local client path
+// (raw TCP/CLI, MCP) with the same policy/audit/redaction behavior.
+
+/// Action classifications. Advisory tags mirroring bridge.py for policy authors
+/// and the default redaction set; deny/allow/confirmation are driven by the
+/// policy file, not these sets.
+#[allow(dead_code)]
+fn sensitive_actions() -> &'static [&'static str] {
+    &[
+        "getCookies", "storageState", "executeScript", "executeScriptCDP",
+        "startInterception", "downloadUrl",
+    ]
+}
+
+#[allow(dead_code)]
+fn mutating_actions() -> &'static [&'static str] {
+    &[
+        "navigate", "click", "type", "fill", "hover", "scroll", "press", "drag",
+        "select", "uploadFile", "activateTab", "closeTab", "reload", "goBack",
+        "goForward", "setViewport", "setGeolocation", "clearGeolocation",
+        "startInterception", "stopInterception", "startMonitoring", "stopMonitoring",
+        "handleDialog", "downloadUrl", "batch",
+    ]
+}
+
+#[allow(dead_code)]
+fn destructive_actions() -> &'static [&'static str] {
+    &[
+        "executeScript", "executeScriptCDP", "startInterception", "downloadUrl",
+        "getCookies", "storageState",
+    ]
+}
+
+/// Origin-exempt actions: their policy target is NOT the live tab origin, so the
+/// host must not do a tab-origin lookup for them. Mirrors bridge.py: every other
+/// forwarded action is treated as tab-scoped and origin-checked (fail-safe).
+fn origin_exempt_action(action: &str) -> bool {
+    matches!(
+        action,
+        "ping" | "getTabs" | "navigate" | "downloadUrl" | "getCookies"
+            | "sessionStatus" | "batch" | "lease" | "release" | "leaseStatus"
+            | "policyCheck"
+    )
+}
+
+/// Actions reserved for host-internal use (tab-origin lookup). A socket client
+/// may never invoke these; they are rejected as unknown.
+fn reserved_action(action: &str) -> bool {
+    matches!(action, "__tabOrigin")
+}
+
+/// Path of the policy file (BRIDGE_POLICY_FILE or <host_dir>/bridge_policy.json).
+fn policy_file_path(host_dir: &Path) -> PathBuf {
+    match std::env::var("BRIDGE_POLICY_FILE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => host_dir.join("bridge_policy.json"),
+    }
+}
+
+/// Path of the audit log (BRIDGE_AUDIT_LOG_FILE or <host_dir>/bridge_audit.jsonl).
+fn audit_log_path(host_dir: &Path) -> PathBuf {
+    match std::env::var("BRIDGE_AUDIT_LOG_FILE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => host_dir.join("bridge_audit.jsonl"),
+    }
+}
+
+/// Built-in permissive default; the policy file's default/clients overlay it.
+fn default_policy() -> Value {
+    json!({
+        "default": {
+            "allowedActions": ["*"],
+            "deniedActions": [],
+            "allowedOrigins": ["*"],
+            "deniedOrigins": [],
+            "requireConfirmation": [],
+            "redactPatterns": [],
+            "redact": true,
+            "audit": true
+        },
+        "clients": {}
+    })
+}
+
+/// Read and parse the policy file. Missing/malformed file falls back to the
+/// permissive default and logs one error, preserving current behavior.
+fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
+    let path = policy_file_path(host_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                log_error(logger, &format!("Could not load policy file {}: root must be an object", path.display()));
+                default_policy()
+            }
+            Err(e) => {
+                log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
+                default_policy()
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => default_policy(),
+        Err(e) => {
+            log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
+            default_policy()
+        }
+    }
+}
+
+/// Shared policy value plus the recorded policy-file mtime, reloadable under a lock.
+struct PolicyRegistry {
+    value: Value,
+    policy_file_mtime: Option<SystemTime>,
+}
+
+type Policy = Arc<RwLock<PolicyRegistry>>;
+
+fn build_policy_registry(host_dir: &Path, logger: &Arc<Logger>) -> PolicyRegistry {
+    PolicyRegistry {
+        value: load_policy(host_dir, logger),
+        policy_file_mtime: file_mtime(&policy_file_path(host_dir)),
+    }
+}
+
+/// Cached-with-mtime read: reload when the policy file's mtime changes
+/// (including absent -> present) so changes take effect without a restart.
+fn current_policy(policy: &Policy, host_dir: &Path, logger: &Arc<Logger>) -> Value {
+    let cur = file_mtime(&policy_file_path(host_dir));
+    if let Ok(reg) = policy.read() {
+        if cur == reg.policy_file_mtime {
+            return reg.value.clone();
+        }
+    }
+    if let Ok(mut reg) = policy.write() {
+        if cur != reg.policy_file_mtime {
+            reg.value = load_policy(host_dir, logger);
+            reg.policy_file_mtime = cur;
+        }
+        return reg.value.clone();
+    }
+    default_policy()
+}
+
+const POLICY_LIST_KEYS: [&str; 6] = [
+    "allowedActions", "deniedActions", "allowedOrigins", "deniedOrigins",
+    "requireConfirmation", "redactPatterns",
+];
+const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
+
+/// Merge: built-in default -> policy["default"] -> policy["clients"][name].
+fn policy_for_client(policy: &Value, name: &str) -> Value {
+    let mut merged = default_policy()
+        .get("default")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let layers = [
+        policy.get("default"),
+        policy.get("clients").and_then(|c| c.get(name)),
+    ];
+    for layer in layers.iter().flatten() {
+        if !layer.is_object() {
+            continue;
+        }
+        for key in POLICY_LIST_KEYS.iter() {
+            if let Some(v) = layer.get(*key) {
+                if v.is_array() {
+                    merged[*key] = v.clone();
+                }
+            }
+        }
+        for key in POLICY_BOOL_KEYS.iter() {
+            if let Some(Value::Bool(b)) = layer.get(*key) {
+                merged[*key] = Value::Bool(*b);
+            }
+        }
+    }
+    merged
+}
+
+/// Extract an explicit `:port` from a URL's authority, matching Python's
+/// `urlparse().port` which preserves even default ports (e.g. `:443`). The
+/// `url` crate normalizes default ports to `None`, so we read the raw string.
+/// The caller has already validated `raw_url` via `Url::parse`, so any present
+/// port is well-formed.
+fn explicit_port(raw_url: &str) -> Option<u16> {
+    let after_scheme = raw_url.splitn(2, "://").nth(1)?;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?;
+    let host_port = if let Some(idx) = authority.find(']') {
+        // IPv6 literal: port follows the closing bracket.
+        &authority[idx + 1..]
+    } else {
+        authority
+    };
+    let port_str = host_port.rsplit_once(':').map(|(_, p)| p)?;
+    port_str.parse::<u16>().ok()
+}
+
+/// Lowercase scheme/host, preserve explicit port, strip path/query/fragment.
+/// Returns [scheme://host[:port], *://host[:port]] or [] for invalid URLs.
+fn normalize_url_targets(raw_url: &str) -> Vec<String> {
+    let parsed = match url::Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => return Vec::new(),
+    };
+    let scheme = parsed.scheme().to_lowercase();
+    let host = match parsed.host_str() {
+        Some(h) => h.to_lowercase(),
+        None => return Vec::new(),
+    };
+    if scheme.is_empty() || host.is_empty() {
+        return Vec::new();
+    }
+    let netloc = match explicit_port(raw_url) {
+        Some(p) => format!("{}:{}", host, p),
+        None => host,
+    };
+    vec![format!("{}://{}", scheme, netloc), format!("*://{}", netloc)]
+}
+
+/// Ordered list of normalized policy targets derived from a request payload.
+fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
+    let payload = match payload {
+        Some(p) if p.is_object() => p,
+        _ => return Vec::new(),
+    };
+    match action {
+        "navigate" | "downloadUrl" => payload
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(normalize_url_targets)
+            .unwrap_or_default(),
+        "getCookies" => {
+            match payload.get("domain").and_then(|d| d.as_str()) {
+                Some(d) if !d.is_empty() => {
+                    let d = d.strip_prefix('.').unwrap_or(d);
+                    vec![format!("*://{}", d.to_lowercase())]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "batch" => {
+            let mut targets = Vec::new();
+            if let Some(Value::Array(steps)) = payload.get("steps") {
+                for step in steps {
+                    if step.is_object() {
+                        let s_action = step.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                        targets.extend(targets_from_payload(s_action, step.get("payload")));
+                    }
+                }
+            }
+            targets
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Convert a tab origin ("https://host[:port]") into policy target strings
+/// using the same normalizer as URLs. Empty/opaque origins -> [].
+fn origin_targets(origin: Option<&str>) -> Vec<String> {
+    match origin {
+        Some(o) if !o.is_empty() => normalize_url_targets(o),
+        _ => Vec::new(),
+    }
+}
+
+/// Stable map key for a tabId: the integer as a string, or "" for the active
+/// tab (tabId absent/null). Mirrors Python's dict keyed by tabId|None.
+fn tabid_key(payload: Option<&Value>) -> String {
+    match payload.and_then(|p| p.get("tabId")) {
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Yield (action, effective_payload) for a batch's steps, applying runBatch
+/// tabId defaulting: a top-level batch tabId fills steps that omit one.
+fn step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let obj = match payload {
+        Some(p) if p.is_object() => p,
+        _ => return out,
+    };
+    let default_tab = obj.get("tabId").filter(|v| !v.is_null()).cloned();
+    if let Some(Value::Array(steps)) = obj.get("steps") {
+        for step in steps {
+            let s_action = step.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            let mut s_payload = match step.get("payload") {
+                Some(Value::Object(m)) => Value::Object(m.clone()),
+                _ => json!({}),
+            };
+            if let (Some(dt), Value::Object(map)) = (&default_tab, &mut s_payload) {
+                let missing = map.get("tabId").map(|v| v.is_null()).unwrap_or(true);
+                if missing {
+                    map.insert("tabId".to_string(), dt.clone());
+                }
+            }
+            out.push((s_action, s_payload));
+        }
+    }
+    out
+}
+
+/// The set of tabId keys whose live origin the host must resolve to apply site
+/// policy. "" means the active tab. Empty for origin-exempt actions. Recurses
+/// into batch steps with runBatch tabId defaulting.
+fn tab_ids_needed(action: &str, payload: Option<&Value>) -> std::collections::BTreeSet<String> {
+    let mut needed = std::collections::BTreeSet::new();
+    if action == "batch" {
+        for (s_action, s_payload) in step_payloads(payload) {
+            needed.extend(tab_ids_needed(&s_action, Some(&s_payload)));
+        }
+        return needed;
+    }
+    if origin_exempt_action(action) {
+        return needed;
+    }
+    needed.insert(tabid_key(payload));
+    needed
+}
+
+/// True when the client's site policy is non-trivial, i.e. it could allow or
+/// deny based on a tab's origin. Lets the host skip the tab-origin round-trip
+/// when policy is origin-permissive (deniedOrigins empty, allowedOrigins ["*"]).
+fn policy_constrains_origins(policy: &Value, name: &str) -> bool {
+    let cp = policy_for_client(policy, name);
+    let denied_nonempty = matches!(cp.get("deniedOrigins"), Some(Value::Array(a)) if !a.is_empty());
+    if denied_nonempty {
+        return true;
+    }
+    let allowed_is_star = matches!(
+        cp.get("allowedOrigins"),
+        Some(Value::Array(a)) if a.len() == 1 && a[0].as_str() == Some("*")
+    );
+    !allowed_is_star
+}
+
+fn action_matches(patterns: Option<&Value>, action: &str) -> bool {
+    match patterns {
+        Some(Value::Array(arr)) => arr.iter().any(|p| {
+            p.as_str()
+                .and_then(|pat| glob::Pattern::new(pat).ok())
+                .map(|g| g.matches(action))
+                .unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+fn target_matches(patterns: Option<&Value>, targets: &[String]) -> bool {
+    let arr = match patterns {
+        Some(Value::Array(arr)) => arr,
+        _ => return false,
+    };
+    for target in targets {
+        for p in arr {
+            if let Some(pat) = p.as_str() {
+                if let Ok(g) = glob::Pattern::new(pat) {
+                    if g.matches(target) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns (allowed, reason, confirmation_required, redact_enabled,
+/// audit_enabled, targets). Precedence: denied action -> allowed action ->
+/// denied target -> allowed target -> confirmation requirement.
+/// ``origins`` maps a tabId key (integer string, or "" for the active tab) to
+/// that tab's live origin; for tab-scoped actions the matching origin is folded
+/// into the site-policy targets so policy applies even with no URL in payload.
+fn evaluate_policy(
+    policy: &Value,
+    name: &str,
+    action: &str,
+    payload: Option<&Value>,
+    origins: &std::collections::BTreeMap<String, Option<String>>,
+) -> (bool, Option<String>, bool, bool, bool, Vec<String>) {
+    let cp = policy_for_client(policy, name);
+    let redact_enabled = cp.get("redact").and_then(|v| v.as_bool()).unwrap_or(true);
+    let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut targets = targets_from_payload(action, payload);
+    if !origin_exempt_action(action) {
+        if let Some(Some(origin)) = origins.get(&tabid_key(payload)) {
+            targets.extend(origin_targets(Some(origin.as_str())));
+        }
+    }
+
+    // Reserved host-internal actions are never client-invokable, including as a
+    // batch step (runBatch would otherwise dispatch them). Deny centrally here.
+    if reserved_action(action) {
+        return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
+    }
+
+    if action_matches(cp.get("deniedActions"), action) {
+        return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
+    }
+    if !action_matches(cp.get("allowedActions"), action) {
+        return (false, Some(format!("action {} not allowed", action)), false, redact_enabled, audit_enabled, targets);
+    }
+    let confirm = action_matches(cp.get("requireConfirmation"), action);
+
+    if action == "batch" {
+        if confirm {
+            return (true, None, true, redact_enabled, audit_enabled, targets);
+        }
+        let mut step_confirm = false;
+        for (i, (s_action, s_payload)) in step_payloads(payload).into_iter().enumerate() {
+            let (s_allowed, s_reason, s_confirm, _, _, _) =
+                evaluate_policy(policy, name, &s_action, Some(&s_payload), origins);
+            if !s_allowed {
+                let reason = s_reason.unwrap_or_default();
+                return (false, Some(format!("batch step {}: {}", i, reason)), false,
+                        redact_enabled, audit_enabled, targets);
+            }
+            step_confirm = step_confirm || s_confirm;
+        }
+        return (true, None, step_confirm, redact_enabled, audit_enabled, targets);
+    }
+
+    if !targets.is_empty() && target_matches(cp.get("deniedOrigins"), &targets) {
+        return (false, Some("target denied".to_string()), false, redact_enabled, audit_enabled, targets);
+    }
+    if !targets.is_empty() && !target_matches(cp.get("allowedOrigins"), &targets) {
+        return (false, Some("target not allowed".to_string()), false, redact_enabled, audit_enabled, targets);
+    }
+    (true, None, confirm, redact_enabled, audit_enabled, targets)
+}
+
+/// Append one JSON line to the audit log. Never writes payload/response bodies.
+/// A write failure is logged but never blocks browser automation.
+fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
+    let path = audit_log_path(host_dir);
+    let line = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{}", line));
+    if let Err(e) = result {
+        log_error(logger, &format!("Could not write audit event to {}: {}", path.display(), e));
+    }
+}
+
+/// Emit an audit event when audit is enabled for the client.
+#[allow(clippy::too_many_arguments)]
+fn audit(
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+    audit_enabled: bool,
+    client: &str,
+    action: &str,
+    targets: &[String],
+    decision: &str,
+    reason: Option<&str>,
+    request_id: Option<&str>,
+) {
+    if !audit_enabled {
+        return;
+    }
+    let event = json!({
+        "ts": now_ms() as u64,
+        "client": client,
+        "action": action,
+        "targets": targets,
+        "decision": decision,
+        "reason": reason,
+        "requestId": request_id,
+    });
+    write_audit_event(host_dir, logger, &event);
+}
+
+const REDACT_KEY_SUBSTRINGS: [&str; 7] =
+    ["token", "secret", "password", "cookie", "session", "csrf", "auth"];
+
+fn redact_storage_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                let lower = k.to_lowercase();
+                if REDACT_KEY_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
+                    out.insert(k, Value::String("<redacted>".to_string()));
+                } else {
+                    out.insert(k, redact_storage_value(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(redact_storage_value).collect()),
+        other => other,
+    }
+}
+
+fn redact_cookie_list(list: &[Value]) -> Vec<Value> {
+    list.iter()
+        .map(|c| {
+            if let Value::Object(map) = c {
+                let mut m = map.clone();
+                if m.contains_key("value") {
+                    m.insert("value".to_string(), Value::String("<redacted>".to_string()));
+                }
+                Value::Object(m)
+            } else {
+                c.clone()
+            }
+        })
+        .collect()
+}
+
+/// Compile policy redactPatterns into regexes, skipping invalid ones. Patterns
+/// match case-sensitively; authors use inline flags (e.g. (?i)).
+fn compile_patterns(patterns: Option<&Value>) -> Vec<regex::Regex> {
+    let mut out = Vec::new();
+    if let Some(Value::Array(arr)) = patterns {
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                if !s.is_empty() {
+                    if let Ok(rx) = regex::Regex::new(s) {
+                        out.push(rx);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn mask_text(text: &str, compiled: &[regex::Regex]) -> String {
+    let mut s = text.to_string();
+    for rx in compiled {
+        s = rx.replace_all(&s, "<redacted>").into_owned();
+    }
+    s
+}
+
+/// Recursively mask redact patterns in string leaves of a content value.
+fn redact_content_value(value: Value, compiled: &[regex::Regex]) -> Value {
+    match value {
+        Value::String(s) => Value::String(mask_text(&s, compiled)),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, redact_content_value(v, compiled)))
+                .collect(),
+        ),
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(|v| redact_content_value(v, compiled)).collect())
+        }
+        other => other,
+    }
+}
+
+/// Response fields carrying page-derived content, subject to redactPatterns.
+const CONTENT_REDACT_FIELDS: [&str; 5] = ["html", "text", "val", "value", "result"];
+
+/// Redact sensitive response values before returning them to socket clients.
+fn redact_response(
+    action: &str,
+    response: Value,
+    redact_enabled: bool,
+    patterns: Option<&Value>,
+) -> Value {
+    if !redact_enabled {
+        return response;
+    }
+    let mut obj = match response {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    if action == "getCookies" {
+        // result.cookies (object) | result (array) | response.cookies (array)
+        if let Some(Value::Object(result)) = obj.get("result") {
+            if let Some(Value::Array(cookies)) = result.get("cookies") {
+                let redacted = redact_cookie_list(cookies);
+                let mut new_result = result.clone();
+                new_result.insert("cookies".to_string(), Value::Array(redacted));
+                obj.insert("result".to_string(), Value::Object(new_result));
+                return Value::Object(obj);
+            }
+        }
+        if let Some(Value::Array(cookies)) = obj.get("result") {
+            let redacted = redact_cookie_list(cookies);
+            obj.insert("result".to_string(), Value::Array(redacted));
+            return Value::Object(obj);
+        }
+        if let Some(Value::Array(cookies)) = obj.get("cookies") {
+            let redacted = redact_cookie_list(cookies);
+            obj.insert("cookies".to_string(), Value::Array(redacted));
+            return Value::Object(obj);
+        }
+        return Value::Object(obj);
+    }
+    if action == "storageState" {
+        if let Some(result) = obj.remove("result") {
+            obj.insert("result".to_string(), redact_storage_value(result));
+        }
+        return Value::Object(obj);
+    }
+    if matches!(action, "getHTML" | "extractText" | "executeScript" | "executeScriptCDP") {
+        let compiled = compile_patterns(patterns);
+        if compiled.is_empty() {
+            return Value::Object(obj);
+        }
+        for field in CONTENT_REDACT_FIELDS.iter() {
+            if let Some(v) = obj.remove(*field) {
+                obj.insert((*field).to_string(), redact_content_value(v, &compiled));
+            }
+        }
+        return Value::Object(obj);
+    }
+    Value::Object(obj)
+}
+
 /// Write a single newline-delimited JSON response line to the client socket.
 fn write_line(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
     let mut out = serde_json::to_vec(value).unwrap_or_default();
@@ -363,12 +979,82 @@ fn write_line(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
     stream.flush()
 }
 
+/// Forward one command to the extension and block until its response or timeout.
+/// Returns (req_id, Some(response)) or (req_id, None) on timeout. ``on_registered``
+/// runs after the request id is registered but before write_message, so callers
+/// can audit "allow" with the generated id before the action is forwarded. Used
+/// for normal forwards and host-internal lookups (e.g. __tabOrigin).
+fn forward_to_extension(
+    mut cmd: Value,
+    pending: &Pending,
+    stdout: &Arc<Mutex<io::Stdout>>,
+    logger: &Arc<Logger>,
+    resp_timeout: Duration,
+    on_registered: impl FnOnce(&str),
+) -> (String, Option<Value>) {
+    let req_id = uuid::Uuid::new_v4().to_string();
+    if let Value::Object(map) = &mut cmd {
+        map.insert("id".to_string(), Value::String(req_id.clone()));
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    if let Ok(mut p) = pending.lock() {
+        p.insert(req_id.clone(), tx);
+    }
+    on_registered(&req_id);
+    write_message(stdout, logger, &cmd);
+    match rx.recv_timeout(resp_timeout) {
+        Ok(response) => (req_id, Some(response)),
+        Err(_) => {
+            if let Ok(mut p) = pending.lock() {
+                p.remove(&req_id);
+            }
+            (req_id, None)
+        }
+    }
+}
+
+/// Resolve each needed tabId key ("" = active tab) to its live origin via the
+/// reserved __tabOrigin extension action. A failed/timed-out/blank lookup maps
+/// to None, which is fail-closed under an origin-constraining policy.
+fn resolve_origins(
+    needed: &std::collections::BTreeSet<String>,
+    pending: &Pending,
+    stdout: &Arc<Mutex<io::Stdout>>,
+    logger: &Arc<Logger>,
+    resp_timeout: Duration,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    let mut origins = std::collections::BTreeMap::new();
+    for key in needed {
+        let payload = if key.is_empty() {
+            json!({})
+        } else if let Ok(n) = key.parse::<i64>() {
+            json!({ "tabId": n })
+        } else {
+            json!({})
+        };
+        let cmd = json!({ "action": "__tabOrigin", "payload": payload });
+        let (_, resp) = forward_to_extension(cmd, pending, stdout, logger, resp_timeout, |_| {});
+        // Prefer the full tab url over origin: JS URL.origin strips explicit
+        // default ports, but normalize_url_targets() preserves them.
+        let origin = resp
+            .as_ref()
+            .filter(|r| r.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
+            .and_then(|r| r.get("result"))
+            .and_then(|res| res.get("url").or_else(|| res.get("origin")))
+            .and_then(|o| o.as_str())
+            .map(|s| s.to_string());
+        origins.insert(key.clone(), origin);
+    }
+    origins
+}
+
 fn handle_socket_client(
     mut stream: TcpStream,
     host_dir: &Path,
     tokens: &Tokens,
     pending: &Pending,
     lease: &LeaseState,
+    policy: &Policy,
     stdout: &Arc<Mutex<io::Stdout>>,
     logger: &Arc<Logger>,
 ) {
@@ -433,36 +1119,81 @@ fn handle_socket_client(
         let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
         let payload = cmd.get("payload").cloned();
 
+        // Reserved host-internal actions (e.g. __tabOrigin) are never reachable
+        // from socket clients; reject as unknown so the internal surface cannot
+        // be driven or probed externally.
+        if reserved_action(&action) {
+            log_warn(logger, &format!("Rejected reserved action from client: {}", action));
+            let policy_value = current_policy(policy, host_dir, logger);
+            let cp = policy_for_client(&policy_value, &client_name);
+            let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
+            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("unknown action: {}", action)}));
+            continue;
+        }
+
         // Lease verbs are answered host-side with no extension round-trip.
         if let Some(resp) = handle_lease_action(&action, payload.as_ref(), &client_name, lease) {
+            let policy_value = current_policy(policy, host_dir, logger);
+            let cp = policy_for_client(&policy_value, &client_name);
+            let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            let success = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let decision = if success { "lease_allow" } else { "lease_deny" };
+            let reason = resp.get("error").and_then(|v| v.as_str());
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], decision, reason, None);
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
             continue;
         }
 
-        // A live lease held by another client blocks every other action.
-        if let Some(blocked) = lease_gate(&client_name, lease) {
-            if write_line(&mut stream, &blocked).is_err() {
+        let policy_value = current_policy(policy, host_dir, logger);
+
+        // policyCheck is host-side: report what the policy would decide for a
+        // target action/payload without forwarding it to the extension.
+        if action == "policyCheck" {
+            let pc = payload.unwrap_or(json!({}));
+            let target_action = pc.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            let target_payload = pc.get("payload");
+            let no_origins = std::collections::BTreeMap::new();
+            let (allowed, reason, confirm, redact_enabled, audit_enabled, targets) = evaluate_policy(
+                &policy_value, &client_name, target_action, target_payload, &no_origins);
+            // Without forwarding, the host cannot see the live tab origin, so for
+            // an origin-constrained policy a tab-scoped action's verdict is
+            // provisional: report originDependent so callers don't trust an
+            // "allowed" that origin policy may still deny.
+            let origin_dependent = !tab_ids_needed(target_action, target_payload).is_empty()
+                && policy_constrains_origins(&policy_value, &client_name);
+            let resp = json!({"success": true, "result": {
+                "allowed": allowed,
+                "reason": reason,
+                "confirmationRequired": confirm,
+                "redact": redact_enabled,
+                "audit": audit_enabled,
+                "originDependent": origin_dependent,
+            }});
+            audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
+            if write_line(&mut stream, &resp).is_err() {
                 return;
             }
             continue;
         }
 
-        let req_id = uuid::Uuid::new_v4().to_string();
-        if let Value::Object(map) = &mut cmd {
-            map.insert("id".to_string(), Value::String(req_id.clone()));
+        let empty_origins = std::collections::BTreeMap::new();
+
+        // Phase 1: action-level and payload-target checks needing no extension
+        // round-trip. These run before the lease gate, preserving prior
+        // precedence (policy denial wins over a lease for payload targets).
+        let (allowed, _reason, _confirm, redact_enabled, audit_enabled, targets) =
+            evaluate_policy(&policy_value, &client_name, &action, payload.as_ref(), &empty_origins);
+        if !allowed {
+            let reason = _reason.unwrap_or_default();
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
+            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason)}));
+            continue;
         }
 
-        let (tx, rx) = std::sync::mpsc::channel::<Value>();
-        if let Ok(mut p) = pending.lock() {
-            p.insert(req_id.clone(), tx);
-        }
-
-        // Send to extension, then block this connection until its response.
-        // Waits and human-handoff carry a payload timeoutMs that may exceed the
-        // idle timeout; cover that window (plus headroom) so the host does not
-        // give up before the extension legitimately finishes.
+        // Cover long waits/human-handoff that carry a payload timeoutMs.
         let resp_timeout = payload
             .as_ref()
             .and_then(|p| p.get("timeoutMs"))
@@ -470,21 +1201,99 @@ fn handle_socket_client(
             .filter(|ms| *ms > 0.0)
             .map(|ms| idle.max(Duration::from_millis(ms as u64 + 30000)))
             .unwrap_or(idle);
-        write_message(stdout, logger, &cmd);
-        match rx.recv_timeout(resp_timeout) {
-            Ok(response) => {
+
+        // Phase 2: tab-origin policy for tab-scoped actions. The live origin
+        // comes from a host-internal __tabOrigin lookup, so the lease gate runs
+        // first (a non-owner must trigger no extension round-trip), then
+        // origin-aware re-evaluation runs before the confirm check so a denied
+        // origin wins over a confirmation requirement.
+        let needed = if policy_constrains_origins(&policy_value, &client_name) {
+            tab_ids_needed(&action, payload.as_ref())
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let (confirm, targets) = if !needed.is_empty() {
+            if let Some(blocked) = lease_gate(&client_name, lease) {
+                let reason = blocked.get("error").and_then(|v| v.as_str());
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
+                if write_line(&mut stream, &blocked).is_err() {
+                    return;
+                }
+                continue;
+            }
+            let origins = resolve_origins(&needed, pending, stdout, logger, resp_timeout);
+            // Fail closed when any needed tab resolves to no usable origin
+            // target (lookup failure, no such tab, opaque origin): under an
+            // origin-constraining policy such a request must not proceed.
+            if needed.iter().any(|k| origin_targets(origins.get(k).and_then(|o| o.as_deref())).is_empty()) {
+                let mut t = targets.clone();
+                t.push("<unresolved-origin>".to_string());
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &t, "deny", Some("tab origin unresolved"), None);
+                let _ = write_line(&mut stream, &json!({"success": false, "error": "policy denied: tab origin unresolved"}));
+                continue;
+            }
+            let (allowed, reason, confirm, _, _, targets) =
+                evaluate_policy(&policy_value, &client_name, &action, payload.as_ref(), &origins);
+            if !allowed {
+                let reason = reason.unwrap_or_default();
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
+                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason)}));
+                continue;
+            }
+            (confirm, targets)
+        } else {
+            (_confirm, targets)
+        };
+
+        if confirm {
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_required", None, None);
+            let _ = write_line(&mut stream, &json!({
+                "success": false, "error": "confirmation required",
+                "confirmationRequired": true, "action": action
+            }));
+            continue;
+        }
+
+        // A live lease held by another client blocks every other action.
+        if let Some(blocked) = lease_gate(&client_name, lease) {
+            let reason = blocked.get("error").and_then(|v| v.as_str());
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
+            if write_line(&mut stream, &blocked).is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Audit "allow" with the generated id before the action is forwarded.
+        let redact_patterns = policy_for_client(&policy_value, &client_name)
+            .get("redactPatterns").cloned();
+        let (req_id, response) = {
+            let h = host_dir;
+            let l = logger;
+            let ce = client_name.clone();
+            let ac = action.clone();
+            let tg = targets.clone();
+            forward_to_extension(cmd, pending, stdout, logger, resp_timeout, |rid| {
+                audit(h, l, audit_enabled, &ce, &ac, &tg, "allow", None, Some(rid));
+            })
+        };
+        match response {
+            Some(response) => {
+                let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ext_decision = if success { "extension_success" } else { "extension_error" };
+                let reason = response.get("error").and_then(|v| v.as_str());
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, ext_decision, reason, Some(&req_id));
+                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref());
                 if write_line(&mut stream, &response).is_err() {
                     return;
                 }
             }
-            Err(_) => {
+            None => {
                 log_error(
                     logger,
                     &format!("Timed out waiting for extension response to {}.", req_id),
                 );
-                if let Ok(mut p) = pending.lock() {
-                    p.remove(&req_id);
-                }
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "extension_error", Some("extension response timeout"), Some(&req_id));
                 let _ = write_line(
                     &mut stream,
                     &json!({"success": false, "error": "extension response timeout"}),
@@ -500,6 +1309,7 @@ fn socket_server_loop(
     tokens: Tokens,
     pending: Pending,
     lease: LeaseState,
+    policy: Policy,
     stdout: Arc<Mutex<io::Stdout>>,
     logger: Arc<Logger>,
 ) {
@@ -551,10 +1361,11 @@ fn socket_server_loop(
                 let tokens = Arc::clone(&tokens);
                 let pending = Arc::clone(&pending);
                 let lease = Arc::clone(&lease);
+                let policy = Arc::clone(&policy);
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &stdout, &logger);
+                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &policy, &stdout, &logger);
                 });
             }
             Err(e) => {
@@ -582,16 +1393,18 @@ fn main() {
         owner: None,
         expires_at: None,
     }));
+    let policy: Policy = Arc::new(RwLock::new(build_policy_registry(&host_dir, &logger)));
 
     {
         let host_dir = host_dir.clone();
         let tokens = Arc::clone(&tokens);
         let pending = Arc::clone(&pending);
         let lease = Arc::clone(&lease);
+        let policy = Arc::clone(&policy);
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(host_dir, tokens, pending, lease, stdout, logger);
+            socket_server_loop(host_dir, tokens, pending, lease, policy, stdout, logger);
         });
     }
 

@@ -240,6 +240,16 @@ def browser_action(action: str, payload: Optional[dict] = None) -> str:
     return _text(call(action, payload or {}))
 
 
+def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
+    """Ask the host what its policy would decide for ``action``/``payload``.
+
+    Reports allowed/reason/confirmationRequired/redact/audit without forwarding
+    the action to the extension. Policy is enforced in the native host, not by
+    MCP annotations, so this reflects the real security boundary.
+    """
+    return _text(call("policyCheck", {"action": action, "payload": payload or {}}))
+
+
 def browser_lease(ttl_ms: int = 300000) -> str:
     """Acquire exclusive cooperative control of the shared real-Chrome profile.
 
@@ -315,6 +325,7 @@ _TOOLS = [
     (browser_screenshot, False, False),
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
+    (browser_policy_check, False, False),
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
     (browser_navigate, True, False),
