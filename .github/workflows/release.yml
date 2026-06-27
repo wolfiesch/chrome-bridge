@@ -38,7 +38,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
           python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/chrome-bridge-noop.json
-          python3 benchmark_harness.py compare --input /tmp/chrome-bridge-noop.json --output /tmp/chrome-bridge-report.md
+          python3 benchmark_harness.py compare --input /tmp/chrome-bridge-noop.json --output /tmp/chrome-bridge-report.md --junit-output /tmp/chrome-bridge-benchmark.xml --github-step-summary "$GITHUB_STEP_SUMMARY"
           grep -q "Claim Discipline" /tmp/chrome-bridge-report.md
       - name: Package release artifacts
         run: python3 scripts/package_release.py --version ${{ github.ref_name }} --dist /tmp/chrome-bridge-release-dist

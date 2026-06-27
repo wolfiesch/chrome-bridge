@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from xml.etree import ElementTree
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLIENT = SCRIPT_DIR / "test_client.py"
@@ -22,7 +23,7 @@ COMPARISON_METADATA = {
         "chrome-native-bridge": {
             "name": "Chrome Native Bridge",
             "strengths": "Runs in real-profile Chrome using extension/native host, allows CDP-backed interactions, supports storage, geolocation, performance metrics, and console/network monitoring.",
-            "limits": "No isolated contexts/profiles, no native trace/video capture, and limited first-party test-runner integrations.",
+            "limits": "No isolated contexts/profiles, no native trace/video capture, and limited interactive policy approvals.",
             "capability_status": "pass",
             "scores": {"speed": 4, "capability": 4, "authReuse": 5, "ergonomics": 3},
         },
@@ -64,30 +65,28 @@ COMPARISON_METADATA = {
     },
     "gaps": [
         {
+            "id": "BENCH-001",
             "gap": "isolated contexts and profiles",
             "description": "Launch isolated/ephemeral browser profiles within one benchmark run while preserving the real-profile mode.",
             "surface": "benchmark_harness.py adapter lifecycle and extension/background.js session model",
             "acceptance": "A benchmark run can create two isolated sessions with separate cookies and report both as pass.",
         },
         {
+            "id": "BENCH-002",
             "gap": "multi-browser support",
             "description": "Add non-Chrome browser targets or explicit parity adapters for Firefox/WebKit.",
             "surface": "benchmark_harness.py adapter registry",
             "acceptance": "The scorecard includes measured Firefox or WebKit timings for navigate, click, fill, screenshot, and storage.",
         },
         {
+            "id": "BENCH-003",
             "gap": "trace and video recording",
             "description": "Capture replayable traces or video artifacts for browser operations.",
             "surface": "extension/background.js debugger commands and benchmark_harness.py artifact fields",
             "acceptance": "A live Chrome Bridge run writes a trace or video artifact path and the report links it without exposing private content.",
         },
         {
-            "gap": "first-party ecosystem integrations",
-            "description": "Expose benchmark output in test-runner and CI-friendly formats.",
-            "surface": "benchmark_harness.py report exporters",
-            "acceptance": "The harness emits JSON, Markdown, and JUnit or GitHub Step Summary output for the same run.",
-        },
-        {
+            "id": "BENCH-005",
             "gap": "interactive destructive approval",
             "description": "Provide an interactive approve/deny path for actions the policy marks requireConfirmation, instead of failing closed with confirmationRequired.",
             "surface": "bridge.py, host-rs/src/main.rs, mcp/chrome_bridge_mcp/server.py",
@@ -172,6 +171,68 @@ FIXTURE_PAGE = b"""<!doctype html>
 
 class UnsupportedAdapter(RuntimeError):
     pass
+
+class BrowserRssLimitExceeded(RuntimeError):
+    pass
+
+BROWSER_PROCESS_MARKERS = (
+    "Google Chrome for Testing.app/",
+    "chrome-mac-arm64/Google Chrome for Testing",
+    "chrome-headless-shell",
+    "Chromium.app/",
+)
+DEFAULT_BROWSER_RSS_LIMIT_MB = 4096
+
+
+def browser_rss_mb_from_ps(ps_output):
+    total_kb = 0
+    for line in ps_output.splitlines():
+        if not any(marker in line for marker in BROWSER_PROCESS_MARKERS):
+            continue
+        fields = line.split(None, 2)
+        if len(fields) < 2 or not fields[1].isdigit():
+            continue
+        total_kb += int(fields[1])
+    return (total_kb + 1023) // 1024
+
+
+def current_browser_rss_mb():
+    override = os.environ.get("CHROME_BRIDGE_BENCHMARK_PS_OUTPUT")
+    if override is not None:
+        return browser_rss_mb_from_ps(override)
+    proc = subprocess.run(
+        ["ps", "-axo", "pid,rss,args"],
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"could not sample browser RSS: {proc.stderr.strip() or proc.stdout.strip()}")
+    return browser_rss_mb_from_ps(proc.stdout)
+
+
+def enforce_browser_rss_limit(limit_mb, ps_output=None):
+    if limit_mb <= 0:
+        return
+    rss_mb = browser_rss_mb_from_ps(ps_output) if ps_output is not None else current_browser_rss_mb()
+    if rss_mb > limit_mb:
+        raise BrowserRssLimitExceeded(f"browser RSS {rss_mb} MB exceeds limit {limit_mb} MB")
+
+
+def chrome_for_testing_executable():
+    candidates = [
+        Path("/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
+    ]
+    for root in [
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+        Path.home() / ".cache" / "puppeteer" / "chrome",
+    ]:
+        if root.exists():
+            candidates.extend(sorted(root.glob("**/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 class FixtureHandler(http.server.BaseHTTPRequestHandler):
@@ -688,6 +749,7 @@ def run_playwright_iteration(results, state, base_url):
     page.on("request", lambda req: requests.append(req.url))
     try:
         for op in OPERATIONS:
+            enforce_browser_rss_limit(state.get("browser_rss_limit_mb", DEFAULT_BROWSER_RSS_LIMIT_MB))
             t0 = time.perf_counter()
             try:
                 if op == "ping":
@@ -803,12 +865,14 @@ def run_playwright(args, results, base_url):
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
-            state = {"browser": browser}
+            state = {"browser": browser, "browser_rss_limit_mb": args.browser_rss_limit_mb}
             try:
                 for _ in range(args.iterations):
                     run_playwright_iteration(results, state, base_url)
             finally:
                 browser.close()
+    except BrowserRssLimitExceeded:
+        raise
     except Exception as exc:
         mark_all(results, "unsupported", f"Playwright browser launch failed: {exc}")
 
@@ -939,15 +1003,33 @@ def run_puppeteer_runner(args, results, base_url, runner_name, temp_prefix):
         root = npm_root()
         if root:
             env["NODE_PATH"] = root if not env.get("NODE_PATH") else f"{root}{os.pathsep}{env['NODE_PATH']}"
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["node", str(script_path), base_url, str(args.iterations), str(output_path), json.dumps(OPERATIONS)],
             text=True,
-            capture_output=True,
-            timeout=max(30, args.iterations * 20),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
         )
+        deadline = time.monotonic() + max(30, args.iterations * 20)
+        while proc.poll() is None:
+            if time.monotonic() > deadline:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(proc.args, max(30, args.iterations * 20), output=stdout, stderr=stderr)
+            try:
+                enforce_browser_rss_limit(args.browser_rss_limit_mb)
+            except BrowserRssLimitExceeded:
+                proc.terminate()
+                with contextlib_suppress():
+                    proc.wait(timeout=5)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                raise
+            time.sleep(0.5)
+        proc_stdout, proc_stderr = proc.communicate()
         if proc.returncode != 0:
-            mark_all(results, "unsupported", f"{runner_name} runner failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            mark_all(results, "unsupported", f"{runner_name} runner failed: {proc_stderr.strip() or proc_stdout.strip()}")
             return
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         for op in OPERATIONS:
@@ -1129,16 +1211,23 @@ async def _run_chrome_devtools_mcp_async(args, results, base_url):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "chrome-devtools-mcp@1.2.0", "--headless=true", "--isolated=true", "--channel=stable"],
-    )
+    base_args = ["-y", "chrome-devtools-mcp@1.2.0", "--headless=true", "--isolated=true"]
+    if args.browser_rss_limit_mb > 0:
+        # Pin to Chrome for Testing so the RSS guard counts this adapter's browser.
+        executable_path = chrome_for_testing_executable()
+        if not executable_path:
+            raise UnsupportedAdapter("Chrome for Testing executable is not available for guarded Chrome DevTools MCP run")
+        launch_args = base_args + ["--executablePath", executable_path]
+    else:
+        launch_args = base_args + ["--channel=stable"]
+    server_params = StdioServerParameters(command="npx", args=launch_args)
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             context = {"page_opened": False}
             for _ in range(args.iterations):
                 for op in OPERATIONS:
+                    enforce_browser_rss_limit(args.browser_rss_limit_mb)
                     t0 = time.perf_counter()
                     try:
                         await _run_chrome_devtools_mcp_op(session, context, op, base_url)
@@ -1166,6 +1255,8 @@ def run_chrome_devtools_mcp(args, results, base_url):
         return
     try:
         asyncio.run(_run_chrome_devtools_mcp_async(args, results, base_url))
+    except BrowserRssLimitExceeded:
+        raise
     except Exception as exc:
         mark_all(results, "unsupported", f"Chrome DevTools MCP server launch failed: {exc}")
 
@@ -1214,6 +1305,8 @@ def handle_run(args):
         server, base_url = start_fixture_server()
     results = initial_results()
     try:
+        if args.iterations > 0 and args.adapter in {"playwright", "puppeteer", "chrome-devtools-mcp"}:
+            enforce_browser_rss_limit(args.browser_rss_limit_mb)
         if args.adapter == "noop":
             for _ in range(args.iterations):
                 run_noop(results)
@@ -1224,8 +1317,12 @@ def handle_run(args):
             run_playwright(args, results, base_url)
         elif args.adapter == "puppeteer":
             run_puppeteer(args, results, base_url)
+            if args.iterations > 0:
+                enforce_browser_rss_limit(args.browser_rss_limit_mb)
         elif args.adapter == "chrome-devtools-mcp":
             run_chrome_devtools_mcp(args, results, base_url)
+            if args.iterations > 0:
+                enforce_browser_rss_limit(args.browser_rss_limit_mb)
         else:
             raise ValueError(f"Unknown adapter: {args.adapter}")
         output_data = finish_results(args.adapter, args.iterations, results)
@@ -1283,6 +1380,49 @@ def _scorecard_for_inputs(inputs):
         speed = score_from_median(operations)
         scorecard[key] = {"speed": speed, "capability": capability, "authReuse": "", "ergonomics": "", "overall": "", "source": "measured"}
     return scorecard
+
+def write_junit_report(path, inputs):
+    suite = ElementTree.Element("testsuite", {"name": "browser-automation-benchmark"})
+    tests = 0
+    failures = 0
+    skipped = 0
+    for adapter, data in inputs.items():
+        for op in data.get("operations", []):
+            tests += 1
+            name = f"{adapter}.{op.get('name', 'unknown')}"
+            attrs = {
+                "name": name,
+                "classname": adapter,
+                "time": f"{float(op.get('medianMs') or 0) / 1000:.6f}",
+            }
+            testcase = ElementTree.SubElement(suite, "testcase", attrs)
+            status = op.get("capability")
+            message = "; ".join(str(error) for error in op.get("errors", []) if error)
+            if status == "fail":
+                failures += 1
+                failure = ElementTree.SubElement(testcase, "failure", {"message": message or "benchmark operation failed"})
+                failure.text = message
+            elif status in {"unsupported", "manual"}:
+                skipped += 1
+                skipped_node = ElementTree.SubElement(testcase, "skipped", {"message": message or str(status)})
+                skipped_node.text = message or str(status)
+    suite.set("tests", str(tests))
+    suite.set("failures", str(failures))
+    suite.set("skipped", str(skipped))
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ElementTree.ElementTree(suite).write(output_path, encoding="unicode", xml_declaration=True)
+
+
+def write_github_step_summary(path, report_lines):
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_lines = list(report_lines)
+    if summary_lines and summary_lines[0].startswith("# "):
+        summary_lines[0] = "## Browser Automation Benchmark"
+    with output_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(summary_lines) + "\n")
+
 
 
 def handle_compare(args):
@@ -1358,7 +1498,8 @@ def handle_compare(args):
     primary_adapter = adapters[0] if adapters else "unknown"
     for idx, gap_item in enumerate(gaps, start=1):
         title = gap_item.get("gap", "gap").capitalize()
-        lines.append(f"### BENCH-{idx:03d}: {title}")
+        ticket_id = gap_item.get("id") or f"BENCH-{idx:03d}"
+        lines.append(f"### {ticket_id}: {title}")
         lines.append(f"- Benchmark signal: `{primary_adapter}` report currently tracks this as a gap against stronger surfaces.")
         lines.append(f"- Acceptance target: {gap_item.get('acceptance', 'Measured pass in benchmark harness.')}")
         lines.append(f"- Likely surface: {gap_item.get('surface', 'benchmark_harness.py')}")
@@ -1366,6 +1507,12 @@ def handle_compare(args):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
+    if getattr(args, "junit_output", None):
+        write_junit_report(args.junit_output, inputs)
+        print(f"Benchmark JUnit report successfully written to {args.junit_output}")
+    if getattr(args, "github_step_summary", None):
+        write_github_step_summary(args.github_step_summary, lines)
+        print(f"Benchmark GitHub step summary successfully written to {args.github_step_summary}")
     print(f"Benchmark report successfully written to {args.output}")
 
 
@@ -1382,9 +1529,17 @@ def main():
     run_parser.add_argument("--iterations", type=int, default=2, help="Number of benchmark iterations")
     run_parser.add_argument("--output", required=True, help="Path to write JSON results")
     run_parser.add_argument("--base-url", help="Base URL of target page for live benchmarking")
+    run_parser.add_argument(
+        "--browser-rss-limit-mb",
+        type=int,
+        default=DEFAULT_BROWSER_RSS_LIMIT_MB,
+        help="Abort live adapter runs when matching browser process RSS exceeds this many MB; use 0 to disable",
+    )
     compare_parser = subparsers.add_parser("compare", help="Compare benchmark results and generate report")
     compare_parser.add_argument("--input", action="append", required=True, help="Path to JSON results file; may be provided multiple times")
     compare_parser.add_argument("--output", required=True, help="Path to write markdown report")
+    compare_parser.add_argument("--junit-output", help="Optional path to write a JUnit XML report")
+    compare_parser.add_argument("--github-step-summary", help="Optional path to write a GitHub Step Summary markdown report")
     args = parser.parse_args()
     if args.command == "run":
         handle_run(args)
@@ -1393,4 +1548,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrowserRssLimitExceeded as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

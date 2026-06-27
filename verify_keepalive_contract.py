@@ -56,6 +56,12 @@ def run_against(label, cmd, port):
     env["BRIDGE_PORT"] = str(port)
     env["BRIDGE_TOKEN_FILE"] = token_file
     env["BRIDGE_LOG_FILE"] = f"/tmp/chrome-bridge-keepalive-{label}.log"
+    policy_file = "/tmp/chrome-bridge-keepalive-policy.json"
+    with open(policy_file, "w") as f:
+        json.dump({"default": {"allowedActions": ["*"], "allowedOrigins": ["*"],
+                               "deniedActions": [], "deniedOrigins": [],
+                               "requireConfirmation": [], "redact": True, "audit": False}}, f)
+    env["BRIDGE_POLICY_FILE"] = policy_file
 
     proc = subprocess.Popen(
         cmd,
@@ -88,12 +94,14 @@ def run_against(label, cmd, port):
                        f"wrong/again response for {action}: {resp}")
 
         # Case 2: two requests COALESCED into one send() (newline-delimited).
+        # Use actions that do not require a resolved browser target so the
+        # transport/coalescing path is exercised without live-tab policy checks.
         coalesced = (
-            json.dumps({"action": "navigate", "payload": {}, "token": TOKEN}) + "\n" +
+            json.dumps({"action": "ping", "payload": {}, "token": TOKEN}) + "\n" +
             json.dumps({"action": "click", "payload": {}, "token": TOKEN}) + "\n"
         ).encode()
         sock.sendall(coalesced)
-        for action in ("navigate", "click"):
+        for action in ("ping", "click"):
             line, buf = recv_line(sock, buf)
             expect(line is not None, f"no response for coalesced {action}")
             if line:

@@ -460,12 +460,12 @@ python3 benchmark_harness.py run --adapter chrome-devtools-mcp --iterations 5 --
 python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --base-url http://127.0.0.1:PORT/ --output /tmp/results.json
 ```
 
-Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks. Shadow DOM and iframe user-action parity are measured as explicit capability rows; Chrome Bridge currently reports them as unsupported until a later locator/iframe phase implements first-class support.
+Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks. Shadow DOM, iframe, and semantic locator user-action parity are measured as explicit capability rows.
 
-Generate the Markdown report:
+Generate the Markdown report, with optional CI-friendly JUnit XML and GitHub Step Summary outputs:
 
 ```bash
-python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md
+python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md --junit-output /tmp/benchmark.xml --github-step-summary /tmp/summary.md
 python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --input /tmp/chrome-devtools-results.json --output /tmp/head-to-head.md
 ```
 
