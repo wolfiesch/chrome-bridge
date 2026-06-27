@@ -218,6 +218,32 @@ def main():
         require("## Claim Discipline" in text, "claim discipline section missing")
         require("| Tool | Speed | Capability | Auth Reuse | Ergonomics | Overall |" in text, "scorecard table missing")
 
+        # cleanup: dry-run must be safe (no --kill) and reachable via argv.
+        proc = run("cleanup")
+        require(proc.returncode == 0, f"cleanup dry-run must succeed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        require("Stale browser process trees" in proc.stdout, "cleanup must report process-tree section")
+        require("Orphaned temp profile directories" in proc.stdout, "cleanup must report profile section")
+        require("Dry-run only" in proc.stdout, "cleanup without --kill must stay dry-run")
+
+        # cleanup: stale-tree detection groups benchmark browsers, skips own pgid and user Chrome.
+        own_pgid = os.getpgrp()
+        sample_rows = [
+            (101, 1, 9000, 13000, "browser-gateway start"),
+            (102, 101, 9000, 8000, ".../chrome-headless-shell-mac-arm64/chrome-headless-shell --headless"),
+            (200, 1, 9100, 500000, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            (300, 1, own_pgid, 7000, ".../chrome-headless-shell --type=renderer"),
+        ]
+        stale = benchmark_harness.find_stale_browser_trees(sample_rows)
+        require(9000 in stale, "cleanup must flag the benchmark headless-shell process group")
+        require(9100 not in stale, "cleanup must not flag the user's normal Google Chrome")
+        require(own_pgid not in stale, "cleanup must never target its own process group")
+
+        # cleanup: live --user-data-dir profiles are protected from deletion.
+        live = benchmark_harness._live_profile_paths(
+            [(401, 1, 9200, 6000, "chrome-headless-shell --user-data-dir=/tmp/live-profile-xyz")]
+        )
+        require("/tmp/live-profile-xyz" in live, "cleanup must detect live temp profile paths")
+
     print("Benchmark harness contract OK")
 
 

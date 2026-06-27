@@ -5,6 +5,7 @@ import json
 import re
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1516,6 +1517,139 @@ def handle_compare(args):
     print(f"Benchmark report successfully written to {args.output}")
 
 
+def _ps_full():
+    proc = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,pgid=,rss=,args="],
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"could not list processes: {proc.stderr.strip() or proc.stdout.strip()}")
+    rows = []
+    for line in proc.stdout.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 5 or not fields[3].isdigit():
+            continue
+        pid, ppid, pgid, rss, args = fields
+        rows.append((int(pid), int(ppid), int(pgid), int(rss), args))
+    return rows
+
+
+def find_stale_browser_trees(rows):
+    """Return process group ids whose members are benchmark-launched browsers.
+
+    Matches headless-shell / Chrome-for-Testing browser processes and the
+    browser-gateway parents that supervise them, grouped by process group so a
+    whole tree is recycled together. The user's normal Google Chrome profile is
+    never matched because it is not part of BROWSER_PROCESS_MARKERS.
+    """
+    own_pgid = os.getpgrp()
+    groups = {}
+    for pid, ppid, pgid, rss, args in rows:
+        groups.setdefault(pgid, []).append((pid, ppid, rss, args))
+    stale = {}
+    for pgid, members in groups.items():
+        if pgid == own_pgid:
+            continue
+        # Require at least one benchmark-launched browser process in the group;
+        # the whole tree (including any browser-gateway parent) is then recycled
+        # together. The user's normal Chrome is never matched because it is not
+        # in BROWSER_PROCESS_MARKERS.
+        has_browser = any(
+            any(marker in args for marker in BROWSER_PROCESS_MARKERS)
+            for _, _, _, args in members
+        )
+        if has_browser:
+            stale[pgid] = members
+    return stale
+
+
+def _terminate(pid, sig):
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        print(f"permission denied for pid {pid}: {exc}", file=sys.stderr)
+        return False
+
+
+def _live_profile_paths(rows):
+    """Temp profile dirs still referenced by a live process command line."""
+    live = set()
+    for _, _, _, _, args in rows:
+        match = re.search(r"--user-data-dir=(\S+)", args)
+        if match:
+            live.add(match.group(1))
+    return live
+
+
+def find_orphan_profiles():
+    """Leftover puppeteer temp profile dirs under the repo working tree."""
+    return sorted(p for p in SCRIPT_DIR.glob(".chrome-bridge-puppeteer-*") if p.is_dir())
+
+
+def handle_cleanup(args):
+    rows = _ps_full()
+
+    # --- Section 1: stale browser process trees ---
+    stale = find_stale_browser_trees(rows)
+    print("== Stale browser process trees ==")
+    if not stale:
+        print("  none")
+    else:
+        for pgid in sorted(stale):
+            total_mb = sum(rss for _, _, rss, _ in stale[pgid]) // 1024
+            print(f"  pgid={pgid} processes={len(stale[pgid])} rss={total_mb}MB")
+            for pid, ppid, rss, cmd in sorted(stale[pgid]):
+                print(f"    pid={pid} ppid={ppid} rss={rss // 1024}MB {cmd[:100]}")
+
+    # --- Section 2: orphaned temp profile directories ---
+    live_profiles = _live_profile_paths(rows)
+    orphans = [p for p in find_orphan_profiles() if str(p) not in live_profiles]
+    skipped = [p for p in find_orphan_profiles() if str(p) in live_profiles]
+    print("== Orphaned temp profile directories ==")
+    if not orphans:
+        print("  none")
+    else:
+        for path in orphans:
+            print(f"  {path}")
+    for path in skipped:
+        print(f"  (skipped, still in use) {path}")
+
+    if not args.kill:
+        print("Dry-run only. Re-run with --kill to recycle trees and delete orphan profiles.")
+        return
+
+    # Recycle process trees: SIGTERM the whole group, then SIGKILL survivors.
+    target_pids = [pid for members in stale.values() for pid, _, _, _ in members]
+    for pid in target_pids:
+        _terminate(pid, signal.SIGTERM)
+    if target_pids:
+        time.sleep(max(args.wait, 0.0))
+        remaining = {pid for pid, *_ in _ps_full()} & set(target_pids)
+        for pid in sorted(remaining):
+            _terminate(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        remaining = {pid for pid, *_ in _ps_full()} & set(target_pids)
+        recycled = [pid for pid in target_pids if pid not in remaining]
+        print(f"Recycled {len(recycled)} process(es): {', '.join(map(str, recycled)) or 'none'}")
+        if remaining:
+            print(f"Still running: {', '.join(map(str, sorted(remaining)))}", file=sys.stderr)
+
+    # Delete orphan profile dirs (re-checking live args right before removal).
+    fresh_live = _live_profile_paths(_ps_full())
+    deleted = 0
+    for path in orphans:
+        if str(path) in fresh_live:
+            print(f"  (skipped, became active) {path}")
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        deleted += 1
+    print(f"Deleted {deleted} orphan profile director(ies).")
+
 def main():
     parser = argparse.ArgumentParser(description="Browser Automation Benchmark Harness")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1540,11 +1674,16 @@ def main():
     compare_parser.add_argument("--output", required=True, help="Path to write markdown report")
     compare_parser.add_argument("--junit-output", help="Optional path to write a JUnit XML report")
     compare_parser.add_argument("--github-step-summary", help="Optional path to write a GitHub Step Summary markdown report")
+    cleanup_parser = subparsers.add_parser("cleanup", help="Recycle stale benchmark browser trees and orphan temp profiles")
+    cleanup_parser.add_argument("--kill", action="store_true", help="Recycle process trees and delete orphan profiles. Omitted by default (dry-run).")
+    cleanup_parser.add_argument("--wait", type=float, default=3.0, help="Seconds to wait after SIGTERM before SIGKILL")
     args = parser.parse_args()
     if args.command == "run":
         handle_run(args)
     elif args.command == "compare":
         handle_compare(args)
+    elif args.command == "cleanup":
+        handle_cleanup(args)
 
 
 if __name__ == "__main__":
