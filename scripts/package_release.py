@@ -41,7 +41,7 @@ EXCLUDED_GLOBS = {
     ".bridge_tokens.*",
     ".env",
     ".env.*",
-    "bridge_policy.local.json",
+    "bridge_policy*.json",
     "bridge_token_*.txt",
     "com.automation.bridge*.json",
     "*.log",
@@ -53,6 +53,10 @@ EXCLUDED_GLOBS = {
     "*.token",
     "*.tokens",
     "*.policy",
+}
+
+ALWAYS_INCLUDE_PATHS = {
+    "bridge_policy.example.json",
 }
 
 
@@ -128,6 +132,8 @@ def should_exclude(path: Path, repo_root: Path, dist_dir: Path, patterns: dict[P
         return True
     if len(parts) >= 2 and parts[0] == "host-rs" and parts[1] == "target":
         return True
+    if relative.as_posix() in ALWAYS_INCLUDE_PATHS:
+        return False
     if any(part in EXCLUDED_NAMES for part in parts):
         return True
     if path.suffix in EXCLUDED_SUFFIXES:
