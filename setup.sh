@@ -122,6 +122,9 @@ case "$(uname -s)" in
     BASE="$HOME/Library/Application Support"
     HOST_DIRS=(
       "$BASE/Google/Chrome/NativeMessagingHosts"
+      "$BASE/ChromeForTesting/NativeMessagingHosts"
+      "$BASE/Google/ChromeForTesting/NativeMessagingHosts"
+      "$BASE/Google/Chrome for Testing/NativeMessagingHosts"
       "$BASE/Google/Chrome Beta/NativeMessagingHosts"
       "$BASE/Google/Chrome Canary/NativeMessagingHosts"
       "$BASE/Chromium/NativeMessagingHosts"

@@ -56,18 +56,44 @@ def run_setup(tmp, env):
 
 
 
+
+
+
+
+def chrome_for_testing_executables():
+    if sys.platform != "darwin":
+        return []
+    names = ("Google Chrome for Testing",)
+    roots = [
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+        Path.home() / ".cache" / "puppeteer" / "chrome",
+    ]
+    candidates = []
+    for root in roots:
+        for name in names:
+            candidates.extend(root.glob(f"**/{name}.app/Contents/MacOS/{name}"))
+    return [str(path) for path in candidates if path.exists()]
+
+
 def expected_manifest_paths(tmp):
     if sys.platform == "darwin":
         base = tmp / "home" / "Library" / "Application Support"
-        return {
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome": base / "Google" / "Chrome" / "NativeMessagingHosts" / "com.automation.bridge.json",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium": base / "Chromium" / "NativeMessagingHosts" / "com.automation.bridge.json",
-        }
+        cft_manifest = base / "ChromeForTesting" / "NativeMessagingHosts" / "com.automation.bridge.json"
+        paths = {executable: cft_manifest for executable in chrome_for_testing_executables()}
+        paths.update(
+            {
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing": cft_manifest,
+                "/Applications/Chromium.app/Contents/MacOS/Chromium": base / "Chromium" / "NativeMessagingHosts" / "com.automation.bridge.json",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome": base / "Google" / "Chrome" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            }
+        )
+        return paths
     if sys.platform.startswith("linux"):
         xdg = tmp / "xdg"
         return {
             "google-chrome": xdg / "google-chrome" / "NativeMessagingHosts" / "com.automation.bridge.json",
             "google-chrome-stable": xdg / "google-chrome" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            "google-chrome-beta": xdg / "google-chrome-beta" / "NativeMessagingHosts" / "com.automation.bridge.json",
             "chromium": xdg / "chromium" / "NativeMessagingHosts" / "com.automation.bridge.json",
             "chromium-browser": xdg / "chromium" / "NativeMessagingHosts" / "com.automation.bridge.json",
         }
@@ -79,6 +105,9 @@ def setup_created_manifest_paths(tmp):
         base = tmp / "home" / "Library" / "Application Support"
         return [
             base / "Google" / "Chrome" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            base / "ChromeForTesting" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            base / "Google" / "ChromeForTesting" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            base / "Google" / "Chrome for Testing" / "NativeMessagingHosts" / "com.automation.bridge.json",
             base / "Google" / "Chrome Beta" / "NativeMessagingHosts" / "com.automation.bridge.json",
             base / "Google" / "Chrome Canary" / "NativeMessagingHosts" / "com.automation.bridge.json",
             base / "Chromium" / "NativeMessagingHosts" / "com.automation.bridge.json",
@@ -118,6 +147,62 @@ def assert_manifest(path, launcher, extension_id):
         raise AssertionError(f"manifest {path} missing allowed origin {origin}")
 
 
+def real_macos_manifest_paths(browser_path):
+    if sys.platform != "darwin":
+        return []
+    base = Path.home() / "Library" / "Application Support"
+    if "Chrome for Testing" in browser_path:
+        return [
+            base / "ChromeForTesting" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            base / "Google" / "ChromeForTesting" / "NativeMessagingHosts" / "com.automation.bridge.json",
+            base / "Google" / "Chrome for Testing" / "NativeMessagingHosts" / "com.automation.bridge.json",
+        ]
+    if "Google Chrome Beta.app" in browser_path:
+        return [base / "Google" / "Chrome Beta" / "NativeMessagingHosts" / "com.automation.bridge.json"]
+    if "Google Chrome Canary.app" in browser_path:
+        return [base / "Google" / "Chrome Canary" / "NativeMessagingHosts" / "com.automation.bridge.json"]
+    if "Chromium.app" in browser_path:
+        return [base / "Chromium" / "NativeMessagingHosts" / "com.automation.bridge.json"]
+    if "Google Chrome.app" in browser_path:
+        return [base / "Google" / "Chrome" / "NativeMessagingHosts" / "com.automation.bridge.json"]
+    return []
+
+
+def install_temporary_real_manifest(browser_path, selected_manifest):
+    states = []
+    for target in real_macos_manifest_paths(browser_path):
+        backup = None
+        if target.exists():
+            stat = target.stat()
+            backup = (target.read_bytes(), stat.st_mode & 0o777)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(selected_manifest, target)
+        states.append((target, backup))
+    return states
+def restore_temporary_real_manifest(states):
+    if not states:
+        return
+    for target, backup in states:
+        if backup is None:
+            target.unlink(missing_ok=True)
+            continue
+        data, mode = backup
+        target.write_bytes(data)
+        target.chmod(mode)
+
+def install_profile_manifest(profile_dir, selected_manifest):
+    target = profile_dir / "NativeMessagingHosts" / "com.automation.bridge.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(selected_manifest, target)
+    return target
+
+
+
+
+
+
+
+
 def find_browser(candidates):
     for candidate, manifest in candidates.items():
         if sys.platform == "darwin":
@@ -128,6 +213,11 @@ def find_browser(candidates):
             if resolved:
                 return resolved, manifest
     return None, None
+
+
+
+
+
 
 
 def start_fixture(root):
@@ -203,6 +293,16 @@ def assert_policy_allowed(env):
         raise AssertionError(f"policyCheck getTabs was not allowed: {proc.stdout}")
 
 
+
+
+
+
+
+
+
+
+
+
 def terminate_browser(proc):
     if proc.poll() is not None:
         return
@@ -219,6 +319,7 @@ def main():
     browser = None
     fixture = None
     browser_stderr = None
+    real_manifest_state = None
     try:
         for name in ("home", "xdg", "state", "extension", "chrome-profile"):
             (tmp_path / name).mkdir(parents=True, exist_ok=True)
@@ -238,6 +339,7 @@ def main():
         if not selected_manifest.exists():
             print(f"ERROR: native host manifest missing for selected browser: {selected_manifest}", file=sys.stderr)
             return 1
+        real_manifest_state = install_temporary_real_manifest(browser_path, selected_manifest)
 
         fixture, url = start_fixture(tmp_path / "fixture")
         browser_env = env.copy()
@@ -284,6 +386,7 @@ def main():
         if fixture is not None:
             fixture.shutdown()
             fixture.server_close()
+        restore_temporary_real_manifest(real_manifest_state)
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 

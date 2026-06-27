@@ -46,14 +46,14 @@ def recv_line(sock):
         buffer += chunk
     return buffer.split(b"\n", 1)[0]
 
-def round_trip(proc, port, action, result_payload, label):
+def round_trip(proc, port, action, result_payload, label, payload=None):
     print(f"[TEST] --- {label} ---")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(('127.0.0.1', port))
     token_file = os.environ.get('BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
     with open(token_file) as f:
         token = f.read().strip()
-    sock.sendall((json.dumps({"action": action, "payload": {}, "token": token}) + "\n").encode('utf-8'))
+    sock.sendall((json.dumps({"action": action, "payload": payload or {}, "token": token}) + "\n").encode('utf-8'))
 
     # Wait for the host to forward exactly one new command.
     req_id = None
@@ -101,6 +101,10 @@ def main():
         f.write("verify-token\n")
     test_env['BRIDGE_TOKEN_FILE'] = token_fixture
     os.environ['BRIDGE_TOKEN_FILE'] = token_fixture
+    policy_fixture = "/tmp/chrome-bridge-verify-rust-policy.json"
+    with open(policy_fixture, "w", encoding="utf-8") as f:
+        json.dump({"default": {"allowedActions": ["*"], "allowedOrigins": ["*"], "deniedActions": [], "deniedOrigins": [], "requireConfirmation": [], "redact": True, "audit": True}}, f)
+    test_env['BRIDGE_POLICY_FILE'] = policy_fixture
     # The Rust host resolves defaults relative to its OWN exe dir
     # (host-rs/target/release/), so the log path MUST be set explicitly to
     # keep it out of the repo.
@@ -120,7 +124,7 @@ def main():
 
     # Case 2: large payload that exceeds a single recv() buffer (the framing bug).
     big = "x" * 500_000
-    round_trip(proc, 9225, "getCookies", big, "Case 2: 500KB payload")
+    round_trip(proc, 9225, "getCookies", big, "Case 2: 500KB payload", {"domain": "example.com"})
 
     # Case 3: a wrong token must be rejected without forwarding to the extension.
     print("[TEST] --- Case 3: invalid token rejected ---")

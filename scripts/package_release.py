@@ -41,7 +41,7 @@ EXCLUDED_GLOBS = {
     ".bridge_tokens.*",
     ".env",
     ".env.*",
-    "bridge_policy*.json",
+    "bridge_policy.local.json",
     "bridge_token_*.txt",
     "com.automation.bridge*.json",
     "*.log",

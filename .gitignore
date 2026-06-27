@@ -13,6 +13,8 @@ com.automation.bridge.json
 com.automation.bridge.rust.json
 # Generated Rust launcher (machine-specific absolute paths)
 bridge-host-launch.sh
+bridge-host-python-launch.sh
+bridge_policy.json
 
 # Logs and caches
 bridge_debug.log

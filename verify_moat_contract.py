@@ -34,6 +34,24 @@ _spec.loader.exec_module(test_client)
 # timeout well above it so the transport deadline never fires first.
 HANDOFF_DELAY_MS = 300
 
+def write_moat_policy(label):
+    path = f"/tmp/chrome-bridge-moat-policy-{label}.json"
+    policy = {
+        "default": {
+            "allowedActions": ["ping", "sessionStatus", "waitForHandoff"],
+            "deniedActions": [],
+            "allowedOrigins": ["*"],
+            "deniedOrigins": [],
+            "requireConfirmation": [],
+            "redact": True,
+            "audit": False,
+        }
+    }
+    with open(path, "w") as f:
+        json.dump(policy, f)
+    return path
+
+
 
 def mock_extension(proc):
     """Read 4-byte length + JSON frames the host forwards on stdout and reply on
@@ -58,6 +76,8 @@ def mock_extension(proc):
                     }
                 ]
             }
+        elif action == "__tabOrigin":
+            result = {"url": "https://example.com/dashboard", "origin": "https://example.com"}
         elif action == "waitForHandoff":
             time.sleep(HANDOFF_DELAY_MS / 1000)
             result = {
@@ -85,6 +105,7 @@ def run_against(label, cmd, port):
     env["BRIDGE_PORT"] = str(port)
     env["BRIDGE_TOKEN_FILE"] = token_file
     env["BRIDGE_LOG_FILE"] = f"/tmp/chrome-bridge-moat-{label}.log"
+    env["BRIDGE_POLICY_FILE"] = write_moat_policy(label)
 
     proc = subprocess.Popen(
         cmd,
@@ -194,6 +215,7 @@ def run_idle_override(label, cmd, port):
     env["BRIDGE_TOKEN_FILE"] = token_file
     env["BRIDGE_LOG_FILE"] = f"/tmp/chrome-bridge-moat-idle-{label}.log"
     env["BRIDGE_SOCKET_IDLE_TIMEOUT"] = "0.1"
+    env["BRIDGE_POLICY_FILE"] = write_moat_policy(f"idle-{label}")
 
     proc = subprocess.Popen(
         cmd,

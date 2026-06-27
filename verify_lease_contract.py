@@ -157,6 +157,20 @@ def make_env():
     env["BRIDGE_TOKENS_FILE"] = tokens_file
     env["BRIDGE_TOKEN_FILE"] = legacy
     env["BRIDGE_LOG_FILE"] = "/tmp/chrome-bridge-lease.log"
+    policy = "/tmp/chrome-bridge-lease-policy.json"
+    with open(policy, "w") as f:
+        json.dump({
+            "default": {
+                "allowedActions": ["ping", "batch", "click", "lease", "release", "leaseStatus"],
+                "allowedOrigins": ["*"],
+                "deniedActions": [],
+                "deniedOrigins": [],
+                "requireConfirmation": [],
+                "redact": True,
+                "audit": False,
+            }
+        }, f)
+    env["BRIDGE_POLICY_FILE"] = policy
     return env
 
 
