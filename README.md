@@ -40,6 +40,9 @@ chrome-native-bridge/
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
 | `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
+| `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
+| `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
+| `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
 
 ## Requirements
 
@@ -283,6 +286,22 @@ The default sample policy is intentionally fail-closed and denies loopback URLs.
 
 `verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
 
+## Release packaging
+
+Pull requests run `.github/workflows/ci.yml`. Tags that match `v*` run `.github/workflows/release.yml`.
+
+The extension artifact is an unpacked, developer-mode bundle and remains unkeyed. Later Web Store packaging uses the store-managed ID:
+
+```bash
+./setup.sh --extension-id <store-id>
+```
+
+Build local release artifacts with:
+
+```bash
+python3 scripts/package_release.py --version <version> --dist dist
+```
+
 ## Rust host (parity port)
 
 `host-rs/` is a behavior-identical Rust port of `bridge.py` (same MV3 extension, same native-messaging framing, same token-gated `127.0.0.1:9223` TCP API). The Python host remains the reference; the Rust host is a drop-in replacement for the native-host process only.
@@ -293,12 +312,13 @@ The default sample policy is intentionally fail-closed and denies loopback URLs.
 cargo build --release --manifest-path host-rs/Cargo.toml
 ```
 
-Produces `host-rs/target/release/bridge-host`.
+Cargo may place the binary under the target directory reported by `cargo metadata`; `setup-rs.sh` resolves that path automatically.
 
 ### Register
 
 ```bash
-./setup-rs.sh <extension-id>
+./setup-rs.sh
+./setup-rs.sh --extension-id <id>
 ```
 
 Registers the Rust binary as the native host. Because native-messaging manifests cannot pass environment variables and the binary otherwise resolves token/log paths relative to its own directory, `setup-rs.sh` generates a small `bridge-host-launch.sh` wrapper that exports the repo-root `BRIDGE_TOKEN_FILE`/`BRIDGE_TOKENS_FILE`/`BRIDGE_LOG_FILE` and registers that launcher. It reuses the same `bridge_token.txt` and the same `com.automation.bridge` host name, so the unchanged extension talks to it transparently. Only one host (Python or Rust) can own the `com.automation.bridge` registration / port `9223` at a time.
