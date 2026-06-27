@@ -273,6 +273,8 @@ def print_usage():
     print("  python3 test_client.py fill <tabId> <selector> <text>")
     print("  python3 test_client.py select <tabId> <selector> <value>")
     print("  python3 test_client.py uploadFile <tabId> <selector> <path...>")
+    print("    selectors: CSS, css=<selector>, label=<text>, text=<text>, role=<role>[name=<text>],")
+    print("               <host> >>> <shadow-selector>, frame=<iframe-selector> >> <target-selector>")
     print("  python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
     print("  python3 test_client.py setCpuThrottling <tabId> <rate>")
     print("  python3 test_client.py setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]")

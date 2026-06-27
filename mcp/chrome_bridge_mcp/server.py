@@ -88,7 +88,7 @@ def browser_screenshot(tab_id: Optional[int] = None) -> ImageContent:
 
 
 def browser_click(selector: str, tab_id: Optional[int] = None) -> str:
-    """Click the first element matching a CSS selector."""
+    """Click a target by CSS or semantic selector (label=, text=, role=, frame=... >> ..., shadow >>>)."""
     tid = resolve_tab_id(tab_id)
     return _text(call("click", {"tabId": tid, "selector": selector}))
 
@@ -100,13 +100,13 @@ def browser_type(selector: str, text: str, tab_id: Optional[int] = None) -> str:
 
 
 def browser_fill(selector: str, text: str, tab_id: Optional[int] = None) -> str:
-    """Clear an element, then insert text."""
+    """Clear, then insert text into a CSS, semantic, frame, or shadow target."""
     tid = resolve_tab_id(tab_id)
     return _text(call("fill", {"tabId": tid, "selector": selector, "text": text}))
 
 
 def browser_hover(selector: str, tab_id: Optional[int] = None) -> str:
-    """Hover the pointer over the first element matching a CSS selector."""
+    """Hover a CSS, semantic, frame, or shadow target."""
     tid = resolve_tab_id(tab_id)
     return _text(call("hover", {"tabId": tid, "selector": selector}))
 
@@ -138,7 +138,7 @@ def browser_drag(
     to_selector: str,
     tab_id: Optional[int] = None,
 ) -> str:
-    """Drag from one element to another by CSS selector."""
+    """Drag between CSS, semantic, frame, or shadow targets."""
     tid = resolve_tab_id(tab_id)
     return _text(call("drag", {
         "tabId": tid,
@@ -148,7 +148,7 @@ def browser_drag(
 
 
 def browser_select(selector: str, value: str, tab_id: Optional[int] = None) -> str:
-    """Select an option ``value`` in a ``<select>`` element."""
+    """Select an option ``value`` in a ``<select>`` reached by CSS, semantic, frame, or shadow selector."""
     tid = resolve_tab_id(tab_id)
     return _text(call("select", {"tabId": tid, "selector": selector, "value": value}))
 
@@ -158,7 +158,7 @@ def browser_upload_file(
     files: list,
     tab_id: Optional[int] = None,
 ) -> str:
-    """Set files on a file ``<input>``; local paths are validated first."""
+    """Set files on a file ``<input>`` reached by CSS, semantic, frame, or shadow selector; local paths are validated first."""
     expanded = _expand_existing_files(files)
     tid = resolve_tab_id(tab_id)
     return _text(call("uploadFile", {"tabId": tid, "selector": selector, "files": expanded}))

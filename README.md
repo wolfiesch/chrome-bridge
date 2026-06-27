@@ -149,7 +149,7 @@ chrome-bridge select <tabId> <selector> <value>
 chrome-bridge uploadFile <tabId> <selector> <path...>
 ```
 
-`type` focuses and inserts text. `fill` clears first, then inserts text. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
+`type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, and `uploadFile` accept plain CSS plus semantic selector prefixes: `css=<selector>`, `label=<text>`, `text=<text>`, and `role=<role>[name=<accessible-name>]`. Use `<host> >>> <shadow-selector>` for open shadow DOM and `frame=<iframe-selector> >> <target-selector>` for iframe targets; these forms also work for `<select>` elements and file inputs. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
 
 ### Viewport
 
