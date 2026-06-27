@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run CI gates
+        run: |
+          python3 -m pip install -e ./mcp
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/package_release.py
+          node --check background.js
+          diff -q manifest.json extension/manifest.json
+          diff -q background.js extension/background.js
+          PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
+          cargo build --release --manifest-path host-rs/Cargo.toml
+          python3 scripts/package_release.py --version ci --dist /tmp/chrome-bridge-dist
+          PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_lease_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_lease_stress_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
+          python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/chrome-bridge-noop.json
+          python3 benchmark_harness.py compare --input /tmp/chrome-bridge-noop.json --output /tmp/chrome-bridge-report.md
+          grep -q "Claim Discipline" /tmp/chrome-bridge-report.md
+      - name: Package release artifacts
+        run: python3 scripts/package_release.py --version ${{ github.ref_name }} --dist /tmp/chrome-bridge-release-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrome-native-bridge-source-${{ github.ref_name }}
+          path: /tmp/chrome-bridge-release-dist/chrome-native-bridge-source-${{ github.ref_name }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrome-native-bridge-extension-unpacked-${{ github.ref_name }}
+          path: /tmp/chrome-bridge-release-dist/chrome-native-bridge-extension-unpacked-${{ github.ref_name }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-host-${{ runner.os }}-${{ github.ref_name }}
+          path: /tmp/chrome-bridge-release-dist/bridge-host-${{ runner.os }}-${{ github.ref_name }}
+          if-no-files-found: error
