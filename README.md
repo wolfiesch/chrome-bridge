@@ -185,9 +185,13 @@ chrome-bridge drag <tabId> <fromSelector> <toSelector>
 chrome-bridge fill <tabId> <selector> <text>
 chrome-bridge select <tabId> <selector> <value>
 chrome-bridge uploadFile <tabId> <selector> <path...>
+chrome-bridge githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]
+chrome-bridge githubSubmitComment <tabId> [formSelector] [timeoutMs]
 ```
 
 `type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, and `uploadFile` accept plain CSS plus semantic selector prefixes: `css=<selector>`, `label=<text>`, `text=<text>`, and `role=<role>[name=<accessible-name>]`. Use `<host> >>> <shadow-selector>` for open shadow DOM and `frame=<iframe-selector> >> <target-selector>` for iframe targets; these forms also work for `<select>` elements and file inputs. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
+
+For GitHub comments, use `uploadFile` first, then `githubAttachUploadedFiles` to call GitHub's `<file-attachment>` component without opening arbitrary `executeScript*` access. Use `githubSubmitComment` instead of a broad submit-button click on draft PRs; it only clicks an exact `Comment` or `Add comment` button and refuses `Close with comment`. Both GitHub-specific actions also verify the target tab is on `https://github.com`.
 
 ### Viewport
 
@@ -610,6 +614,7 @@ tail -f bridge_debug.log
 - Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, `policyInfo`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in. `policyInfo` is additionally answered host-side before the action gate (like `policyCheck`), so a client can always discover the active policy/audit file paths even under a deny-all policy; it returns only those paths, never policy contents.
 - Actions listed in `requireConfirmation` return an opaque `confirmationToken`; clients must resend the same action and payload through `browser_confirm_action` or `test_client.py confirm` before the host forwards it.
 - Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
+- GitHub attachment helpers (`githubAttachUploadedFiles`, `githubSubmitComment`) are narrow tab-scoped actions. They remain subject to host origin policy and also reject any tab whose URL origin is not `https://github.com`, so they do not require broad `executeScript*` allowlisting.
 - Audit logs are JSONL at `BRIDGE_AUDIT_LOG_FILE` / `bridge_audit.jsonl`, one event per request with `ts`, `client`, `action`, `targets`, `decision`, `reason`, `requestId`. They intentionally omit payload and response bodies.
 - Cookie and storage-state redaction is enabled by default through policy (`redact`): cookie values and sensitive storage keys are replaced with `<redacted>` before responses reach the client. Page-derived content from `getHTML`, `extractText`, `executeScript`, and `executeScriptCDP` is additionally masked against the client policy's `redactPatterns` (a list of regexes; use inline flags like `(?i)` for case-insensitivity) before it reaches the client.
 - The Python and Rust native hosts enforce the same policy, audit, and redaction behavior; this parity is covered by the guardrails contract (`verify_guardrails_contract.py`).

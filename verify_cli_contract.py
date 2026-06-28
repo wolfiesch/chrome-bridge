@@ -54,6 +54,10 @@ CASES = [
     (["fill", "1", "input[name=q]", "hello"], 111),
     (["select", "1", "select[name=kind]", "beta"], 111),
     (["uploadFile", "1", "input[type=file]", UPLOAD_FIXTURE], 111),
+    (["githubAttachUploadedFiles", "1", "input[type=file]"], 111),
+    (["githubAttachUploadedFiles", "1", "input[type=file]", ".js-comment-form", "15000"], 111),
+    (["githubSubmitComment", "1"], 111),
+    (["githubSubmitComment", "1", ".js-comment-form", "15000"], 111),
     (["setViewport", "1", "1280", "720", "1"], 111),
     (["startMonitoring", "1"], 111),
     (["stopMonitoring", "1"], 111),
@@ -165,6 +169,23 @@ check("background navigate payload", result.get("payload"), {"url": "https://exa
 
 result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"])
 check("quiet screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
+
+result = dispatch(["githubAttachUploadedFiles", "1", "input[type=file]", ".js-comment-form", "15000"])
+check("githubAttachUploadedFiles action", result.get("action"), "githubAttachUploadedFiles")
+check("githubAttachUploadedFiles payload", result.get("payload"), {
+    "tabId": 1,
+    "inputSelector": "input[type=file]",
+    "formSelector": ".js-comment-form",
+    "timeoutMs": 15000,
+})
+
+result = dispatch(["githubSubmitComment", "1", ".js-comment-form", "15000"])
+check("githubSubmitComment action", result.get("action"), "githubSubmitComment")
+check("githubSubmitComment payload", result.get("payload"), {
+    "tabId": 1,
+    "formSelector": ".js-comment-form",
+    "timeoutMs": 15000,
+})
 
 # --- policy subcommands: file edits and doctor work against local files using
 #     the paths the host reports via policyInfo (here a fake host). ---

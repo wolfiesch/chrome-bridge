@@ -372,6 +372,12 @@ async function dispatchAction(action, payload) {
       case "select":
         result = await selectOption(payload.tabId, payload.selector, payload.value);
         break;
+      case "githubAttachUploadedFiles":
+        result = await githubAttachUploadedFiles(payload.tabId, payload.inputSelector, payload.formSelector, payload.timeoutMs);
+        break;
+      case "githubSubmitComment":
+        result = await githubSubmitComment(payload.tabId, payload.formSelector, payload.timeoutMs);
+        break;
       case "uploadFile":
         result = await uploadFile(payload.tabId, payload.selector, payload.files);
         break;
@@ -1382,6 +1388,143 @@ async function selectOption(tabId, selector, value) {
     const resolved = await resolveActionTarget(tabId, locator, target);
     if (resolved.success === false) return resolved;
     const result = await evaluateInContext(target, domSelectExpression(locator, value), resolved.contextId);
+    return result.val || result;
+  });
+}
+
+async function assertGitHubTab(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  let origin = null;
+  try {
+    origin = tab.url ? new URL(tab.url).origin : null;
+  } catch (error) {
+    origin = null;
+  }
+  if (origin !== "https://github.com") {
+    return { success: false, err: "GitHub action requires a https://github.com tab", origin, url: tab.url || null };
+  }
+  return { success: true, origin, url: tab.url || null };
+}
+
+function githubAttachExpression(locator, formSelector, timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    ${locatorResolverSource()}
+    const inputResult = resolveLocator(${JSON.stringify(locator)});
+    if (!inputResult.success) {
+      resolve(inputResult);
+      return;
+    }
+    const input = inputResult.el;
+    if (!(input instanceof HTMLInputElement) || input.type !== 'file') {
+      resolve({ success: false, err: 'GitHub attachment target must be a file input' });
+      return;
+    }
+    if (!input.files || input.files.length === 0) {
+      resolve({ success: false, err: 'No files are set on the GitHub attachment input' });
+      return;
+    }
+    const attachment = input.closest('file-attachment');
+    if (!attachment || typeof attachment.attach !== 'function') {
+      resolve({ success: false, err: 'No GitHub file-attachment.attach(input.files) component found' });
+      return;
+    }
+    const formSelector = ${JSON.stringify(formSelector || null)};
+    const explicitRoot = formSelector ? document.querySelector(formSelector) : null;
+    if (formSelector && !explicitRoot) {
+      resolve({ success: false, err: 'No GitHub comment form matched formSelector' });
+      return;
+    }
+    const root = explicitRoot || input.closest('form') || attachment.closest('form') || document.querySelector('.js-comment-form');
+    if (!root) {
+      resolve({ success: false, err: 'No GitHub comment form found for attachment' });
+      return;
+    }
+    const textarea = root.querySelector('textarea');
+    if (!textarea) {
+      resolve({ success: false, err: 'No GitHub comment textarea found for attachment' });
+      return;
+    }
+    const timeoutMs = ${JSON.stringify(timeoutMs || 30000)};
+    const deadline = Date.now() + timeoutMs;
+    const assetPattern = /user-attachments\\/assets\\/[A-Za-z0-9._-]+/g;
+    Promise.resolve(attachment.attach(input.files)).catch((error) => {
+      resolve({ success: false, err: String(error && error.message || error) });
+    });
+    const poll = () => {
+      const value = textarea.value || '';
+      const assets = Array.from(new Set(value.match(assetPattern) || []));
+      if (!value.includes('Uploading') && assets.length >= input.files.length) {
+        resolve({ success: true, files: input.files.length, assets, valueLength: value.length });
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ success: false, err: 'Timed out waiting for GitHub attachment markdown', files: input.files.length, assets, uploading: value.includes('Uploading') });
+        return;
+      }
+      setTimeout(poll, 250);
+    };
+    poll();
+  }))()`;
+}
+
+function githubSubmitExpression(formSelector, timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    const formSelector = ${JSON.stringify(formSelector || null)};
+    const explicitRoot = formSelector ? document.querySelector(formSelector) : null;
+    if (formSelector && !explicitRoot) {
+      resolve({ success: false, err: 'No GitHub comment form matched formSelector' });
+      return;
+    }
+    const activeForm = document.activeElement && document.activeElement.closest ? document.activeElement.closest('.js-comment-form') : null;
+    const commentForms = Array.from(document.querySelectorAll('.js-comment-form'));
+    const root = explicitRoot || activeForm || (commentForms.length === 1 ? commentForms[0] : null);
+    if (!root) {
+      resolve({ success: false, err: 'No GitHub comment form found' });
+      return;
+    }
+    const allowedLabels = new Set(['Comment', 'Add comment']);
+    const forbiddenLabels = new Set(['Close with comment']);
+    const buttons = Array.from(root.querySelectorAll('button[type="submit"], input[type="submit"]'))
+      .filter((button) => !button.disabled && button.offsetParent !== null)
+      .map((button) => ({ button, text: ((button.innerText || button.value || button.textContent || '').trim().replace(/\\s+/g, ' ')) }));
+    const forbidden = buttons.find(({ text }) => forbiddenLabels.has(text));
+    if (forbidden) {
+      resolve({ success: false, err: 'Refusing to click GitHub Close with comment button' });
+      return;
+    }
+    const matches = buttons.filter(({ text }) => allowedLabels.has(text));
+    if (matches.length !== 1) {
+      resolve({ success: false, err: 'Expected exactly one GitHub Comment or Add comment submit button', labels: buttons.map(({ text }) => text) });
+      return;
+    }
+    matches[0].button.click();
+    const timeoutMs = ${JSON.stringify(timeoutMs || 10000)};
+    setTimeout(() => resolve({ success: true, label: matches[0].text }), Math.min(timeoutMs, 1000));
+  }))()`;
+}
+
+async function githubAttachUploadedFiles(tabId, inputSelector, formSelector, timeoutMs) {
+  const gate = await assertGitHubTab(tabId);
+  if (gate.success === false) return gate;
+  return withDebugger(tabId, async (target) => {
+    let locator;
+    try {
+      locator = parseActionLocator(inputSelector);
+    } catch (error) {
+      return { success: false, err: error.message };
+    }
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    const result = await evaluateInContext(target, githubAttachExpression(locator, formSelector, timeoutMs), resolved.contextId);
+    return result.val || result;
+  });
+}
+
+async function githubSubmitComment(tabId, formSelector, timeoutMs) {
+  const gate = await assertGitHubTab(tabId);
+  if (gate.success === false) return gate;
+  return withDebugger(tabId, async (target) => {
+    const result = await evaluateInContext(target, githubSubmitExpression(formSelector, timeoutMs), null);
     return result.val || result;
   });
 }

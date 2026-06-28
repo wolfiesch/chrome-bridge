@@ -498,6 +498,8 @@ def print_usage():
     print("  python3 test_client.py fill <tabId> <selector> <text>")
     print("  python3 test_client.py select <tabId> <selector> <value>")
     print("  python3 test_client.py uploadFile <tabId> <selector> <path...>")
+    print("  python3 test_client.py githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]")
+    print("  python3 test_client.py githubSubmitComment <tabId> [formSelector] [timeoutMs]")
     print("    selectors: CSS, css=<selector>, label=<text>, text=<text>, role=<role>[name=<text>],")
     print("               <host> >>> <shadow-selector>, frame=<iframe-selector> >> <target-selector>")
     print("  python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
@@ -616,6 +618,22 @@ def main():
     elif action == "uploadFile":
         require_args(args, 5, "Usage: python3 test_client.py uploadFile <tabId> <selector> <path...>")
         sys.exit(send_command("uploadFile", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "files": expand_existing_files(args[4:])}))
+    elif action == "githubAttachUploadedFiles":
+        require_args(args, 4, "Usage: python3 test_client.py githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]")
+        payload = {"tabId": parse_int(args[2], "tabId"), "inputSelector": args[3]}
+        if len(args) > 4:
+            payload["formSelector"] = args[4]
+        if len(args) > 5:
+            payload["timeoutMs"] = parse_int(args[5], "timeoutMs")
+        sys.exit(send_command("githubAttachUploadedFiles", payload))
+    elif action == "githubSubmitComment":
+        require_args(args, 3, "Usage: python3 test_client.py githubSubmitComment <tabId> [formSelector] [timeoutMs]")
+        payload = {"tabId": parse_int(args[2], "tabId")}
+        if len(args) > 3:
+            payload["formSelector"] = args[3]
+        if len(args) > 4:
+            payload["timeoutMs"] = parse_int(args[4], "timeoutMs")
+        sys.exit(send_command("githubSubmitComment", payload))
     elif action == "setViewport":
         require_args(args, 5, "Usage: python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
         scale = parse_float(args[5], "deviceScaleFactor") if len(args) > 5 else 1
