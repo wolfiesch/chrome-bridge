@@ -3,17 +3,16 @@ import base64
 import json
 import os
 import re
-import shlex
 import socket
-import subprocess
 import sys
 import time
+from bridge_wake import bridge_extension_id, token_file_path, wake_bridge_extension
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
 def load_token():
-    token_file = token_file_path()
+    token_file = token_file_path(SCRIPT_DIR)
     try:
         with open(token_file) as f:
             return f.read().strip()
@@ -58,87 +57,6 @@ def expand_output_path(path):
     return os.path.abspath(os.path.expanduser(path))
 
 
-def token_file_path():
-    return os.environ.get('BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
-
-
-def read_first_existing(paths):
-    for path in paths:
-        if not path:
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                value = f.read().strip()
-            if value:
-                return value
-        except Exception:
-            pass
-    return None
-
-
-def bridge_extension_id():
-    configured = os.environ.get("BRIDGE_EXTENSION_ID")
-    if configured:
-        return configured
-
-    token_dir = os.path.dirname(os.path.abspath(os.path.expanduser(token_file_path())))
-    from_file = read_first_existing([
-        os.environ.get("BRIDGE_EXTENSION_ID_FILE"),
-        os.path.join(token_dir, "extension_id.txt"),
-        os.path.join(SCRIPT_DIR, "extension_id.txt"),
-    ])
-    if from_file:
-        return from_file
-
-    key_file = os.environ.get("BRIDGE_EXTENSION_KEY_FILE")
-    if not key_file:
-        state_key = os.path.join(token_dir, "extension_key.pem")
-        key_file = state_key if os.path.exists(state_key) else os.path.join(SCRIPT_DIR, "extension_key.pem")
-    if not os.path.exists(key_file):
-        return None
-    try:
-        proc = subprocess.run(
-            [sys.executable, os.path.join(SCRIPT_DIR, "extension_identity.py"), "id", "--key", key_file],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        return None
-    extension_id = proc.stdout.strip()
-    return extension_id if proc.returncode == 0 and extension_id else None
-
-
-def wake_bridge_extension():
-    if os.environ.get("BRIDGE_WAKE_DISABLED") == "1":
-        return False
-
-    extension_id = bridge_extension_id()
-    if not extension_id:
-        return False
-    url = f"chrome-extension://{extension_id}/wake.html"
-
-    command = os.environ.get("BRIDGE_WAKE_COMMAND")
-    if command:
-        argv = shlex.split(command) + [url]
-    elif sys.platform == "darwin":
-        bundle = os.environ.get("BRIDGE_CHROME_BUNDLE_ID", "com.google.Chrome")
-        argv = ["open", "-g", "-b", bundle, url]
-    else:
-        argv = ["xdg-open", url]
-
-    try:
-        return subprocess.run(
-            argv,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        ).returncode == 0
-    except Exception:
-        return False
 
 
 def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
@@ -182,7 +100,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                 except Exception:
                     pass
                 if not wake_attempted:
-                    wake_bridge_extension()
+                    wake_bridge_extension(SCRIPT_DIR)
                     wake_attempted = True
                 if time.monotonic() >= deadline:
                     raise

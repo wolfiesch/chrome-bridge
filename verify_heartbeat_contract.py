@@ -91,15 +91,15 @@ for path in [os.path.join(SCRIPT_DIR, "wake.js"), os.path.join(SCRIPT_DIR, "exte
             if needle not in text:
                 fail(f"{path} missing wake script needle {needle}")
 
-client_text = open(CLIENT).read()
+wake_text = open(os.path.join(SCRIPT_DIR, "bridge_wake.py")).read()
 for needle in [
     "wake_bridge_extension",
     "BRIDGE_WAKE_COMMAND",
     "wake.html",
     "extension_id.txt",
 ]:
-    if needle not in client_text:
-        fail(f"test_client.py missing wake CLI needle {needle}")
+    if needle not in wake_text:
+        fail(f"bridge_wake.py missing wake helper needle {needle}")
 
 setup_text = open(os.path.join(SCRIPT_DIR, "setup.sh")).read()
 if "extension_id.txt" not in setup_text:

@@ -25,6 +25,14 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, cwd=SCRIPT_DIR, text=True, capture_output=True, **kwargs)
 
 
+def last_json(stdout):
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            return json.loads(line)
+    raise ValueError(f"no JSON object in output: {stdout!r}")
+
+
 def mode(path):
     return stat.S_IMODE(os.stat(path).st_mode)
 
@@ -97,6 +105,55 @@ def main():
         if os.name == "posix":
             expect(mode(policy_path) == 0o600,
                    f"host redeploy should restrict existing broad policy to 0600, got {oct(mode(policy_path))}")
+
+        install_env = os.environ.copy()
+        install_env["HOME"] = str(tmp / "home")
+        install_env["XDG_CONFIG_HOME"] = str(tmp / "xdg-config")
+        state_dir = tmp / "state"
+        r = run([
+            "./setup.sh",
+            "--state-dir", str(state_dir),
+            "--ext", str(tmp / "extension"),
+            "--host-port", "19223",
+            "--print-json",
+        ], env=install_env)
+        expect(r.returncode == 0, f"setup state-dir failed: {r.stderr}")
+        if r.returncode == 0:
+            setup_info = last_json(r.stdout)
+            launcher = Path(setup_info["launcher"])
+            expect(launcher.exists(), "setup state-dir launcher should exist")
+            expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
+                   "setup state-dir launcher should use host port 19223")
+            expect((state_dir / "extension_id.txt").exists(),
+                   "setup state-dir should write extension_id.txt")
+            expect(setup_info.get("extensionIdFile") == str(state_dir / "extension_id.txt"),
+                   "setup JSON should include extensionIdFile")
+            expect(setup_info.get("hostPort") == "19223",
+                   "setup JSON should include hostPort 19223")
+
+        rust_state_dir = tmp / "state-rs"
+        r = run([
+            "./setup-rs.sh",
+            "--state-dir", str(rust_state_dir),
+            "--ext", str(tmp / "extension-rs"),
+            "--host-port", "19223",
+            "--print-json",
+        ], env=install_env)
+        if r.returncode == 0:
+            setup_info = last_json(r.stdout)
+            launcher = Path(setup_info["launcher"])
+            expect(launcher.exists(), "setup-rs state-dir launcher should exist")
+            expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
+                   "setup-rs state-dir launcher should use host port 19223")
+            expect((rust_state_dir / "extension_id.txt").exists(),
+                   "setup-rs state-dir should write extension_id.txt")
+            expect(setup_info.get("extensionIdFile") == str(rust_state_dir / "extension_id.txt"),
+                   "setup-rs JSON should include extensionIdFile")
+            expect(setup_info.get("hostPort") == "19223",
+                   "setup-rs JSON should include hostPort 19223")
+        else:
+            expect("Build the Rust host first" in (r.stdout + r.stderr),
+                   f"setup-rs missing build-first message: stdout={r.stdout} stderr={r.stderr}")
 
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")

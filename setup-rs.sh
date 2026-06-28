@@ -16,6 +16,8 @@ RUST_BIN="$SCRIPT_DIR/host-rs/target/release/bridge-host"
 KEY_FILE="$SCRIPT_DIR/extension_key.pem"
 LAUNCHER="$SCRIPT_DIR/bridge-host-launch.sh"
 EXTENSION_ID=""
+EXTENSION_ID_FILE="$SCRIPT_DIR/extension_id.txt"
+HOST_PORT=9223
 
 if command -v cargo >/dev/null 2>&1; then
   TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
@@ -33,7 +35,7 @@ case "$(uname -s)" in
 esac
 
 usage() {
-  echo "Usage: ./setup-rs.sh [--ext <extension-dir>] [--extension-id <id>] [--key-file <path>] [--state-dir <path>] [--print-json]" >&2
+  echo "Usage: ./setup-rs.sh [--ext <extension-dir>] [--extension-id <id>] [--key-file <path>] [--state-dir <path>] [--host-port <port>] [--print-json]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +52,9 @@ while [[ $# -gt 0 ]]; do
     --state-dir)
       if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then echo "ERROR: --state-dir requires a path" >&2; exit 2; fi
       STATE_DIR="$2"; shift 2 ;;
+    --host-port)
+      if [[ $# -lt 2 ]]; then echo "ERROR: --host-port requires a port" >&2; exit 2; fi
+      HOST_PORT="$2"; shift 2 ;;
     --print-json)
       PRINT_JSON=1; shift ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -67,6 +72,7 @@ if [[ -n "$STATE_DIR" ]]; then
   if [[ "$KEY_FILE_PROVIDED" -eq 0 ]]; then
     KEY_FILE="$STATE_DIR/extension_key.pem"
   fi
+  EXTENSION_ID_FILE="$STATE_DIR/extension_id.txt"
 fi
 
 if [[ ! -f "$TOKEN_FILE" ]]; then
@@ -99,6 +105,9 @@ if [[ -z "$EXTENSION_ID" ]]; then
 else
   echo "Using provided extension ID: $EXTENSION_ID"
 fi
+printf '%s\n' "$EXTENSION_ID" > "$EXTENSION_ID_FILE"
+chmod 0644 "$EXTENSION_ID_FILE"
+echo "Wrote extension ID $EXTENSION_ID_FILE"
 
 if [[ ! -x "$RUST_BIN" ]]; then
   echo "Build the Rust host first: cargo build --release --manifest-path host-rs/Cargo.toml"
@@ -107,7 +116,7 @@ fi
 
 cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
-export BRIDGE_PORT="\${BRIDGE_PORT:-9223}"
+export BRIDGE_PORT="\${BRIDGE_PORT:-$HOST_PORT}"
 export BRIDGE_TOKEN_FILE="$TOKEN_FILE"
 export BRIDGE_TOKENS_FILE="$TOKENS_FILE"
 export BRIDGE_POLICY_FILE="$POLICY_FILE"
@@ -152,9 +161,9 @@ case "$(uname -s)" in
     echo "Load unpacked: $EXT_DIR"
     echo "Then run: python3 test_client.py ping"
     if [[ "$PRINT_JSON" -eq 1 ]]; then
-      python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" <<'PY'
+      python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
 import json, sys
-keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher")
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "extensionIdFile", "hostPort")
 print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
 PY
     fi
@@ -174,9 +183,9 @@ echo "Load unpacked: $EXT_DIR"
 echo "Then run: python3 test_client.py ping"
 
 if [[ "$PRINT_JSON" -eq 1 ]]; then
-  python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" <<'PY'
+  python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
 import json, sys
-keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher")
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "extensionIdFile", "hostPort")
 print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
 PY
 fi
