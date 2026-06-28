@@ -277,6 +277,12 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_agent_actions_live.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
 ```
 
+`verify_capability_matrix.py` skips `downloadUrl` by default in live profiles because Chrome's "Ask where to save each file before downloading" setting can open a modal save dialog and block unattended smoke runs. To exercise that capability intentionally, run:
+
+```bash
+CHROME_BRIDGE_TEST_DOWNLOAD=1 PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
+```
+
 `verify_live_install_smoke.py` uses a temporary HOME/XDG_CONFIG_HOME and exits 0 with `SKIP live install smoke: Chrome/Chromium executable not found` only when no Chrome/Chromium executable is available.
 
 The default sample policy is intentionally fail-closed and denies loopback URLs. For these localhost live gates, temporarily use an explicit smoke-test policy, then restore your normal policy:

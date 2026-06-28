@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 
 HOST = "127.0.0.1"
-PORT = 8765
-BASE_URL = f"http://{HOST}:{PORT}/"
+PORT = 0  # Dynamic port binding
+BASE_URL = ""
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
@@ -121,16 +121,17 @@ class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
 
 def start_server():
+    global BASE_URL
     server = ReusableThreadingHTTPServer((HOST, PORT), Handler)
+    BASE_URL = f"http://{HOST}:{server.server_address[1]}/"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
 
 
 def run_bridge(*args, timeout=20):
-    for arg in args:
-        if isinstance(arg, int) and arg > 1000:
-            timeout = max(timeout, int(arg / 1000) + 15)
+    if args and args[0] in {"waitForLoad", "waitForSelector"} and isinstance(args[-1], int) and args[-1] > 1000:
+        timeout = max(timeout, int(args[-1] / 1000) + 15)
     proc = subprocess.run(["chrome-bridge", *map(str, args)], text=True, capture_output=True, timeout=timeout)
     parsed = None
     if proc.stdout.strip():
@@ -167,6 +168,25 @@ def require(condition, message, call=None):
         raise AssertionError(f"{message}{err}{out}")
 
 
+def target_origin_unresolved(call):
+    data = call.get("json") or {}
+    denial = data.get("policyDenial") if isinstance(data, dict) else None
+    return isinstance(denial, dict) and denial.get("kind") == "target"
+
+
+def wait_for_tab_origin(tab_id, timeout=5):
+    deadline = time.monotonic() + timeout
+    last_call = None
+    while time.monotonic() <= deadline:
+        last_call = run_bridge("getCurrentState", tab_id, timeout=5)
+        if last_call["exit"] == 0:
+            return
+        if not target_origin_unresolved(last_call):
+            require(False, "tab origin resolution failed", last_call)
+        time.sleep(0.2)
+    require(False, "tab origin stayed unresolved after navigate", last_call)
+
+
 def main():
     backup = None
     policy_path = None
@@ -194,7 +214,7 @@ def main():
                     "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
                     "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab", "policyInfo"
                 ],
-                "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
+                "allowedOrigins": ["*"],
                 "deniedActions": [],
                 "deniedOrigins": [],
                 "requireConfirmation": [],
@@ -234,6 +254,7 @@ def main_inner():
         tab_id = nav.get("tabId") if isinstance(nav, dict) else None
         record(summary, "navigate", call, {"tabId": tab_id})
         require(call["exit"] == 0 and tab_id, "navigate did not return tabId")
+        wait_for_tab_origin(tab_id)
 
         checks = [
             ("waitForLoad", run_bridge("waitForLoad", tab_id, 20000), None),

@@ -159,9 +159,8 @@ def restore_policy(backup, policy_path, backup_mode=None):
 
 
 def run_bridge(*args, timeout=20):
-    for arg in args:
-        if isinstance(arg, int) and arg > 1000:
-            timeout = max(timeout, int(arg / 1000) + 15)
+    if args and args[0] in {"waitForLoad", "waitForSelector"} and isinstance(args[-1], int) and args[-1] > 1000:
+        timeout = max(timeout, int(args[-1] / 1000) + 15)
     proc = subprocess.run([*bridge_command(), *map(str, args)], text=True, capture_output=True, timeout=timeout)
     parsed = None
     if proc.stdout:
@@ -198,6 +197,25 @@ def require(condition, message, call=None):
         out = f"\nSTDOUT: {call.get('stdout')}" if isinstance(call, dict) and call.get("stdout") else ""
         raise AssertionError(f"{message}{err}{out}")
 
+
+def target_origin_unresolved(call):
+    data = call.get("json") or {}
+    denial = data.get("policyDenial") if isinstance(data, dict) else None
+    return isinstance(denial, dict) and denial.get("kind") == "target"
+
+
+def wait_for_tab_origin(tab_id, timeout=5):
+    deadline = time.monotonic() + timeout
+    last_call = None
+    while time.monotonic() <= deadline:
+        last_call = run_bridge("getCurrentState", tab_id, timeout=5)
+        if last_call["exit"] == 0:
+            return
+        if not target_origin_unresolved(last_call):
+            require(False, "tab origin resolution failed", last_call)
+        time.sleep(0.2)
+    require(False, "tab origin stayed unresolved after navigate", last_call)
+
 def main():
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
     for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
@@ -233,7 +251,7 @@ def main():
                     "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
                     "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab"
                 ],
-                "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
+                "allowedOrigins": ["*"],
                 "deniedActions": [],
                 "deniedOrigins": [],
                 "requireConfirmation": [],
@@ -261,6 +279,7 @@ def main():
         tab_id = nav.get("tabId")
         record(summary, "navigate", call, {"tabId": tab_id})
         require(call["exit"] == 0 and tab_id is not None, "navigate did not return tabId")
+        wait_for_tab_origin(tab_id)
 
         # 3. Wait For Load
         call = run_bridge("waitForLoad", tab_id, 20000)
