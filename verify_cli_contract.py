@@ -24,6 +24,7 @@ with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
 CASES = [
     (["ping"], 111),
     (["navigate", "https://example.com"], 111),
+    (["navigate", "https://example.com", "--background"], 111),
     (["getCookies", "example.com"], 111),
     (["executeScript", "1", "document.title"], 111),
     (["getTabs"], 111),
@@ -42,6 +43,7 @@ CASES = [
     (["waitForUrl", "1", "github.com", "5000"], 111),
     (["getCurrentState", "1"], 111),
     (["screenshot", "1", "/tmp/chrome-bridge-shot.png"], 111),
+    (["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"], 111),
     (["extractText", "1", "2000"], 111),
     (["getHTML", "1", "/tmp/chrome-bridge-page.html"], 111),
     (["hover", "1", "#target"], 111),
@@ -121,8 +123,9 @@ def _fake_send_command_data(action, payload=None, read_timeout_ms=None, confirma
     captured["payload"] = payload
     captured["read_timeout_ms"] = read_timeout_ms
     captured["confirmation_token"] = confirmation_token
+    result = {"dataUrl": "data:image/png;base64,iVBORw0KGgo="} if action == "screenshot" else {}
     # Mimic a successful response so send_command returns exit code 0.
-    return 0, {"success": True}, ""
+    return 0, {"success": True, "result": result}, ""
 
 test_client.send_command_data = _fake_send_command_data
 
@@ -156,6 +159,12 @@ check(
     {"message": "please log in", "until": {"mode": "selector", "selector": "#ok"}, "timeoutMs": 60000},
 )
 check("waitForHandoff read_timeout_ms", result.get("read_timeout_ms"), 60000)
+
+result = dispatch(["navigate", "https://example.com", "--background"])
+check("background navigate payload", result.get("payload"), {"url": "https://example.com", "active": False})
+
+result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"])
+check("quiet screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
 
 # --- policy subcommands: file edits and doctor work against local files using
 #     the paths the host reports via policyInfo (here a fake host). ---

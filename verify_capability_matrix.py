@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import sys
 import json
@@ -16,6 +17,8 @@ BASE_URL = ""
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CLIENT = os.path.join(SCRIPT_DIR, "test_client.py")
 BRIDGE_COMMAND = os.environ.get("CHROME_BRIDGE_CLIENT")
+QUIET_MODE = False
+
 
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
@@ -216,7 +219,9 @@ def wait_for_tab_origin(tab_id, timeout=5):
         time.sleep(0.2)
     require(False, "tab origin stayed unresolved after navigate", last_call)
 
-def main():
+def main(quiet=False):
+    global QUIET_MODE
+    QUIET_MODE = quiet
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
     for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
         with contextlib.suppress(FileNotFoundError):
@@ -274,12 +279,17 @@ def main():
         require(call["exit"] == 0 and result(call) == "pong", "ping failed")
 
         # 2. Navigate
-        call = run_bridge("navigate", BASE_URL)
+        call = run_bridge("navigate", BASE_URL, "--background") if QUIET_MODE else run_bridge("navigate", BASE_URL)
         nav = result(call) or {}
         tab_id = nav.get("tabId")
         record(summary, "navigate", call, {"tabId": tab_id})
         require(call["exit"] == 0 and tab_id is not None, "navigate did not return tabId")
         wait_for_tab_origin(tab_id)
+        if QUIET_MODE:
+            state = run_bridge("getCurrentState", tab_id)
+            active = ((result(state) or {}).get("tab") or {}).get("active")
+            record(summary, "quietNavigateInactive", state, {"active": active})
+            require(state["exit"] == 0 and active is False, "quiet navigate created an active tab")
 
         # 3. Wait For Load
         call = run_bridge("waitForLoad", tab_id, 20000)
@@ -350,7 +360,7 @@ def main():
         require(call["exit"] == 0, "scroll failed")
 
         # 14. Screenshot
-        call = run_bridge("screenshot", tab_id, SHOT_PATH)
+        call = run_bridge("screenshot", tab_id, SHOT_PATH, "--quiet") if QUIET_MODE else run_bridge("screenshot", tab_id, SHOT_PATH)
         shot = call.get("json") or {}
         record(summary, "screenshot", call, {
             "bytes": shot.get("bytes"),
@@ -358,6 +368,11 @@ def main():
             "path": SHOT_PATH
         })
         require(call["exit"] == 0 and shot.get("bytes", 0) > 1000 and Path(SHOT_PATH).is_file(), "screenshot failed")
+        if QUIET_MODE:
+            state = run_bridge("getCurrentState", tab_id)
+            active = ((result(state) or {}).get("tab") or {}).get("active")
+            record(summary, "quietScreenshotInactive", state, {"active": active})
+            require(state["exit"] == 0 and active is False, "quiet screenshot activated the tab")
 
         # 15. Get HTML
         call = run_bridge("getHTML", tab_id, HTML_PATH)
@@ -534,11 +549,22 @@ def main():
         record(summary, "executeScriptCDP_verify_semantic_css_fill", call, {"filled": css_filled})
         require(call["exit"] == 0 and css_filled is True, "semantic css fill did not update value")
 
-        call = run_bridge("click", tab_id, "role=button[name=Click me")
-        semantic_error = result(call) or {}
-        semantic_rejected = call["exit"] != 0 and "Invalid role locator" in (semantic_error.get("err") or semantic_error.get("error") or "")
-        summary["semanticSyntaxRejected"] = {"rejected": semantic_rejected}
-        require(semantic_rejected, "semantic syntax error was not preserved")
+        malformed_locators = [
+            (">>>> #bad", "Unsupported selector token"),
+            ("frame= >> #q", "Missing frame selector"),
+            ("frame=#frame >>", "Missing final selector"),
+            ("#shadow-host >>>", "Missing final selector"),
+            ("role=button[name=]", "Invalid role locator"),
+            ("role=[name=Submit]", "Invalid role locator"),
+        ]
+        rejected = {}
+        for locator, expected_error in malformed_locators:
+            call = run_bridge("click", tab_id, locator)
+            semantic_error = result(call) or {}
+            message = semantic_error.get("err") or semantic_error.get("error") or ""
+            rejected[locator] = call["exit"] != 0 and expected_error in message
+        summary["semanticSyntaxRejected"] = rejected
+        require(all(rejected.values()), "semantic syntax error was not preserved")
 
         # 24. Start Interception
         call = run_bridge("startInterception", tab_id, "*data.json*", "fulfill", 200, '{"ok":true,"intercepted":true}')
@@ -620,6 +646,12 @@ def main():
         metrics = perf.get("metrics", {}) if isinstance(perf, dict) else {}
         record(summary, "performanceMetrics", call, {"metricCount": len(metrics)})
         require(call["exit"] == 0 and len(metrics) > 0, "performanceMetrics failed or returned no metrics")
+        if QUIET_MODE:
+            state = run_bridge("getCurrentState", tab_id)
+            active = ((result(state) or {}).get("tab") or {}).get("active")
+            record(summary, "quietFinalInactive", state, {"active": active})
+            require(state["exit"] == 0 and active is False, "quiet run ended with active tab")
+
 
         # Compact JSON output on success
         print(json.dumps(summary, separators=(",", ":")))
@@ -647,7 +679,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        parser = argparse.ArgumentParser(description="Run the live Chrome Native Bridge capability matrix")
+        parser.add_argument("--quiet", action="store_true", help="Open the fixture tab inactive and capture screenshots through CDP")
+        args = parser.parse_args()
+        main(quiet=args.quiet)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if LAST_SUMMARY:

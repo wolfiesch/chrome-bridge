@@ -18,6 +18,8 @@ from xml.etree import ElementTree
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLIENT = SCRIPT_DIR / "test_client.py"
 BRIDGE_COMMAND = os.environ.get("CHROME_BRIDGE_CLIENT")
+BENCHMARK_QUIET = False
+
 
 COMPARISON_METADATA = {
     "tools": {
@@ -294,7 +296,10 @@ def _build_bridge_payload(verb, args):
     if verb == "ping":
         return "ping", {}
     if verb == "navigate":
-        return "navigate", {"url": args[0]}
+        payload = {"url": args[0]}
+        if BENCHMARK_QUIET:
+            payload["active"] = False
+        return "navigate", payload
     if verb == "waitForLoad":
         return "waitForLoad", {"tabId": int(args[0]), "timeoutMs": int(args[1])}
     if verb == "waitForSelector":
@@ -308,7 +313,10 @@ def _build_bridge_payload(verb, args):
     if verb == "uploadFile":
         return "uploadFile", {"tabId": int(args[0]), "selector": args[1], "files": [os.path.abspath(p) for p in args[2:]]}
     if verb == "screenshot":
-        return "screenshot", {"tabId": int(args[0]), "format": "png"}
+        payload = {"tabId": int(args[0]), "format": "png"}
+        if BENCHMARK_QUIET:
+            payload["quiet"] = True
+        return "screenshot", payload
     if verb == "extractText":
         return "extractText", {"tabId": int(args[0]), "maxChars": int(args[1])}
     if verb == "getHTML":
@@ -496,6 +504,7 @@ def finish_results(adapter, iterations, results):
         "schemaVersion": 1,
         "adapter": adapter,
         "iterations": iterations,
+        "quiet": BENCHMARK_QUIET,
         "operations": operations,
         "comparison": COMPARISON_METADATA,
         "scorecard": build_scorecard(adapter, operations),
@@ -519,7 +528,7 @@ def run_chrome_bridge_op(op_name, context, base_url):
             return "pass", (time.perf_counter() - t0) * 1000
         raise RuntimeError("ping failed")
     if op_name == "navigate":
-        res = run_bridge_cmd("navigate", base_url)
+        res = run_bridge_cmd("navigate", base_url, "--background") if BENCHMARK_QUIET else run_bridge_cmd("navigate", base_url)
         nav = get_result(res) or {}
         if res["exit"] == 0 and nav.get("tabId") is not None:
             context["tab_id"] = nav["tabId"]
@@ -552,7 +561,7 @@ def run_chrome_bridge_op(op_name, context, base_url):
         with tempfile.NamedTemporaryFile(prefix="shot-", suffix=".png", delete=False) as f:
             temp_path = f.name
         try:
-            res = run_bridge_cmd("screenshot", tab_id, temp_path)
+            res = run_bridge_cmd("screenshot", tab_id, temp_path, "--quiet") if BENCHMARK_QUIET else run_bridge_cmd("screenshot", tab_id, temp_path)
         finally:
             with contextlib_suppress():
                 os.unlink(temp_path)
@@ -1300,6 +1309,8 @@ def initial_results():
 
 
 def handle_run(args):
+    global BENCHMARK_QUIET
+    BENCHMARK_QUIET = bool(getattr(args, "quiet", False))
     base_url = args.base_url
     server = None
     if args.adapter in {"chrome-bridge", "playwright", "puppeteer", "chrome-devtools-mcp"} and args.iterations > 0 and not base_url:
@@ -1668,6 +1679,11 @@ def main():
         type=int,
         default=DEFAULT_BROWSER_RSS_LIMIT_MB,
         help="Abort live adapter runs when matching browser process RSS exceeds this many MB; use 0 to disable",
+    )
+    run_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Avoid avoidable focus changes for chrome-bridge by opening benchmark tabs inactive and using CDP screenshots",
     )
     compare_parser = subparsers.add_parser("compare", help="Compare benchmark results and generate report")
     compare_parser.add_argument("--input", action="append", required=True, help="Path to JSON results file; may be provided multiple times")

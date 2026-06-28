@@ -292,7 +292,7 @@ async function dispatchAction(action, payload) {
         result = "pong";
         break;
       case "navigate":
-        result = await navigateToUrl(payload.url);
+        result = await navigateToUrl(payload.url, payload.active);
         break;
       case "getTabs":
         result = await getTabs();
@@ -346,7 +346,7 @@ async function dispatchAction(action, payload) {
         result = await getCurrentState(payload.tabId);
         break;
       case "screenshot":
-        result = await captureScreenshot(payload.tabId, payload.format);
+        result = await captureScreenshot(payload.tabId, payload.format, payload.quiet);
         break;
       case "extractText":
         result = await extractText(payload.tabId, payload.maxChars);
@@ -455,8 +455,8 @@ function sendResponseToHost(response) {
   }
 }
 
-async function navigateToUrl(url) {
-  const tab = await chrome.tabs.create({ url });
+async function navigateToUrl(url, active = true) {
+  const tab = await chrome.tabs.create({ url, active: active !== false });
   return { tabId: tab.id };
 }
 
@@ -864,6 +864,30 @@ function domClickExpression(locator) {
   })()`;
 }
 
+function domScrollExpression(locator, deltaX, deltaY) {
+  const locatorJson = locator ? JSON.stringify(locator) : "null";
+  return `(() => {
+    ${locator ? locatorResolverSource() : ""}
+    const dx = ${JSON.stringify(deltaX)};
+    const dy = ${JSON.stringify(deltaY)};
+    if (${locatorJson} === null) {
+      window.scrollBy(dx, dy);
+      return { success: true, deltaX: dx, deltaY: dy };
+    }
+    const resolved = resolveLocator(${locatorJson});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    if (typeof el.scrollBy === 'function') {
+      el.scrollBy(dx, dy);
+    } else {
+      el.scrollLeft += dx;
+      el.scrollTop += dy;
+    }
+    return { success: true, deltaX: dx, deltaY: dy, tagName: el.tagName };
+  })()`;
+}
+
+
 function domSelectExpression(locator, value) {
   return `(() => {
     ${locatorResolverSource()}
@@ -1081,10 +1105,19 @@ async function getCurrentState(tabId) {
   };
 }
 
-async function captureScreenshot(tabId, format) {
+async function captureScreenshot(tabId, format, quiet = false) {
+  const screenshotFormat = format || "png";
+  if (quiet) {
+    return withDebugger(tabId, async (target) => {
+      const result = await debuggerCommand(target, "Page.captureScreenshot", { format: screenshotFormat });
+      const mimeType = screenshotFormat === "jpeg" ? "image/jpeg" : "image/png";
+      return { success: true, mimeType, dataUrl: `data:${mimeType};base64,${result.data}` };
+    });
+  }
   const activated = await activateTab(tabId);
-  const dataUrl = await chrome.tabs.captureVisibleTab(activated.windowId, { format: format || "png" });
-  return { success: true, mimeType: "image/png", dataUrl };
+  const dataUrl = await chrome.tabs.captureVisibleTab(activated.windowId, { format: screenshotFormat });
+  const mimeType = screenshotFormat === "jpeg" ? "image/jpeg" : "image/png";
+  return { success: true, mimeType, dataUrl };
 }
 
 async function extractText(tabId, maxChars) {
@@ -1124,11 +1157,20 @@ async function getElementCenter(target, selector) {
   return resolveActionTarget(target.tabId, locator, target);
 }
 
+async function isTabActive(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab.active === true;
+  } catch (error) {
+    return true;
+  }
+}
+
 async function clickSelector(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const lookup = await getElementCenter(target, selector);
     if (lookup.success === false) return lookup;
-    if (lookup.contextId !== null && lookup.contextId !== undefined) {
+    if (lookup.contextId !== null && lookup.contextId !== undefined || !(await isTabActive(tabId))) {
       const click = await evaluateInContext(target, domClickExpression(lookup.locator), lookup.contextId);
       const value = click.val || click;
       if (!click.success || value.success === false) return value;
@@ -1167,13 +1209,25 @@ async function hoverSelector(tabId, selector) {
 async function scrollTarget(tabId, deltaX, deltaY, selector) {
   return withDebugger(tabId, async (target) => {
     let point;
+    let locator = null;
     if (selector) {
-      point = await getElementCenter(target, selector);
+      try {
+        locator = parseActionLocator(selector);
+      } catch (error) {
+        return { success: false, err: error.message };
+      }
+      point = await resolveActionTarget(tabId, locator, target);
       if (point.success === false) return point;
     } else {
       const center = await evaluateWithDebugger(target, '({ x: innerWidth / 2, y: innerHeight / 2 })');
       if (!center.success) return center;
       point = center.val;
+    }
+    if (!(await isTabActive(tabId))) {
+      const scrolled = await evaluateInContext(target, domScrollExpression(locator, deltaX, deltaY), point.contextId);
+      const value = scrolled.val || scrolled;
+      if (!scrolled.success || value.success === false) return value;
+      return value;
     }
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: point.x, y: point.y, deltaX, deltaY });
     return { success: true, deltaX, deltaY };

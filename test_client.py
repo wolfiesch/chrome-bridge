@@ -165,8 +165,11 @@ def result_payload(response):
     return result if isinstance(result, dict) else response
 
 
-def save_screenshot(tab_id, output_path):
-    exit_code, response, stderr = send_command_data("screenshot", {"tabId": tab_id, "format": "png"})
+def save_screenshot(tab_id, output_path, quiet=False):
+    payload = {"tabId": tab_id, "format": "png"}
+    if quiet:
+        payload["quiet"] = True
+    exit_code, response, stderr = send_command_data("screenshot", payload)
     if exit_code != 0:
         if response is not None:
             print(json.dumps(response, indent=2))
@@ -538,7 +541,10 @@ def main():
         sys.exit(send_command("ping"))
     elif action == "navigate":
         require_args(args, 3, "Missing URL.")
-        sys.exit(send_command("navigate", {"url": args[2]}))
+        payload = {"url": args[2]}
+        if len(args) > 3 and args[3] == "--background":
+            payload["active"] = False
+        sys.exit(send_command("navigate", payload))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
     elif action == "getCookies":
@@ -575,8 +581,8 @@ def main():
         require_args(args, 4, "Usage: python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
         sys.exit(send_command("waitForUrl", {"tabId": parse_int(args[2], "tabId"), "substring": args[3], "timeoutMs": parse_timeout(args, 4)}))
     elif action == "screenshot":
-        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath>")
-        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3]))
+        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--quiet]")
+        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3], len(args) > 4 and args[4] == "--quiet"))
     elif action == "extractText":
         require_args(args, 3, "Usage: python3 test_client.py extractText <tabId> [maxChars]")
         max_chars = parse_int(args[3], "maxChars") if len(args) > 3 else 20000

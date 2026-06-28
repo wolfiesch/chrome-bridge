@@ -84,6 +84,12 @@ def main():
         proc = run("run", "--adapter", "noop", "--iterations", "2", "--output", str(out))
         require(proc.returncode == 0, f"benchmark run failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
         require(out.is_file(), "benchmark JSON output was not written")
+        quiet_out = Path(tmp) / "quiet-results.json"
+        proc = run("run", "--adapter", "noop", "--iterations", "1", "--quiet", "--output", str(quiet_out))
+        require(proc.returncode == 0, f"quiet benchmark flag failed: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        quiet_data = json.loads(quiet_out.read_text(encoding="utf-8"))
+        require(quiet_data.get("quiet") is True, "quiet benchmark mode was not recorded")
+
 
         data = json.loads(out.read_text(encoding="utf-8"))
         require(data.get("schemaVersion") == 1, "schemaVersion must be 1")
