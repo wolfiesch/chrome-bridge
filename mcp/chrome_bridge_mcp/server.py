@@ -94,7 +94,7 @@ def browser_click(selector: str, tab_id: Optional[int] = None) -> str:
 
 
 def browser_type(selector: str, text: str, tab_id: Optional[int] = None) -> str:
-    """Focus an element and insert text (does not clear existing value)."""
+    """Focus a CSS, semantic, frame, or shadow target and insert text without clearing."""
     tid = resolve_tab_id(tab_id)
     return _text(call("type", {"tabId": tid, "selector": selector, "text": text}))
 
@@ -117,7 +117,7 @@ def browser_scroll(
     selector: Optional[str] = None,
     tab_id: Optional[int] = None,
 ) -> str:
-    """Scroll by ``delta_x``/``delta_y``; scope to ``selector`` when given."""
+    """Scroll by ``delta_x``/``delta_y``; scope to a CSS, semantic, frame, or shadow ``selector`` when given."""
     tid = resolve_tab_id(tab_id)
     return _text(call("scroll", {
         "tabId": tid,
@@ -231,7 +231,8 @@ def browser_wait_for(
     """Wait for a page condition.
 
     ``mode`` is one of ``load``, ``selector``, ``text``, ``url``. Provide
-    ``selector`` for ``selector`` mode, ``text`` for ``text`` mode, and
+    ``selector`` for ``selector`` mode; it accepts CSS, semantic, frame, and
+    shadow locator grammar. Provide ``text`` for ``text`` mode and
     ``url_substring`` for ``url`` mode.
     """
     tid = resolve_tab_id(tab_id)

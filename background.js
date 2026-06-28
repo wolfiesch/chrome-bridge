@@ -653,19 +653,74 @@ function parseLocatorToken(rawToken, rawLocator) {
   return { kind: "css", selector: token };
 }
 
+function scanLocatorSeparators(raw, separator) {
+  const parts = [];
+  let start = 0;
+  let quote = null;
+  let escaped = false;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[") {
+      bracketDepth += 1;
+      continue;
+    }
+    if (ch === "]" && bracketDepth > 0) {
+      bracketDepth -= 1;
+      continue;
+    }
+    if (ch === "(") {
+      parenDepth += 1;
+      continue;
+    }
+    if (ch === ")" && parenDepth > 0) {
+      parenDepth -= 1;
+      continue;
+    }
+    if (bracketDepth === 0 && parenDepth === 0 && raw.startsWith(separator, i)) {
+      parts.push(raw.slice(start, i).trim());
+      i += separator.length - 1;
+      start = i + 1;
+    }
+  }
+  parts.push(raw.slice(start).trim());
+  return parts;
+}
+
+function hasUnsupportedLocatorToken(raw) {
+  return scanLocatorSeparators(raw, ">>>>").length > 1 || scanLocatorSeparators(raw, "<<<").length > 1;
+}
+
 function parseActionLocator(selector) {
   const raw = String(selector ?? "");
-  if (raw.includes(">>>>") || raw.includes("<<<") || /["'][^"']*(?:>>>|>>)[^"']*["']/.test(raw)) {
+  if (hasUnsupportedLocatorToken(raw)) {
     throw new Error(`Unsupported selector token in ${raw}`);
   }
-  const shadowParts = raw.split(/\s*>>>\s*/);
+  const shadowParts = scanLocatorSeparators(raw, ">>>");
   if (!shadowParts[0]?.trim()) {
     throw new Error(`Missing final selector in ${raw}`);
   }
   if (shadowParts.some((part, index) => index > 0 && !part.trim())) {
     throw new Error(`Missing final selector in ${raw}`);
   }
-  const frameParts = shadowParts[0].split(/\s*>>\s*/);
+  const frameParts = scanLocatorSeparators(shadowParts[0], ">>");
   const frames = [];
   let target = null;
   for (let i = 0; i < frameParts.length; i++) {
