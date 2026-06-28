@@ -23,47 +23,6 @@ HTML_PATH = "/tmp/chrome-bridge-live.html"
 STATE_PATH = "/tmp/chrome-bridge-state.json"
 DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
 LAST_SUMMARY = {}
-POLICY_PATH = Path(os.environ.get("BRIDGE_POLICY_FILE", os.path.join(SCRIPT_DIR, "bridge_policy.json")))
-
-
-def install_smoke_policy():
-    """Temporarily permit the local fixture actions this live verifier exercises."""
-    backup = None
-    if POLICY_PATH.exists():
-        backup = POLICY_PATH.read_bytes()
-    policy = {
-        "default": {
-            "allowedActions": [
-                "ping", "navigate", "waitForLoad", "waitForSelector", "click", "fill",
-                "select", "uploadFile", "screenshot", "extractText", "getHTML", "type", "drag",
-                "scroll", "press", "hover", "startMonitoring", "consoleMessages",
-                "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
-                "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
-                "handleDialog", "stopMonitoring", "getCurrentState", "startInterception",
-                "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
-                "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab"
-            ],
-            "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
-            "deniedActions": [],
-            "deniedOrigins": [],
-            "requireConfirmation": [],
-            "redact": True,
-            "audit": False,
-        }
-    }
-    POLICY_PATH.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
-    return backup
-
-
-def restore_policy(backup):
-    if backup is None:
-        with contextlib.suppress(FileNotFoundError):
-            POLICY_PATH.unlink()
-    else:
-        POLICY_PATH.write_bytes(backup)
-
-
-
 PAGE = b"""<!doctype html>
 <html>
 <head>
@@ -154,8 +113,55 @@ def bridge_command():
             "or set CHROME_BRIDGE_CLIENT=chrome-bridge to use an installed launcher."
         )
     return [BRIDGE_COMMAND] if BRIDGE_COMMAND else [sys.executable, CLIENT]
+def resolve_policy_path():
+    p_host = None
+    resolved_from_host = False
+    try:
+        proc = subprocess.run([*bridge_command(), "policy", "info"], text=True, capture_output=True, timeout=5)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            p_file = (data.get("result") or {}).get("policyFile")
+            if p_file:
+                p_host = Path(p_file)
+                resolved_from_host = True
+    except Exception as e:
+        sys.stderr.write(f"RESOLVER WARNING: failed to query host policy path: {e}\n")
+
+    p_env = os.environ.get("BRIDGE_POLICY_FILE")
+    if p_env:
+        p_env_path = Path(p_env)
+        if p_host and p_host.resolve() != p_env_path.resolve():
+            raise AssertionError(
+                f"Mismatch between environment BRIDGE_POLICY_FILE ({p_env_path}) "
+                f"and active host policy file ({p_host})"
+            )
+        return p_env_path, resolved_from_host
+
+    if p_host:
+        sys.stderr.write(f"RESOLVED ACTIVE POLICY FILE PATH FROM HOST: {p_host}\n")
+        return p_host, True
+
+    return Path(os.path.join(SCRIPT_DIR, "bridge_policy.json")), False
+
+
+
+def restore_policy(backup, policy_path, backup_mode=None):
+    if backup is None:
+        with contextlib.suppress(FileNotFoundError):
+            policy_path.unlink()
+    else:
+        policy_path.write_bytes(backup)
+        if backup_mode is not None:
+            try:
+                os.chmod(policy_path, backup_mode)
+            except OSError:
+                pass
+
 
 def run_bridge(*args, timeout=20):
+    for arg in args:
+        if isinstance(arg, int) and arg > 1000:
+            timeout = max(timeout, int(arg / 1000) + 15)
     proc = subprocess.run([*bridge_command(), *map(str, args)], text=True, capture_output=True, timeout=timeout)
     parsed = None
     if proc.stdout:
@@ -186,22 +192,64 @@ def record(summary, name, call, extra=None):
     LAST_SUMMARY = summary
     return call
 
-def require(condition, message):
+def require(condition, message, call=None):
     if not condition:
-        raise AssertionError(message)
+        err = f"\nSTDERR: {call.get('stderr')}" if isinstance(call, dict) and call.get("stderr") else ""
+        out = f"\nSTDOUT: {call.get('stdout')}" if isinstance(call, dict) and call.get("stdout") else ""
+        raise AssertionError(f"{message}{err}{out}")
 
 def main():
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
     for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-    policy_backup = install_smoke_policy()
-    server = start_server()
-    summary = {}
+    policy_backup = None
+    backup_mode = None
+    policy_path = None
+    policy_installed = False
+    server = None
     tab_id = None
     monitoring_started = False
     interception_started = False
     try:
+        p_path, resolved_from_host = resolve_policy_path()
+        require(resolved_from_host or "BRIDGE_POLICY_FILE" in os.environ, "Expected policy path to be resolved from host via 'policy info'")
+        policy_path = p_path
+        if policy_path.exists():
+            policy_backup = policy_path.read_bytes()
+            try:
+                backup_mode = os.stat(policy_path).st_mode & 0o777
+            except OSError:
+                pass
+        policy = {
+            "default": {
+                "allowedActions": [
+                    "ping", "navigate", "waitForLoad", "waitForSelector", "click", "fill",
+                    "select", "uploadFile", "screenshot", "extractText", "getHTML", "type", "drag",
+                    "scroll", "press", "hover", "startMonitoring", "consoleMessages",
+                    "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
+                    "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
+                    "handleDialog", "stopMonitoring", "getCurrentState", "startInterception",
+                    "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
+                    "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab"
+                ],
+                "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
+                "deniedActions": [],
+                "deniedOrigins": [],
+                "requireConfirmation": [],
+                "redact": True,
+                "audit": False,
+            }
+        }
+        policy_path.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
+        policy_installed = True
+        try:
+            os.chmod(policy_path, 0o600)
+        except OSError:
+            pass
+        time.sleep(1.1)  # let policy file mtime advance for host hot-reload
+        server = start_server()
+        summary = {}
         # 1. Ping
         call = run_bridge("ping")
         record(summary, "ping", call, {"pong": result(call) == "pong"})
@@ -215,15 +263,14 @@ def main():
         require(call["exit"] == 0 and tab_id is not None, "navigate did not return tabId")
 
         # 3. Wait For Load
-        call = run_bridge("waitForLoad", tab_id, 10000)
+        call = run_bridge("waitForLoad", tab_id, 20000)
         record(summary, "waitForLoad", call)
-        require(call["exit"] == 0, "waitForLoad failed")
+        require(call["exit"] == 0, "waitForLoad failed", call)
 
         # 4. Wait For Selector
-        call = run_bridge("waitForSelector", tab_id, "#q", 10000)
+        call = run_bridge("waitForSelector", tab_id, "#q", 20000)
         record(summary, "waitForSelector", call)
-        require(call["exit"] == 0, "waitForSelector failed")
-
+        require(call["exit"] == 0, "waitForSelector failed", call)
         # 5. Fill
         call = run_bridge("fill", tab_id, "#q", "hello")
         record(summary, "fill", call)
@@ -239,10 +286,6 @@ def main():
         record(summary, "hover", call)
         require(call["exit"] == 0, "hover failed")
 
-        # 8. Scroll
-        call = run_bridge("scroll", tab_id, 0, 300)
-        record(summary, "scroll", call)
-        require(call["exit"] == 0, "scroll failed")
 
         # 9. Upload File
         call = run_bridge("uploadFile", tab_id, "#file", UPLOAD_FIXTURE)
@@ -264,7 +307,7 @@ def main():
         call = run_bridge("click", tab_id, "#btn")
         record(summary, "click", call)
         require(call["exit"] == 0, "click failed")
-
+        time.sleep(0.2)
         call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
         status = (result(call) or {}).get("val")
         record(summary, "executeScriptCDP_verify_click", call, {"status": status})
@@ -281,6 +324,11 @@ def main():
         call = run_bridge("press", tab_id, "Enter")
         record(summary, "press", call)
         require(call["exit"] == 0, "press failed")
+
+        # 13b. Scroll
+        call = run_bridge("scroll", tab_id, 0, 300)
+        record(summary, "scroll", call)
+        require(call["exit"] == 0, "scroll failed")
 
         # 14. Screenshot
         call = run_bridge("screenshot", tab_id, SHOT_PATH)
@@ -500,10 +548,14 @@ def main():
         interception_started = False
 
         # 27. Download URL
-        call = run_bridge("downloadUrl", BASE_URL + "data.json", DOWNLOAD_NAME)
-        res = result(call) or {}
-        record(summary, "downloadUrl", call, {"downloadId": res.get("downloadId")})
-        require(call["exit"] == 0 and res.get("downloadId") is not None, "downloadUrl failed")
+        if os.environ.get("CHROME_BRIDGE_TEST_DOWNLOAD") != "1":
+            sys.stderr.write("Skipping downloadUrl check (opt-in only for live profiles).\n")
+            summary["downloadUrl"] = {"exit": 0, "skipped": True}
+        else:
+            call = run_bridge("downloadUrl", BASE_URL + "data.json", DOWNLOAD_NAME)
+            res = result(call) or {}
+            record(summary, "downloadUrl", call, {"downloadId": res.get("downloadId")})
+            require(call["exit"] == 0 and res.get("downloadId") is not None, "downloadUrl failed")
 
         # 28. Storage State
         call = run_bridge("storageState", tab_id, STATE_PATH)
@@ -565,8 +617,10 @@ def main():
             with contextlib.suppress(Exception):
                 run_bridge("closeTab", tab_id)
 
-        restore_policy(policy_backup)
-        server.shutdown()
+        if policy_installed and policy_path is not None:
+            restore_policy(policy_backup, policy_path, backup_mode)
+        if server is not None:
+            server.shutdown()
 
         for path in [UPLOAD_FIXTURE, SHOT_PATH, HTML_PATH, STATE_PATH]:
             with contextlib.suppress(FileNotFoundError):

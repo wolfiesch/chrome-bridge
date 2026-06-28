@@ -15,6 +15,7 @@ TEMPLATE="$SCRIPT_DIR/com.automation.bridge.json.template"
 KEY_FILE="$SCRIPT_DIR/extension_key.pem"
 LAUNCHER="$SCRIPT_DIR/bridge.py"
 EXTENSION_ID=""
+EXTENSION_ID_FILE="$SCRIPT_DIR/extension_id.txt"
 
 case "$(uname -s)" in
   Darwin) EXT_DIR="$HOME/Library/Application Support/chrome-native-bridge/extension" ;;
@@ -57,31 +58,32 @@ if [[ -n "$STATE_DIR" ]]; then
   if [[ "$KEY_FILE_PROVIDED" -eq 0 ]]; then
     KEY_FILE="$STATE_DIR/extension_key.pem"
   fi
+  EXTENSION_ID_FILE="$STATE_DIR/extension_id.txt"
 fi
 
 if [[ ! -f "$TOKEN_FILE" ]]; then
   python3 -c "import secrets; print(secrets.token_hex(32))" > "$TOKEN_FILE"
-  chmod 600 "$TOKEN_FILE"
   echo "Generated new bridge token at $TOKEN_FILE"
 else
   echo "Existing bridge token kept at $TOKEN_FILE"
 fi
+chmod 600 "$TOKEN_FILE"
 
 if [[ ! -f "$TOKENS_FILE" ]]; then
   : > "$TOKENS_FILE"
-  chmod 600 "$TOKENS_FILE"
   echo "Created empty bridge tokens registry at $TOKENS_FILE"
 else
   echo "Existing bridge_tokens.txt kept at $TOKENS_FILE"
 fi
+chmod 600 "$TOKENS_FILE"
 
 if [[ ! -f "$POLICY_FILE" ]]; then
   cp "$SCRIPT_DIR/bridge_policy.example.json" "$POLICY_FILE"
-  chmod 600 "$POLICY_FILE"
   echo "Installed default bridge policy at $POLICY_FILE"
 else
   echo "Existing bridge_policy.json kept at $POLICY_FILE"
 fi
+chmod 600 "$POLICY_FILE"
 
 if [[ -z "$EXTENSION_ID" ]]; then
   "$SCRIPT_DIR/deploy.sh" --ext "$EXT_DIR" --with-local-key --key-file "$KEY_FILE"
@@ -89,6 +91,9 @@ if [[ -z "$EXTENSION_ID" ]]; then
 else
   echo "Using provided extension ID: $EXTENSION_ID"
 fi
+printf '%s\n' "$EXTENSION_ID" > "$EXTENSION_ID_FILE"
+chmod 0644 "$EXTENSION_ID_FILE"
+echo "Wrote extension ID $EXTENSION_ID_FILE"
 
 if [[ -n "$STATE_DIR" ]]; then
   cat > "$LAUNCHER" <<EOF

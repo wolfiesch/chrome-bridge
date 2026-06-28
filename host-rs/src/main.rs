@@ -470,7 +470,7 @@ fn origin_exempt_action(action: &str) -> bool {
         action,
         "ping" | "getTabs" | "navigate" | "downloadUrl" | "getCookies"
             | "sessionStatus" | "batch" | "lease" | "release" | "leaseStatus"
-            | "policyCheck"
+            | "policyCheck" | "policyInfo"
     )
 }
 
@@ -503,7 +503,7 @@ fn audit_log_path(host_dir: &Path) -> PathBuf {
 fn default_policy() -> Value {
     json!({
         "default": {
-            "allowedActions": ["ping", "policyCheck", "lease", "release", "leaseStatus"],
+            "allowedActions": ["ping", "policyCheck", "policyInfo", "lease", "release", "leaseStatus"],
             "deniedActions": [],
             "allowedOrigins": [],
             "deniedOrigins": [
@@ -873,12 +873,12 @@ fn evaluate_policy(
         }
         let mut step_confirm = false;
         for (i, (s_action, s_payload)) in step_payloads(payload).into_iter().enumerate() {
-            let (s_allowed, s_reason, s_confirm, _, _, _) =
+            let (s_allowed, s_reason, s_confirm, _, _, s_targets) =
                 evaluate_policy(policy, name, &s_action, Some(&s_payload), origins);
             if !s_allowed {
                 let reason = s_reason.unwrap_or_default();
                 return (false, Some(format!("batch step {}: {}", i, reason)), false,
-                        redact_enabled, audit_enabled, targets);
+                        redact_enabled, audit_enabled, s_targets);
             }
             step_confirm = step_confirm || s_confirm;
         }
@@ -892,6 +892,121 @@ fn evaluate_policy(
         return (false, Some("target not allowed".to_string()), false, redact_enabled, audit_enabled, targets);
     }
     (true, None, confirm, redact_enabled, audit_enabled, targets)
+}
+
+/// Structured, actionable companion to the opaque "policy denied: <reason>"
+/// error string. The error string itself stays byte-stable for API and
+/// contract compatibility; this object tells a client exactly what to grant, in
+/// which list, and in which file. Mirrors bridge.py::policy_denial.
+fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, host_dir: &Path, policy: &Value) -> Value {
+    let policy_file = policy_file_path(host_dir).to_string_lossy().to_string();
+    let sample = targets.first().cloned();
+    // Strip a "batch step N: <inner>" wrapper so a denied batch step yields the
+    // same structured remediation as the inner action. Mirrors bridge.py.
+    let mut reason = reason.to_string();
+    let mut action = action.to_string();
+    let mut batch_step: Option<i64> = None;
+    if let Some(rest) = reason.strip_prefix("batch step ") {
+        if let Some((num, inner)) = rest.split_once(": ") {
+            if let Ok(n) = num.parse::<i64>() {
+                batch_step = Some(n);
+                reason = inner.to_string();
+            }
+        }
+    }
+    // For action-type reasons the real action is embedded in the reason text;
+    // the outer action may be "batch" for a denied step, so trust the reason.
+    if let Some(inner) = reason.strip_prefix("action ") {
+        let act = inner
+            .strip_suffix(" not allowed")
+            .or_else(|| inner.strip_suffix(" denied"));
+        if let Some(a) = act {
+            if !a.contains(' ') {
+                action = a.to_string();
+            }
+        }
+    }
+    let reason = reason.as_str();
+    let action = action.as_str();
+    // policy_for_client replaces an inherited list when the client layer defines
+    // its own, so a fix must edit the section that actually governs this client:
+    // clients.<name>.<list> when present, else default.<list>.
+    let section_for = |list_key: &str| -> String {
+        let has_client_list = policy
+            .get("clients")
+            .and_then(|c| c.get(name))
+            .and_then(|l| l.get(list_key))
+            .map(|v| v.is_array())
+            .unwrap_or(false);
+        if has_client_list { format!("clients.{}", name) } else { "default".to_string() }
+    };
+    let (kind, remediation, suggested): (&str, String, Value) =
+        if reason.starts_with("action ") && reason.ends_with("not allowed") {
+            let section = section_for("allowedActions");
+            ("action",
+             format!("Add '{}' to {}.allowedActions in {}", action, section, policy_file),
+             json!({"op": "add", "section": section, "list": "allowedActions", "value": action}))
+        } else if reason == "target not allowed" {
+            let section = section_for("allowedOrigins");
+            ("origin",
+             match &sample {
+                 Some(s) => format!("Add an origin pattern covering '{}' to {}.allowedOrigins in {}", s, section, policy_file),
+                 None => format!("Add the request origin to {}.allowedOrigins in {}", section, policy_file),
+             },
+             match &sample {
+                 Some(_) => json!({"op": "add", "section": section, "list": "allowedOrigins", "value": sample}),
+                 None => Value::Null,
+             })
+        } else if reason == "target denied" {
+            let section = section_for("deniedOrigins");
+            let cp = policy_for_client(policy, name);
+            let matched: Vec<String> = cp.get("deniedOrigins")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|p| p.as_str())
+                    .filter(|p| target_matches(Some(&json!([p])), targets))
+                    .map(|p| p.to_string())
+                    .collect())
+                .unwrap_or_default();
+            ("origin",
+             match &sample {
+                 Some(s) => format!("Remove or narrow the {}.deniedOrigins pattern(s) {:?} matching '{}' in {}", section, matched, s, policy_file),
+                 None => format!("Remove or narrow the matching {}.deniedOrigins pattern in {}", section, policy_file),
+             },
+             if matched.is_empty() { Value::Null }
+             else { json!({"op": "removePattern", "section": section, "list": "deniedOrigins", "value": sample, "patterns": matched}) })
+        } else if reason.starts_with("action ") && reason.ends_with("denied") {
+            let section = section_for("deniedActions");
+            let cp = policy_for_client(policy, name);
+            let matched: Vec<String> = cp.get("deniedActions")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|p| p.as_str())
+                    .filter(|p| action_matches(Some(&json!([p])), action))
+                    .map(|p| p.to_string())
+                    .collect())
+                .unwrap_or_default();
+            ("action",
+             format!("Remove or narrow the {}.deniedActions pattern(s) {:?} matching '{}' in {}", section, matched, action, policy_file),
+             json!({"op": "removePattern", "section": section, "list": "deniedActions", "value": action, "patterns": matched}))
+        } else if reason == "target unresolved" || reason == "tab origin unresolved" {
+            ("target",
+             "The request carried no resolvable target origin; supply a valid url/domain/tabId so site policy can be evaluated".to_string(),
+             Value::Null)
+        } else {
+            ("other", format!("Review default policy in {}", policy_file), Value::Null)
+        };
+    json!({
+        "kind": kind,
+        "action": action,
+        "targets": targets,
+        "policyFile": policy_file,
+        "client": name,
+        "remediation": remediation,
+        "suggestedPatch": suggested,
+        "batchStep": batch_step,
+        "cli": "chrome-bridge policy doctor",
+    })
 }
 
 /// Append one JSON line to the audit log. Never writes payload/response bodies.
@@ -1291,6 +1406,30 @@ fn handle_socket_client(
             continue;
         }
 
+        // policyInfo is host-side and always answerable (handled before the
+        // action gate, like policyCheck) so a client can always discover the
+        // active policy file path even when the current policy would deny
+        // everything else. It deliberately returns ONLY the path and its
+        // existence -- never policy contents -- so a token holder cannot use it
+        // to enumerate allowed/denied origins. Mirrors bridge.py.
+        if action == "policyInfo" {
+            let cp = policy_for_client(&policy_value, &client_name);
+            let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            let policy_file = policy_file_path(host_dir);
+            let audit_log = audit_log_path(host_dir);
+            let resp = json!({"success": true, "result": {
+                "policyFile": policy_file.to_string_lossy(),
+                "policyFileExists": policy_file.exists(),
+                "auditLogFile": audit_log.to_string_lossy(),
+                "client": client_name,
+            }});
+            audit(host_dir, logger, audit_enabled, &client_name, "policyInfo", &[], "allow", None, None);
+            if write_line(&mut stream, &resp).is_err() {
+                return;
+            }
+            continue;
+        }
+
         let empty_origins = std::collections::BTreeMap::new();
 
         // Phase 1: action-level and payload-target checks needing no extension
@@ -1301,7 +1440,7 @@ fn handle_socket_client(
         if !allowed {
             let reason = _reason.unwrap_or_default();
             audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason)}));
+            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)}));
             continue;
         }
 
@@ -1341,7 +1480,7 @@ fn handle_socket_client(
                 let mut t = targets.clone();
                 t.push("<unresolved-origin>".to_string());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &t, "deny", Some("tab origin unresolved"), None);
-                let _ = write_line(&mut stream, &json!({"success": false, "error": "policy denied: tab origin unresolved"}));
+                let _ = write_line(&mut stream, &json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value)}));
                 continue;
             }
             let (allowed, reason, confirm, _, _, targets) =
@@ -1349,7 +1488,7 @@ fn handle_socket_client(
             if !allowed {
                 let reason = reason.unwrap_or_default();
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason)}));
+                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)}));
                 continue;
             }
             (confirm, targets)

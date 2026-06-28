@@ -431,6 +431,94 @@ def run_against(label, cmd, env):
         expect(pc_events and pc_events[0]["targets"] == ["*://mail.google.com"],
                f"{label}: policyCheck targets = {pc_events[0]['targets'] if pc_events else None}")
 
+    # --- Structured policyDenial companion accompanies action denials ---
+    write_policy(permissive_with(deniedActions=["getCookies"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getCookies", {"domain": "mail.google.com"})
+        # Error string stays byte-stable; structured companion is additive.
+        expect(r and r.get("error") == "policy denied: action getCookies denied",
+               f"{label}: getCookies deny error must stay byte-stable, got {r}")
+        pd = (r or {}).get("policyDenial") or {}
+        expect(pd.get("kind") == "action" and pd.get("action") == "getCookies",
+               f"{label}: policyDenial should classify action getCookies, got {pd}")
+        sp = pd.get("suggestedPatch") or {}
+        expect(sp.get("op") == "removePattern" and sp.get("list") == "deniedActions"
+               and sp.get("patterns") == ["getCookies"],
+               f"{label}: policyDenial suggestedPatch should removePattern from deniedActions, got {sp}")
+        expect(pd.get("policyFile") == POLICY_FILE,
+               f"{label}: policyDenial should report the active policy file, got {pd}")
+        c.close()
+
+    # --- policyDenial for a denied batch step carries the step index ---
+    write_policy(permissive_with(deniedActions=["executeScript"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("batch", {"steps": [
+            {"action": "ping", "payload": {}},
+            {"action": "executeScript", "payload": {"tabId": 1, "code": "1"}}]})
+        pd = (r or {}).get("policyDenial") or {}
+        expect(pd.get("batchStep") == 1 and pd.get("action") == "executeScript",
+               f"{label}: policyDenial should name failing batch step 1 / executeScript, got {pd}")
+        c.close()
+
+    # --- policyInfo is always answerable, even under a deny-all policy, and
+    #     leaks only paths/metadata (never policy contents) ---
+    write_policy({"default": {"allowedActions": [], "deniedActions": ["*"],
+                              "allowedOrigins": [], "deniedOrigins": ["*"],
+                              "requireConfirmation": [], "redact": True, "audit": True}})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        # Sanity: the deny-all policy really denies a normal action.
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False,
+               f"{label}: deny-all policy should deny getTabs, got {r}")
+        r = c.req("policyInfo")
+        expect(r and r.get("success") is True,
+               f"{label}: policyInfo must succeed under deny-all policy, got {r}")
+        res = (r or {}).get("result") or {}
+        expect(set(res.keys()) == {"policyFile", "policyFileExists", "auditLogFile", "client"},
+               f"{label}: policyInfo must expose only path metadata, got {sorted(res.keys())}")
+        expect(res.get("policyFile") == POLICY_FILE and res.get("policyFileExists") is True,
+               f"{label}: policyInfo should report the active policy file, got {res}")
+        expect("policyInfo" not in forwarded_actions(),
+               f"{label}: policyInfo must not forward to the extension")
+        c.close()
+
+    # --- CLI `policy allow-action` produces a policy the host honors WITHOUT
+    #     dropping inherited grants (the replace-merge footgun). Uses the real
+    #     test_client.cmd_policy to edit the file, then the host to evaluate. ---
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("tc_guard", os.path.join(SCRIPT_DIR, "test_client.py"))
+    _tc = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_tc)
+    # Base policy: default grants ping + getTabs only. We grant getCookies via the
+    # CLI and require ping/getTabs to still resolve afterward.
+    write_policy({"default": {"allowedActions": ["ping", "getTabs"], "deniedActions": [],
+                              "allowedOrigins": ["*"], "deniedOrigins": [],
+                              "requireConfirmation": [], "redact": True, "audit": True}})
+    _tc.send_command_data = lambda a, p=None, read_timeout_ms=None, confirmation_token=None: (
+        0, {"success": True, "result": {"policyFile": POLICY_FILE, "policyFileExists": True,
+                                        "auditLogFile": AUDIT_FILE, "client": "alpha"}}, "")
+    import io as _io, contextlib as _ctx
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "allow-action", "getCookies"])
+    expect(_rc == 0, f"{label}: CLI allow-action should succeed, got rc={_rc}")
+    time.sleep(1.1)  # let the policy file mtime advance for hot-reload
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is True,
+               f"{label}: host should honor CLI-granted getCookies, got {r}")
+        # Inherited grants must survive the edit (the replace-merge footgun).
+        r = c.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: inherited ping must survive CLI allow-action, got {r}")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: inherited getTabs must survive CLI allow-action, got {r}")
+        c.close()
+
     # --- Reserved action rejected from socket clients ---
     write_policy(PERMISSIVE)
     with Host(label, cmd, env):

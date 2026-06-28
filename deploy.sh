@@ -97,6 +97,8 @@ if [[ -n "$EXT_DIR" ]]; then
 
   mkdir -p "$EXT_DIR"
   cp "$SCRIPT_DIR/background.js" "$EXT_DIR/background.js"
+  cp "$SCRIPT_DIR/wake.html" "$EXT_DIR/wake.html"
+  cp "$SCRIPT_DIR/wake.js" "$EXT_DIR/wake.js"
   if [[ "$PUBLIC_UNKEYED" == "1" ]]; then
     cp "$SCRIPT_DIR/manifest.json" "$EXT_DIR/manifest.json"
   else
@@ -124,7 +126,7 @@ if [[ -n "$EXT_DIR" ]]; then
     find "$EXT_DIR" -maxdepth 1 -name '_*' >&2
     exit 1
   fi
-  echo "Extension synced to $EXT_DIR (background.js, manifest.json). Reload the extension."
+  echo "Extension synced to $EXT_DIR (background.js, wake.html, wake.js, manifest.json). Reload the extension."
 fi
 
 if [[ -n "$HOST_DIR" ]]; then
@@ -151,8 +153,8 @@ if [[ -n "$HOST_DIR" ]]; then
       else
         cp "$SCRIPT_DIR/bridge_policy.example.json" "$HOST_DIR/bridge_policy.json"
       fi
-      chmod 600 "$HOST_DIR/bridge_policy.json"
     fi
+    chmod 600 "$HOST_DIR/bridge_policy.json"
   elif [[ ! -f "$HOST_DIR/bridge_policy.json" ]]; then
     echo "WARNING: no bridge_policy.json in $HOST_DIR; fail-closed defaults allow only ping/policyCheck/lease operations" >&2
   fi

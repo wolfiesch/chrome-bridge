@@ -11,6 +11,7 @@ extension_key.pem
 # Generated host manifests (contain absolute paths + your extension ID)
 com.automation.bridge.json
 com.automation.bridge.rust.json
+extension_id.txt
 # Generated Rust launcher (machine-specific absolute paths)
 bridge-host-launch.sh
 bridge-host-python-launch.sh

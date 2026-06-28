@@ -255,7 +255,7 @@ DESTRUCTIVE_ACTIONS = {
 # by default rather than silently exempt).
 ORIGIN_EXEMPT_ACTIONS = {
     'ping', 'getTabs', 'navigate', 'downloadUrl', 'getCookies', 'sessionStatus',
-    'batch', 'lease', 'release', 'leaseStatus', 'policyCheck',
+    'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
 }
 
 # Actions a socket client may never invoke directly: they are reserved for
@@ -269,7 +269,7 @@ TARGET_REQUIRED_ACTIONS = {'navigate', 'downloadUrl', 'getCookies'}
 # automation beyond host-side liveness/policy/lease operations.
 DEFAULT_POLICY = {
     "default": {
-        "allowedActions": ["ping", "policyCheck", "lease", "release", "leaseStatus"],
+        "allowedActions": ["ping", "policyCheck", "policyInfo", "lease", "release", "leaseStatus"],
         "deniedActions": [],
         "allowedOrigins": [],
         "deniedOrigins": [
@@ -510,11 +510,11 @@ def evaluate_policy(policy, name, action, payload, origins=None):
             return (True, None, True, redact_enabled, audit_enabled, targets)
         step_confirm = False
         for i, (s_action, s_payload) in enumerate(_step_payloads(payload)):
-            s_allowed, s_reason, s_confirm, _, _, _ = evaluate_policy(
+            s_allowed, s_reason, s_confirm, _, _, s_targets = evaluate_policy(
                 policy, name, s_action, s_payload, origins=origins)
             if not s_allowed:
                 return (False, f"batch step {i}: {s_reason}", False,
-                        redact_enabled, audit_enabled, targets)
+                        redact_enabled, audit_enabled, s_targets)
             step_confirm = step_confirm or s_confirm
         return (True, None, step_confirm, redact_enabled, audit_enabled, targets)
 
@@ -526,6 +526,91 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     if targets and not target_matches(allowed_origins, targets):
         return (False, "target not allowed", False, redact_enabled, audit_enabled, targets)
     return (True, None, confirm, redact_enabled, audit_enabled, targets)
+
+
+def policy_denial(reason, action, targets, name, policy=None):
+    # Build a structured, actionable companion to the opaque "policy denied:
+    # <reason>" error string. The error string itself stays byte-stable for API
+    # and contract compatibility; this object tells a client exactly what to
+    # grant, in which list, in which section, and in which file. ``kind``
+    # classifies the gate that rejected the request so a client can self-service
+    # the right fix.
+    batch_step = None
+    m = re.match(r"^batch step (\d+): (.*)$", reason or "")
+    if m:
+        batch_step = int(m.group(1))
+        reason = m.group(2)
+    # For action-type reasons the real action is embedded in the reason text
+    # ("action <X> not allowed"/"... denied"); the outer ``action`` may be
+    # "batch" for a denied step, so trust the reason for the action value.
+    am = re.match(r"^action (\S+) (?:not allowed|denied)$", reason or "")
+    if am:
+        action = am.group(1)
+    def section_for(list_key):
+        # policy_for_client replaces an inherited list when the client layer
+        # defines its own, so a fix must edit the section that actually governs
+        # this client: clients.<name>.<list> when present, else default.<list>.
+        client_layer = ((policy or {}).get("clients") or {}).get(name)
+        if isinstance(client_layer, dict) and isinstance(client_layer.get(list_key), list):
+            return f"clients.{name}"
+        return "default"
+    if reason and reason.endswith("not allowed") and reason.startswith("action "):
+        kind = "action"
+        section = section_for("allowedActions")
+        remediation = f"Add {action!r} to {section}.allowedActions in {POLICY_FILE}"
+        suggested = {"op": "add", "section": section, "list": "allowedActions", "value": action}
+    elif reason == "target not allowed":
+        kind = "origin"
+        sample = targets[0] if targets else None
+        section = section_for("allowedOrigins")
+        remediation = (
+            f"Add an origin pattern covering {sample!r} to {section}.allowedOrigins in {POLICY_FILE}"
+            if sample else
+            f"Add the request origin to {section}.allowedOrigins in {POLICY_FILE}")
+        suggested = {"op": "add", "section": section, "list": "allowedOrigins", "value": sample} if sample else None
+    elif reason == "target denied":
+        kind = "origin"
+        sample = targets[0] if targets else None
+        section = section_for("deniedOrigins")
+        cp = policy_for_client(policy or {}, name)
+        matched = [p for p in (cp.get("deniedOrigins") or [])
+                   if isinstance(p, str) and target_matches([p], targets)]
+        remediation = (
+            f"Remove or narrow the {section}.deniedOrigins pattern(s) {matched} matching {sample!r} in {POLICY_FILE}"
+            if matched else
+            f"Remove or narrow the matching {section}.deniedOrigins pattern in {POLICY_FILE}")
+        suggested = {"op": "removePattern", "section": section, "list": "deniedOrigins",
+                     "value": sample, "patterns": matched} if matched else None
+    elif reason and reason.endswith("denied") and reason.startswith("action "):
+        kind = "action"
+        section = section_for("deniedActions")
+        cp = policy_for_client(policy or {}, name)
+        matched = [p for p in (cp.get("deniedActions") or [])
+                   if isinstance(p, str) and action_matches([p], action)]
+        remediation = f"Remove or narrow the {section}.deniedActions pattern(s) {matched} matching {action!r} in {POLICY_FILE}"
+        suggested = {"op": "removePattern", "section": section, "list": "deniedActions",
+                     "value": action, "patterns": matched}
+    elif reason == "target unresolved" or reason == "tab origin unresolved":
+        kind = "target"
+        remediation = (
+            "The request carried no resolvable target origin; supply a valid "
+            "url/domain/tabId so site policy can be evaluated")
+        suggested = None
+    else:
+        kind = "other"
+        remediation = f"Review default policy in {POLICY_FILE}"
+        suggested = None
+    return {
+        "kind": kind,
+        "action": action,
+        "targets": list(targets or []),
+        "policyFile": POLICY_FILE,
+        "client": name,
+        "remediation": remediation,
+        "suggestedPatch": suggested,
+        "batchStep": batch_step,
+        "cli": "chrome-bridge policy doctor",
+    }
 
 
 def write_audit_event(event):
@@ -787,6 +872,26 @@ def handle_socket_client(client_socket):
                 client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
                 continue
 
+            # policyInfo is host-side and always answerable (handled before the
+            # action gate, like policyCheck) so a client can always discover the
+            # active policy file path even when the current policy would deny
+            # everything else. It deliberately returns ONLY the path and its
+            # existence -- never policy contents -- so a token holder cannot use
+            # it to enumerate allowed/denied origins. The CLI reads the file
+            # directly (it is mode 600, owned by the same user) for details.
+            if action == 'policyInfo':
+                cp = policy_for_client(policy, name)
+                audit_enabled = cp.get('audit', True)
+                resp = {"success": True, "result": {
+                    "policyFile": POLICY_FILE,
+                    "policyFileExists": os.path.exists(POLICY_FILE),
+                    "auditLogFile": AUDIT_LOG_FILE,
+                    "client": name,
+                }}
+                _audit(audit_enabled, name, "policyInfo", [], "allow", None, None)
+                client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                continue
+
             payload = cmd.get("payload") or {}
             audit_enabled = policy_for_client(policy, name).get('audit', True)
 
@@ -799,7 +904,8 @@ def handle_socket_client(client_socket):
             if not allowed:
                 _audit(audit_enabled, name, action, targets, "deny", reason, None)
                 client_socket.sendall(
-                    (json.dumps({"success": False, "error": f"policy denied: {reason}"}) + "\n").encode('utf-8'))
+                    (json.dumps({"success": False, "error": f"policy denied: {reason}",
+                                 "policyDenial": policy_denial(reason, action, targets, name, policy)}) + "\n").encode('utf-8'))
                 continue
 
             resp_timeout = SOCKET_IDLE_TIMEOUT
@@ -832,14 +938,16 @@ def handle_socket_client(client_socket):
                     targets = targets + ["<unresolved-origin>"]
                     _audit(audit_enabled, name, action, targets, "deny", "tab origin unresolved", None)
                     client_socket.sendall(
-                        (json.dumps({"success": False, "error": "policy denied: tab origin unresolved"}) + "\n").encode('utf-8'))
+                        (json.dumps({"success": False, "error": "policy denied: tab origin unresolved",
+                                     "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy)}) + "\n").encode('utf-8'))
                     continue
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
                     policy, name, action, payload, origins=origins)
                 if not allowed:
                     _audit(audit_enabled, name, action, targets, "deny", reason, None)
                     client_socket.sendall(
-                        (json.dumps({"success": False, "error": f"policy denied: {reason}"}) + "\n").encode('utf-8'))
+                        (json.dumps({"success": False, "error": f"policy denied: {reason}",
+                                     "policyDenial": policy_denial(reason, action, targets, name, policy)}) + "\n").encode('utf-8'))
                     continue
 
             if confirm:

@@ -61,8 +61,8 @@ def main():
         ext_dir = tmp / "extension"
         r = run(["./deploy.sh", "--ext", str(ext_dir), "--with-local-key", "--key-file", str(key)])
         expect(r.returncode == 0, f"keyed deploy failed: {r.stderr}")
-        expect(visible_names(ext_dir) == ["background.js", "manifest.json"],
-               f"extension deploy should contain only background.js and manifest.json, got {visible_names(ext_dir)}")
+        expect(visible_names(ext_dir) == ["background.js", "manifest.json", "wake.html", "wake.js"],
+               f"extension deploy should contain background.js, manifest.json, wake.html, and wake.js, got {visible_names(ext_dir)}")
         deployed = json.loads((ext_dir / "manifest.json").read_text())
         expect("key" in deployed, "keyed deploy manifest should include key")
 
@@ -84,11 +84,19 @@ def main():
                        f"host token mode should be 0600, got {oct(mode(host_dir / 'bridge_token.txt'))}")
 
         custom = {"default": {"allowedActions": ["ping"]}}
-        (host_dir / "bridge_policy.json").write_text(json.dumps(custom))
+        policy_path = host_dir / "bridge_policy.json"
+        policy_path.write_text(json.dumps(custom))
+        try:
+            os.chmod(policy_path, 0o644)
+        except OSError:
+            pass
         r = run(["./deploy.sh", "--host", str(host_dir), "--copy-policy"])
         expect(r.returncode == 0, f"host redeploy failed: {r.stderr}")
-        expect(json.loads((host_dir / "bridge_policy.json").read_text()) == custom,
+        expect(json.loads(policy_path.read_text()) == custom,
                "deploy --copy-policy must not overwrite an existing custom policy")
+        if os.name == "posix":
+            expect(mode(policy_path) == 0o600,
+                   f"host redeploy should restrict existing broad policy to 0600, got {oct(mode(policy_path))}")
 
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")

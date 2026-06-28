@@ -71,6 +71,7 @@ CASES = [
     (["setGeolocation", "1", "37.7749", "-122.4194", "100"], 111),
     (["clearGeolocation", "1"], 111),
     (["performanceMetrics", "1"], 111),
+    (["policy", "info"], 111),
     (["noSuchAction"], 64),
 ]
 
@@ -155,6 +156,117 @@ check(
     {"message": "please log in", "until": {"mode": "selector", "selector": "#ok"}, "timeoutMs": 60000},
 )
 check("waitForHandoff read_timeout_ms", result.get("read_timeout_ms"), 60000)
+
+# --- policy subcommands: file edits and doctor work against local files using
+#     the paths the host reports via policyInfo (here a fake host). ---
+import json as _json
+
+POLICY_FIXTURE = "/tmp/chrome-bridge-cli-policy.json"
+AUDIT_FIXTURE = "/tmp/chrome-bridge-cli-audit.jsonl"
+for _p in (POLICY_FIXTURE, AUDIT_FIXTURE):
+    try:
+        os.unlink(_p)
+    except FileNotFoundError:
+        pass
+
+def _fake_policy_info(action, payload=None, read_timeout_ms=None, confirmation_token=None):
+    return 0, {"success": True, "result": {
+        "policyFile": POLICY_FIXTURE,
+        "policyFileExists": os.path.exists(POLICY_FIXTURE),
+        "auditLogFile": AUDIT_FIXTURE,
+        "client": "alpha",
+    }}, ""
+
+test_client.send_command_data = _fake_policy_info
+
+# allow-action creates the file and adds to default.allowedActions, seeding the
+# new list from the built-in defaults so inherited grants survive the edit.
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-action", "getCookies"])
+check("allow-action rc", rc, 0)
+_pol = _json.load(open(POLICY_FIXTURE))
+_da = _pol.get("default", {}).get("allowedActions", [])
+check("allow-action added the new action", "getCookies" in _da, True)
+check("allow-action preserved inherited ping", "ping" in _da, True)
+check("allow-action preserved inherited policyInfo", "policyInfo" in _da, True)
+
+# Re-adding the same action is idempotent (no duplicate).
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-action", "getCookies"])
+_pol = _json.load(open(POLICY_FIXTURE))
+check("allow-action idempotent",
+      _pol.get("default", {}).get("allowedActions", []).count("getCookies"), 1)
+
+# allow-origin appends to allowedOrigins in the same section.
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-origin", "https://example.com"])
+check("allow-origin rc", rc, 0)
+_pol = _json.load(open(POLICY_FIXTURE))
+check("allow-origin added the origin",
+      "https://example.com" in _pol.get("default", {}).get("allowedOrigins", []), True)
+
+# The policy file must be written mode 600 (governs automation reach).
+check("policy file mode 600", oct(os.stat(POLICY_FIXTURE).st_mode & 0o777), oct(0o600))
+
+# Enforce permissions on existing broad files: change to 0644, write, and ensure it gets restricted to 0600.
+try:
+    os.chmod(POLICY_FIXTURE, 0o644)
+except OSError:
+    pass
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-action", "anotherAction"])
+check("allow-action rc on broad file", rc, 0)
+check("policy file mode restricted to 600", oct(os.stat(POLICY_FIXTURE).st_mode & 0o777), oct(0o600))
+
+# Enforce permissions on existing broad files even when no change happens (no-op).
+try:
+    os.chmod(POLICY_FIXTURE, 0o644)
+except OSError:
+    pass
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-action", "anotherAction"])
+check("allow-action no-op rc on broad file", rc, 0)
+check("policy file mode restricted to 600 on no-op", oct(os.stat(POLICY_FIXTURE).st_mode & 0o777), oct(0o600))
+# An explicitly named client edits clients.<name>, never the shared default, and
+# seeds the new client list from the existing default layer so the client does
+# not lose the grants default already conferred.
+rc = test_client.cmd_policy(["test_client.py", "policy", "allow-action", "newaction", "beta"])
+check("explicit-client allow-action rc", rc, 0)
+_pol = _json.load(open(POLICY_FIXTURE))
+_beta = _pol.get("clients", {}).get("beta", {}).get("allowedActions", [])
+check("explicit client created clients.beta with new action", "newaction" in _beta, True)
+check("explicit client seeded from default (getCookies inherited)", "getCookies" in _beta, True)
+check("explicit client did not add to default",
+      "newaction" in _pol.get("default", {}).get("allowedActions", []), False)
+
+# doctor splits "not allowed" (grant) from "denied" (remove deny-list).
+with open(AUDIT_FIXTURE, "w") as f:
+    f.write(_json.dumps({"decision": "deny", "action": "getTabs",
+                         "reason": "action getTabs not allowed", "targets": []}) + "\n")
+    f.write(_json.dumps({"decision": "deny", "action": "getCookies",
+                         "reason": "action getCookies denied", "targets": []}) + "\n")
+    f.write(_json.dumps({"decision": "deny", "action": "navigate",
+                         "reason": "target denied", "targets": ["*://mail.google.com"]}) + "\n")
+    f.write(_json.dumps({"decision": "deny", "action": "navigate",
+                         "reason": "target not allowed", "targets": ["https://x.test"]}) + "\n")
+    f.write(_json.dumps({"decision": "deny", "action": "batch",
+                         "reason": "batch step 2: action executeScript not allowed", "targets": []}) + "\n")
+
+import io as _io
+import contextlib as _ctx
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    rc = test_client.cmd_policy(["test_client.py", "policy", "doctor"])
+check("doctor rc", rc, 0)
+_doc = _json.loads(_buf.getvalue())
+_by_reason = {d["reason"]: d.get("suggestion") for d in _doc.get("denials", [])}
+check("doctor not-allowed action grants",
+      _by_reason.get("action getTabs not allowed"), {"cli": "policy allow-action getTabs"})
+check("doctor denied action is manual deny-list removal",
+      (_by_reason.get("action getCookies denied") or {}).get("manual") is not None, True)
+check("doctor target not allowed grants origin",
+      _by_reason.get("target not allowed"), {"cli": "policy allow-origin 'https://x.test'"})
+check("doctor target denied is manual",
+      (_by_reason.get("target denied") or {}).get("manual") is not None, True)
+_batch = next((d for d in _doc.get("denials", []) if d.get("batchStep") == 2), None)
+check("doctor surfaces batch step index", _batch is not None, True)
+check("doctor batch step inner reason gets grant",
+      (_batch or {}).get("suggestion"), {"cli": "policy allow-action executeScript"})
 
 if failed:
     sys.exit(1)

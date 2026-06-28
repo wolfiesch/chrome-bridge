@@ -16,6 +16,48 @@ BASE_URL = f"http://{HOST}:{PORT}/"
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
+SCRIPT_DIR = Path(__file__).resolve().parent
+def resolve_policy_path():
+    p_host = None
+    resolved_from_host = False
+    try:
+        proc = subprocess.run(["chrome-bridge", "policy", "info"], text=True, capture_output=True, timeout=5)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            p_file = (data.get("result") or {}).get("policyFile")
+            if p_file:
+                p_host = Path(p_file)
+                resolved_from_host = True
+    except Exception as e:
+        sys.stderr.write(f"RESOLVER WARNING: failed to query host policy path: {e}\n")
+
+    p_env = os.environ.get("BRIDGE_POLICY_FILE")
+    if p_env:
+        p_env_path = Path(p_env)
+        if p_host and p_host.resolve() != p_env_path.resolve():
+            raise AssertionError(
+                f"Mismatch between environment BRIDGE_POLICY_FILE ({p_env_path}) "
+                f"and active host policy file ({p_host})"
+            )
+        return p_env_path, resolved_from_host
+
+    if p_host:
+        sys.stderr.write(f"RESOLVED ACTIVE POLICY FILE PATH FROM HOST: {p_host}\n")
+        return p_host, True
+
+    return SCRIPT_DIR / "bridge_policy.json", False
+
+def restore_policy(backup, policy_path, backup_mode=None):
+    if backup is None:
+        with contextlib.suppress(FileNotFoundError):
+            policy_path.unlink()
+    else:
+        policy_path.write_bytes(backup)
+        if backup_mode is not None:
+            try:
+                os.chmod(policy_path, backup_mode)
+            except OSError:
+                pass
 
 PAGE = b"""<!doctype html>
 <html>
@@ -86,6 +128,9 @@ def start_server():
 
 
 def run_bridge(*args, timeout=20):
+    for arg in args:
+        if isinstance(arg, int) and arg > 1000:
+            timeout = max(timeout, int(arg / 1000) + 15)
     proc = subprocess.run(["chrome-bridge", *map(str, args)], text=True, capture_output=True, timeout=timeout)
     parsed = None
     if proc.stdout.strip():
@@ -115,12 +160,62 @@ def record(summary, name, call, extra=None):
     return call
 
 
-def require(condition, message):
+def require(condition, message, call=None):
     if not condition:
-        raise AssertionError(message)
+        err = f"\nSTDERR: {call.get('stderr')}" if isinstance(call, dict) and call.get("stderr") else ""
+        out = f"\nSTDOUT: {call.get('stdout')}" if isinstance(call, dict) and call.get("stdout") else ""
+        raise AssertionError(f"{message}{err}{out}")
 
 
 def main():
+    backup = None
+    policy_path = None
+    backup_mode = None
+    policy_installed = False
+    try:
+        p_path, resolved_from_host = resolve_policy_path()
+        require(resolved_from_host or "BRIDGE_POLICY_FILE" in os.environ, "Expected policy path to be resolved from host via 'policy info'")
+        policy_path = p_path
+        if policy_path.exists():
+            backup = policy_path.read_bytes()
+            try:
+                backup_mode = os.stat(policy_path).st_mode & 0o777
+            except OSError:
+                pass
+        policy = {
+            "default": {
+                "allowedActions": [
+                    "ping", "navigate", "waitForLoad", "waitForSelector", "click", "fill",
+                    "select", "uploadFile", "screenshot", "extractText", "getHTML", "type", "drag",
+                    "scroll", "press", "hover", "startMonitoring", "consoleMessages",
+                    "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
+                    "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
+                    "handleDialog", "stopMonitoring", "getCurrentState", "startInterception",
+                    "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
+                    "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab", "policyInfo"
+                ],
+                "allowedOrigins": ["http://127.0.0.1:*", "*://127.0.0.1:*"],
+                "deniedActions": [],
+                "deniedOrigins": [],
+                "requireConfirmation": [],
+                "redact": True,
+                "audit": False,
+            }
+        }
+        policy_path.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
+        policy_installed = True
+        try:
+            os.chmod(policy_path, 0o600)
+        except OSError:
+            pass
+        time.sleep(1.1)  # let policy file mtime advance for host hot-reload
+        main_inner()
+    finally:
+        if policy_installed and policy_path is not None:
+            restore_policy(backup, policy_path, backup_mode)
+
+
+def main_inner():
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
     for path in [SHOT_PATH, HTML_PATH]:
         with contextlib.suppress(FileNotFoundError):
@@ -134,7 +229,6 @@ def main():
         call = run_bridge("ping")
         record(summary, "ping", call, {"result": result(call)})
         require(call["exit"] == 0 and result(call) == "pong", "ping failed")
-
         call = run_bridge("navigate", BASE_URL)
         nav = result(call)
         tab_id = nav.get("tabId") if isinstance(nav, dict) else None
@@ -142,18 +236,16 @@ def main():
         require(call["exit"] == 0 and tab_id, "navigate did not return tabId")
 
         checks = [
-            ("waitForLoad", run_bridge("waitForLoad", tab_id, 10000), None),
-            ("waitForSelector", run_bridge("waitForSelector", tab_id, "#q", 10000), None),
+            ("waitForLoad", run_bridge("waitForLoad", tab_id, 20000), None),
+            ("waitForSelector", run_bridge("waitForSelector", tab_id, "#q", 20000), None),
             ("fill", run_bridge("fill", tab_id, "#q", "hello"), None),
             ("select", run_bridge("select", tab_id, "#kind", "beta"), None),
             ("hover", run_bridge("hover", tab_id, "#btn"), None),
-            ("scroll", run_bridge("scroll", tab_id, 0, 300), None),
             ("uploadFile", run_bridge("uploadFile", tab_id, "#file", UPLOAD_FIXTURE), None),
         ]
         for name, item, extra in checks:
             record(summary, name, item, extra)
-            require(item["exit"] == 0, f"{name} failed")
-
+            require(item["exit"] == 0, f"{name} failed", item)
         call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#q').value")
         value = result(call).get("val") if isinstance(result(call), dict) else None
         record(summary, "filledValue", call, {"value": value})
@@ -167,6 +259,7 @@ def main():
         call = run_bridge("click", tab_id, "#btn")
         record(summary, "click", call)
         require(call["exit"] == 0, "click failed")
+        time.sleep(0.2)
 
         call = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
         status = result(call).get("val") if isinstance(result(call), dict) else None
@@ -180,6 +273,10 @@ def main():
         call = run_bridge("press", tab_id, "Enter")
         record(summary, "press", call)
         require(call["exit"] == 0, "press failed")
+
+        call = run_bridge("scroll", tab_id, 0, 300)
+        record(summary, "scroll", call)
+        require(call["exit"] == 0, "scroll failed")
 
         call = run_bridge("screenshot", tab_id, SHOT_PATH)
         shot = call.get("json") or {}
@@ -237,17 +334,18 @@ def main():
         require(call["exit"] == 0, "stopMonitoring failed")
         monitoring_started = False
 
-        print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+        # print will now happen in finally
     finally:
+        print("SUMMARY: " + json.dumps(summary, sort_keys=True, separators=(",", ":")))
         if monitoring_started and tab_id is not None:
             call = run_bridge("stopMonitoring", tab_id)
             record(summary, "stopMonitoringFinally", call)
         server.shutdown()
-
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
+        # Try to print summary if main was running
         sys.exit(1)

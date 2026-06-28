@@ -2,7 +2,10 @@
 import base64
 import json
 import os
+import re
+import shlex
 import socket
+import subprocess
 import sys
 import time
 
@@ -10,8 +13,7 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
 def load_token():
-    token_file = os.environ.get(
-        'BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
+    token_file = token_file_path()
     try:
         with open(token_file) as f:
             return f.read().strip()
@@ -56,6 +58,89 @@ def expand_output_path(path):
     return os.path.abspath(os.path.expanduser(path))
 
 
+def token_file_path():
+    return os.environ.get('BRIDGE_TOKEN_FILE', os.path.join(SCRIPT_DIR, 'bridge_token.txt'))
+
+
+def read_first_existing(paths):
+    for path in paths:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                value = f.read().strip()
+            if value:
+                return value
+        except Exception:
+            pass
+    return None
+
+
+def bridge_extension_id():
+    configured = os.environ.get("BRIDGE_EXTENSION_ID")
+    if configured:
+        return configured
+
+    token_dir = os.path.dirname(os.path.abspath(os.path.expanduser(token_file_path())))
+    from_file = read_first_existing([
+        os.environ.get("BRIDGE_EXTENSION_ID_FILE"),
+        os.path.join(token_dir, "extension_id.txt"),
+        os.path.join(SCRIPT_DIR, "extension_id.txt"),
+    ])
+    if from_file:
+        return from_file
+
+    key_file = os.environ.get("BRIDGE_EXTENSION_KEY_FILE")
+    if not key_file:
+        state_key = os.path.join(token_dir, "extension_key.pem")
+        key_file = state_key if os.path.exists(state_key) else os.path.join(SCRIPT_DIR, "extension_key.pem")
+    if not os.path.exists(key_file):
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, "extension_identity.py"), "id", "--key", key_file],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    extension_id = proc.stdout.strip()
+    return extension_id if proc.returncode == 0 and extension_id else None
+
+
+def wake_bridge_extension():
+    if os.environ.get("BRIDGE_WAKE_DISABLED") == "1":
+        return False
+
+    extension_id = bridge_extension_id()
+    if not extension_id:
+        return False
+    url = f"chrome-extension://{extension_id}/wake.html"
+
+    command = os.environ.get("BRIDGE_WAKE_COMMAND")
+    if command:
+        argv = shlex.split(command) + [url]
+    elif sys.platform == "darwin":
+        bundle = os.environ.get("BRIDGE_CHROME_BUNDLE_ID", "com.google.Chrome")
+        argv = ["open", "-g", "-b", bundle, url]
+    else:
+        argv = ["xdg-open", url]
+
+    try:
+        return subprocess.run(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
 def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
     if payload is None:
         payload = {}
@@ -77,6 +162,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
     retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
     deadline = time.monotonic() + retry_seconds
     sock = None
+    wake_attempted = False
 
     try:
         while True:
@@ -95,6 +181,9 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                     sock.close()
                 except Exception:
                     pass
+                if not wake_attempted:
+                    wake_bridge_extension()
+                    wake_attempted = True
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.5)
@@ -241,6 +330,221 @@ def require_args(argv, count, usage):
         print(usage, file=sys.stderr)
         sys.exit(1)
 
+def _policy_paths():
+    # Ask the host for the authoritative policy/audit file paths. The host is the
+    # only component that knows BRIDGE_POLICY_FILE as the running host saw it, so
+    # never assume a repo-local path here.
+    exit_code, response, stderr = send_command_data("policyInfo")
+    if exit_code != 0 or not response:
+        print(stderr or "Error: could not reach host for policyInfo", file=sys.stderr)
+        return None
+    return result_payload(response)
+
+
+def _load_policy_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"Error: policy file at {path} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _write_policy_file(path, policy):
+    # Persist with mode 600: the policy governs which origins automation may
+    # touch, so it must not be world-readable.
+    encoded = json.dumps(policy, indent=2) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        os.write(fd, encoded.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+def _restrict_policy_file_perms(path):
+    if not os.path.exists(path):
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+def _policy_section(policy, client, explicit):
+    # Return (container, key) for the list-bearing section governing ``client``.
+    # An explicitly-named client always edits clients.<name> (created if absent)
+    # so naming a new client never silently broadens the shared default policy.
+    # The host-reported inherited client edits clients.<name> only when that
+    # layer already exists, else default.
+    if explicit and client:
+        clients = policy.setdefault("clients", {})
+        return clients, client
+    if client and isinstance(policy.get("clients"), dict) and isinstance(policy["clients"].get(client), dict):
+        return policy["clients"], client
+    policy.setdefault("default", {})
+    return policy, "default"
+
+
+# Built-in fail-closed defaults, mirrored from the host (bridge.py DEFAULT_POLICY
+# / host-rs default_policy). Used only to seed a newly-created list so an "allow"
+# never silently drops inherited grants -- the host remains the source of truth.
+_BUILTIN_DEFAULT_LISTS = {
+    "allowedActions": ["ping", "policyCheck", "policyInfo", "lease", "release", "leaseStatus"],
+    "deniedActions": [],
+    "allowedOrigins": [],
+    "deniedOrigins": [
+        "file://*", "chrome://*", "chrome-extension://*",
+        "*://localhost", "*://localhost:*",
+        "*://127.0.0.1", "*://127.0.0.1:*",
+        "*://0.0.0.0", "*://0.0.0.0:*",
+        "*://*.local", "*://*.local:*",
+        "*://[[]::1[]]", "*://[[]::1[]]:*",
+    ],
+}
+
+
+def _effective_inherited_list(policy, container, key, list_key):
+    # The list the host would resolve for this section BEFORE our edit, following
+    # its merge order: built-in default -> default.<list> -> clients.<name>.<list>.
+    # Editing default inherits only the built-in; editing clients.<name> inherits
+    # the default layer (its own list when present, else built-in).
+    base = list(_BUILTIN_DEFAULT_LISTS.get(list_key, []))
+    if key != "default":
+        default_list = (policy.get("default") or {}).get(list_key)
+        if isinstance(default_list, list):
+            base = list(default_list)
+    return base
+
+
+def _policy_add_to_list(policy, client, list_key, value, explicit):
+    container, key = _policy_section(policy, client, explicit)
+    section = container.setdefault(key, {})
+    if list_key not in section:
+        # Seed a new list from the inherited effective list so appending one
+        # grant does not replace (and thus revoke) everything inherited.
+        section[list_key] = _effective_inherited_list(policy, container, key, list_key)
+    lst = section[list_key]
+    if value in lst:
+        return False
+    lst.append(value)
+    return True
+
+
+def cmd_policy(args):
+    sub = args[2] if len(args) > 2 else ""
+    if sub == "info":
+        return send_command("policyInfo")
+    info = _policy_paths()
+    if info is None:
+        return 1
+    policy_file = info.get("policyFile")
+    audit_file = info.get("auditLogFile")
+    client = info.get("client")
+    if sub == "show":
+        policy = _load_policy_file(policy_file)
+        if policy is None:
+            print(json.dumps({"policyFile": policy_file, "exists": False,
+                              "note": "No policy file; built-in fail-closed default is active."}, indent=2))
+            return 0
+        print(json.dumps({"policyFile": policy_file, "exists": True, "policy": policy}, indent=2))
+        return 0
+    if sub == "doctor":
+        return _policy_doctor(audit_file, policy_file)
+    if sub == "allow-action":
+        require_args(args, 4, "Usage: python3 test_client.py policy allow-action <action> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_add_to_list(policy, target_client, "allowedActions", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "action": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
+    if sub == "allow-origin":
+        require_args(args, 4, "Usage: python3 test_client.py policy allow-origin <pattern> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_add_to_list(policy, target_client, "allowedOrigins", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "origin": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
+    print("Usage: python3 test_client.py policy <info|show|doctor|allow-action|allow-origin> ...", file=sys.stderr)
+    return 64
+
+
+def _policy_doctor(audit_file, policy_file):
+    # Read recent deny entries from the audit log and propose the precise grant
+    # for each distinct (action, target) so the user can self-service. Reads only
+    # paths/metadata the host already disclosed; never forwards anything.
+    denials = []
+    try:
+        with open(audit_file) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(json.dumps({"policyFile": policy_file, "denials": [],
+                          "note": "No audit log yet; nothing to diagnose."}, indent=2))
+        return 0
+    seen = set()
+    for line in reversed(lines[-500:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("decision") != "deny":
+            continue
+        reason = ev.get("reason") or ""
+        action = ev.get("action") or ""
+        targets = ev.get("targets") or []
+        # A denied batch step is audited as "batch step N: <inner reason>" with
+        # the outer action "batch"; strip the wrapper so the inner reason gets the
+        # same fix hint, and surface the step index. Mirrors host policy_denial.
+        batch_step = None
+        bm = re.match(r"^batch step (\d+): (.*)$", reason)
+        if bm:
+            batch_step = int(bm.group(1))
+            reason = bm.group(2)
+        key = (action, reason, tuple(targets), batch_step)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Deny-lists win over allow-lists in the host, so the fix differs by the
+        # gate that fired: "not allowed" means the item is missing from an allow
+        # list (grant it); "denied" means a deny-list pattern matched (the user
+        # must remove/narrow it -- a grant would not help).
+        suggestion = None
+        am = re.match(r"^action (\S+) (?:not allowed|denied)$", reason)
+        if am and reason.endswith("not allowed"):
+            suggestion = {"cli": f"policy allow-action {am.group(1)}"}
+        elif am and reason.endswith("denied"):
+            suggestion = {"manual": f"Remove or narrow the deniedActions pattern matching '{am.group(1)}' in {policy_file}"}
+        elif reason == "target not allowed" and targets:
+            suggestion = {"cli": f"policy allow-origin '{targets[0]}'"}
+        elif reason == "target denied" and targets:
+            suggestion = {"manual": f"Remove or narrow the deniedOrigins pattern matching '{targets[0]}' in {policy_file}"}
+        denials.append({"action": action, "reason": reason, "targets": targets,
+                        "batchStep": batch_step, "suggestion": suggestion})
+    print(json.dumps({"policyFile": policy_file, "auditLogFile": audit_file,
+                      "denials": denials}, indent=2))
+    return 0
+
 
 def print_usage():
     print("Usage:")
@@ -298,6 +602,11 @@ def print_usage():
     print("  python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
     print("  python3 test_client.py policyCheck <action> [payloadJson]")
     print("  python3 test_client.py confirm <action> <confirmationToken> <payloadJson>")
+    print("  python3 test_client.py policy info")
+    print("  python3 test_client.py policy show")
+    print("  python3 test_client.py policy doctor")
+    print("  python3 test_client.py policy allow-action <action> [client]")
+    print("  python3 test_client.py policy allow-origin <pattern> [client]")
 
 def main():
     if len(sys.argv) < 2:
@@ -537,6 +846,8 @@ def main():
             "tabId": parse_int(args[2], "tabId"),
             "userAgent": ua,
         }))
+    elif action == "policy":
+        sys.exit(cmd_policy(args))
     else:
         print(f"Unknown action: {action}", file=sys.stderr)
         sys.exit(64)

@@ -215,6 +215,17 @@ function connectToHost() {
   resetBackoff();
 }
 
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || message.action !== "wakeNativeHost") return false;
+  connectToHost();
+  sendResponse({ success: true });
+  const tabId = sender && sender.tab && sender.tab.id;
+  if (tabId !== undefined) {
+    setTimeout(() => chrome.tabs.remove(tabId), 50);
+  }
+  return false;
+});
+
 chrome.runtime.onInstalled.addListener(() => {
   scheduleHeartbeat();
   connectToHost();

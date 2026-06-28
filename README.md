@@ -10,8 +10,11 @@ The bridge exposes an agent-ready browser-control surface: navigation and histor
 chrome-native-bridge/
 ├── extension/                          <- public unkeyed extension source copy
 │   ├── manifest.json
-│   └── background.js
+│   ├── background.js
+│   ├── wake.html
+│   └── wake.js
 ├── background.js                       <- editable service-worker source
+├── wake.html / wake.js                 <- extension wake page for suspended-worker recovery
 ├── manifest.json                       <- public unkeyed source manifest
 ├── extension_identity.py               <- local key and extension ID helper
 ├── bridge.py                           <- native host
@@ -36,7 +39,8 @@ chrome-native-bridge/
 | File | Role |
 |---|---|
 | `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
-| `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
+| `extension/background.js` | Service worker: connects to the native host, runs browser actions, uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep, and handles wake-page messages. |
+| `wake.html`, `wake.js` | Minimal extension page opened by the CLI after `ECONNREFUSED`; it messages the service worker to call `connectNative()` and then closes its tab. |
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
 | `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
@@ -186,11 +190,18 @@ chrome-bridge setGeolocation <tabId> <latitude> <longitude> [accuracy]
 chrome-bridge clearGeolocation <tabId>
 chrome-bridge performanceMetrics <tabId>
 chrome-bridge policyCheck <action> [payloadJson]
+chrome-bridge policy info
+chrome-bridge policy show
+chrome-bridge policy doctor
+chrome-bridge policy allow-action <action> [client]
+chrome-bridge policy allow-origin <pattern> [client]
 ```
 
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
 `policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time.
+
+The `policy` subcommands let an agent self-service policy when an action is denied. `policy info` asks the host for the active `bridge_policy.json` / audit-log paths (always answerable, even under a deny-all policy, and it never returns policy contents over the wire). `policy show` prints the local policy file; `policy doctor` reads recent deny events from the audit log and proposes the precise fix for each: a `policy allow-action`/`policy allow-origin` command when an item is missing from an allow-list (`not allowed`), or a manual deny-list edit when a deny-list pattern matched (`denied`, which a grant cannot override). `policy allow-action`/`policy allow-origin` edit the policy file in place (mode `600`); with no client argument they edit the section the host says governs this client, and an explicitly named client always edits its own `clients.<name>` section so a new name never silently broadens the shared `default`. Every deny response also carries a structured `policyDenial` companion (`kind`, `suggestedPatch`, `policyFile`, `batchStep`) alongside the byte-stable `policy denied: <reason>` error string.
 
 ### Real-profile moat: session probe and human handoff
 
@@ -540,7 +551,7 @@ The host writes a local `bridge_debug.log` (git-ignored) next to `bridge.py`:
 tail -f bridge_debug.log
 ```
 
-- `Connection refused` after retry: Chrome is closed, no bridge extension is enabled, or the service worker did not wake.
+- `Connection refused` after retry: Chrome is closed, no bridge extension is enabled, or the service worker did not wake. The CLI now tries one external wake by opening `chrome-extension://<extension-id>/wake.html`; set `BRIDGE_WAKE_DISABLED=1` to skip it, `BRIDGE_EXTENSION_ID` or `BRIDGE_EXTENSION_ID_FILE` to override ID discovery, and `BRIDGE_WAKE_COMMAND` to override the opener in tests or nonstandard Chrome installs.
 - `FATAL: could not bind 127.0.0.1:9223`: two bridge extensions are enabled.
 - `unauthorized`: token mismatch, or the native-host manifest authorized the wrong extension ID. Re-run `./setup.sh`, reload the printed extension directory, and disable duplicate bridge extensions.
 
@@ -550,7 +561,7 @@ tail -f bridge_debug.log
 - Payload bodies such as cookies and DOM are not logged by the host.
 - Host policy in `bridge_policy.json` (`BRIDGE_POLICY_FILE`) is the enforcement layer for every raw TCP/CLI/MCP client: the TCP API is localhost-only and token-gated, but token holders bypass MCP scoping, so deny/allow/confirmation rules are enforced in the native host before any action reaches the extension.
 - MCP `readonly`/`allow_sensitive` controls are usability scoping, not the security boundary, because a client with the token can call the raw TCP API directly. Use `bridge_policy.json` for real restrictions; use `browser_policy_check` (or `test_client.py policyCheck`) to see what the host would decide.
-- Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in.
+- Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, `policyInfo`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in. `policyInfo` is additionally answered host-side before the action gate (like `policyCheck`), so a client can always discover the active policy/audit file paths even under a deny-all policy; it returns only those paths, never policy contents.
 - Actions listed in `requireConfirmation` return an opaque `confirmationToken`; clients must resend the same action and payload through `browser_confirm_action` or `test_client.py confirm` before the host forwards it.
 - Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
 - Audit logs are JSONL at `BRIDGE_AUDIT_LOG_FILE` / `bridge_audit.jsonl`, one event per request with `ts`, `client`, `action`, `targets`, `decision`, `reason`, `requestId`. They intentionally omit payload and response bodies.
