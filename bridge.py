@@ -12,6 +12,8 @@ import time
 import re
 import fnmatch
 import hashlib
+import shlex
+import subprocess
 from urllib.parse import urlparse
 
 # Resolve paths relative to this script so the install is location-independent.
@@ -110,8 +112,14 @@ def now_ms():
 # persistent client can reconnect transparently.
 SOCKET_IDLE_TIMEOUT = float(os.environ.get('BRIDGE_SOCKET_IDLE_TIMEOUT', 300))
 CONFIRMATION_TTL_MS = int(os.environ.get('BRIDGE_CONFIRMATION_TTL_MS', '60000'))
+POLICY_APPROVAL_MODE = os.environ.get(
+    'BRIDGE_POLICY_APPROVAL_MODE',
+    'gui' if sys.platform == 'darwin' else 'off')
+POLICY_APPROVAL_COMMAND = os.environ.get('BRIDGE_POLICY_APPROVAL_COMMAND')
+POLICY_APPROVAL_TIMEOUT = float(os.environ.get('BRIDGE_POLICY_APPROVAL_TIMEOUT', '60'))
 _confirmation_lock = threading.Lock()
 _pending_confirmations = {}
+_one_shot_origin_approvals = {}
 
 
 def confirmation_fingerprint(name, action, payload, targets):
@@ -156,6 +164,34 @@ def consume_confirmation(token, name, action, payload, targets):
         if not entry or entry["fingerprint"] != fingerprint:
             return False
         _pending_confirmations.pop(token, None)
+        return True
+
+
+def _issue_one_shot_origin_approval(name, action, payload, targets):
+    token = uuid.uuid4().hex
+    expires_at = now_ms() + CONFIRMATION_TTL_MS
+    fingerprint = confirmation_fingerprint(name, action, payload, targets)
+    with _confirmation_lock:
+        _prune_confirmations_locked()
+        _one_shot_origin_approvals[token] = {
+            "fingerprint": fingerprint,
+            "expires_at": expires_at,
+        }
+    return token
+
+
+def _consume_one_shot_origin_approval(token, name, action, payload, targets):
+    fingerprint = confirmation_fingerprint(name, action, payload, targets)
+    with _confirmation_lock:
+        now = now_ms()
+        expired = [tok for tok, entry in _one_shot_origin_approvals.items()
+                   if entry["expires_at"] <= now]
+        for tok in expired:
+            _one_shot_origin_approvals.pop(tok, None)
+        entry = _one_shot_origin_approvals.get(token)
+        if not entry or entry["fingerprint"] != fingerprint:
+            return False
+        _one_shot_origin_approvals.pop(token, None)
         return True
 
 
@@ -613,6 +649,144 @@ def policy_denial(reason, action, targets, name, policy=None):
     }
 
 
+def _origin_grant_section(policy, name):
+    client_layer = ((policy or {}).get("clients") or {}).get(name)
+    if isinstance(client_layer, dict) and isinstance(client_layer.get("allowedOrigins"), list):
+        return ("clients", name)
+    return ("default", None)
+
+
+def _policy_with_origin_grant(policy, name, origin):
+    cloned = json.loads(json.dumps(policy or {}))
+    container_kind, client_name = _origin_grant_section(cloned, name)
+    if container_kind == "clients":
+        section = cloned.setdefault("clients", {}).setdefault(client_name, {})
+    else:
+        section = cloned.setdefault("default", {})
+    origins = section.setdefault("allowedOrigins", [])
+    if origin not in origins:
+        origins.append(origin)
+    return cloned
+
+
+def _persist_origin_grant(policy, name, origin):
+    updated = _policy_with_origin_grant(policy, name, origin)
+    encoded = json.dumps(updated, indent=2) + "\n"
+    fd = os.open(POLICY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(encoded)
+            fd = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    global _policy_cache, _policy_mtime
+    with _policy_lock:
+        _policy_cache = updated
+        _policy_mtime = _file_mtime(POLICY_FILE)
+    return updated
+
+
+def _approval_origin(targets):
+    for target in targets or []:
+        if isinstance(target, str) and target.startswith(("http://", "https://", "*://")):
+            return target
+    return None
+
+
+def _policy_approval_enabled():
+    mode = (POLICY_APPROVAL_MODE or "off").lower()
+    if mode in {"", "off", "none", "false", "0"}:
+        return False
+    if mode == "command":
+        return bool(POLICY_APPROVAL_COMMAND)
+    if mode == "gui":
+        return sys.platform == "darwin"
+    return False
+
+
+def _run_policy_approval_prompt(name, action, origin, targets):
+    mode = (POLICY_APPROVAL_MODE or "off").lower()
+    if mode in {"", "off", "none", "false", "0"}:
+        return "deny"
+    env = os.environ.copy()
+    env.update({
+        "CHROME_BRIDGE_APPROVAL_CLIENT": name,
+        "CHROME_BRIDGE_APPROVAL_ACTION": action,
+        "CHROME_BRIDGE_APPROVAL_ORIGIN": origin or "",
+        "CHROME_BRIDGE_APPROVAL_TARGETS": json.dumps(list(targets or [])),
+        "CHROME_BRIDGE_POLICY_FILE": POLICY_FILE,
+    })
+    try:
+        if mode == "command":
+            if not POLICY_APPROVAL_COMMAND:
+                return "deny"
+            proc = subprocess.run(
+                shlex.split(POLICY_APPROVAL_COMMAND),
+                text=True,
+                capture_output=True,
+                timeout=POLICY_APPROVAL_TIMEOUT,
+                env=env,
+            )
+            if proc.returncode != 0:
+                logging.warning("Policy approval command failed: %s", proc.stderr.strip())
+                return "deny"
+            decision = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "deny"
+        elif mode == "gui" and sys.platform == "darwin":
+            message = (
+                f"Chrome Bridge is trying to access {origin} for action {action}. "
+                "Do you want to deny, allow this time, or always allow this origin?"
+            )
+            script = (
+                'button returned of (display dialog '
+                f'{json.dumps(message)} '
+                'with title "Chrome Bridge Policy Approval" '
+                'buttons {"Deny", "Allow This Time", "Always Allow"} '
+                'default button "Deny" cancel button "Deny")'
+            )
+            proc = subprocess.run(
+                ["osascript", "-e", script],
+                text=True,
+                capture_output=True,
+                timeout=POLICY_APPROVAL_TIMEOUT,
+                env=env,
+            )
+            if proc.returncode != 0:
+                return "deny"
+            decision = proc.stdout.strip()
+        else:
+            return "deny"
+    except Exception as exc:
+        logging.warning("Policy approval prompt failed: %s", exc)
+        return "deny"
+    normalized = decision.strip().lower().replace(" ", "_").replace("-", "_")
+    if normalized in {"allow_this_time", "allow_once", "once"}:
+        return "allow_once"
+    if normalized in {"always_allow", "allow_always", "always"}:
+        return "always_allow"
+    return "deny"
+
+
+def maybe_apply_origin_approval(policy, name, action, payload, targets, audit_enabled):
+    origin = _approval_origin(targets)
+    if not origin:
+        return None
+    decision = _run_policy_approval_prompt(name, action, origin, targets)
+    if decision == "allow_once":
+        token = _issue_one_shot_origin_approval(name, action, payload, targets)
+        if _consume_one_shot_origin_approval(token, name, action, payload, targets):
+            _audit(audit_enabled, name, action, targets, "origin_approval_once", origin, None)
+            return _policy_with_origin_grant(policy, name, origin)
+    if decision == "always_allow":
+        updated = _persist_origin_grant(policy, name, origin)
+        _audit(audit_enabled, name, action, targets, "origin_approval_persisted", origin, None)
+        return updated
+    _audit(audit_enabled, name, action, targets, "origin_approval_denied", origin, None)
+    return None
+
+
 def write_audit_event(event):
     # Append one JSON line. Never writes payload/response bodies. A write
     # failure is logged but never blocks browser automation.
@@ -896,11 +1070,25 @@ def handle_socket_client(client_socket):
             audit_enabled = policy_for_client(policy, name).get('audit', True)
 
             # Host-enforced policy, phase 1: action-level and payload-target
-            # checks that need no extension round-trip. These run before the
-            # lease gate, preserving prior precedence (policy denial wins over a
-            # lease held by another client for payload-determined targets).
+            # checks that need no extension round-trip. Plain policy denial still
+            # wins over leases for payload-determined targets, but interactive
+            # origin approval is deferred behind lease ownership so a non-owner
+            # cannot pop UI or mutate policy for an action that cannot run.
             allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
                 policy, name, action, payload)
+            if not allowed and reason == "target not allowed" and _policy_approval_enabled():
+                with lease_lock:
+                    owner, _ = _lease_status_locked()
+                if owner is not None and owner != name:
+                    _audit(audit_enabled, name, action, targets, "lease_deny", f"leased by {owner}", None)
+                    client_socket.sendall(
+                        (json.dumps({"success": False, "error": f"leased by {owner}"}) + "\n").encode('utf-8'))
+                    continue
+                approved_policy = maybe_apply_origin_approval(policy, name, action, payload, targets, audit_enabled)
+                if approved_policy is not None:
+                    policy = approved_policy
+                    allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
+                        policy, name, action, payload)
             if not allowed:
                 _audit(audit_enabled, name, action, targets, "deny", reason, None)
                 client_socket.sendall(
@@ -943,6 +1131,12 @@ def handle_socket_client(client_socket):
                     continue
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
                     policy, name, action, payload, origins=origins)
+                if not allowed and reason == "target not allowed" and _policy_approval_enabled():
+                    approved_policy = maybe_apply_origin_approval(policy, name, action, payload, targets, audit_enabled)
+                    if approved_policy is not None:
+                        policy = approved_policy
+                        allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
+                            policy, name, action, payload, origins=origins)
                 if not allowed:
                     _audit(audit_enabled, name, action, targets, "deny", reason, None)
                     client_socket.sendall(

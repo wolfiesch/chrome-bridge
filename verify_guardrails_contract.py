@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +124,7 @@ def make_env():
     env["BRIDGE_POLICY_FILE"] = POLICY_FILE
     env["BRIDGE_AUDIT_LOG_FILE"] = AUDIT_FILE
     env["BRIDGE_LOG_FILE"] = "/tmp/chrome-bridge-guard.log"
+    env["BRIDGE_POLICY_APPROVAL_MODE"] = "off"
     return env
 
 
@@ -172,6 +174,22 @@ def forwarded_actions():
         return [a for a, _ in forwarded]
 
 
+def make_approval_command():
+    fd, path = tempfile.mkstemp(prefix="chrome-bridge-approval-", suffix=".py")
+    os.close(fd)
+    with open(path, "w") as f:
+        f.write(
+            "import os\n"
+            "decision = os.environ.get('TEST_APPROVAL_DECISION', 'deny')\n"
+            "with open(os.environ['TEST_APPROVAL_LOG'], 'a') as log:\n"
+            "    log.write(os.environ.get('CHROME_BRIDGE_APPROVAL_ACTION', '') + '|' + "
+            "os.environ.get('CHROME_BRIDGE_APPROVAL_ORIGIN', '') + '\\n')\n"
+            "print(decision)\n"
+        )
+    os.chmod(path, 0o700)
+    return path
+
+
 PERMISSIVE = {"default": {"allowedActions": ["*"], "deniedActions": [],
                           "allowedOrigins": ["*"], "deniedOrigins": [],
                           "requireConfirmation": [], "redact": True, "audit": True}}
@@ -181,6 +199,139 @@ def permissive_with(**overrides):
     default = dict(PERMISSIVE["default"])
     default.update(overrides)
     return {"default": default}
+
+
+def check_python_origin_approval(cmd, env):
+    label = "python"
+    approval_cmd = make_approval_command()
+    approval_log = "/tmp/chrome-bridge-approval-log.txt"
+
+    # Deny: denied origin remains denied and nothing forwards.
+    write_policy(permissive_with(allowedActions=["navigate"], allowedOrigins=[]))
+    try:
+        os.remove(approval_log)
+    except FileNotFoundError:
+        pass
+    deny_env = dict(env)
+    deny_env.update({
+        "BRIDGE_POLICY_APPROVAL_MODE": "command",
+        "BRIDGE_POLICY_APPROVAL_COMMAND": f"{sys.executable} {approval_cmd}",
+        "TEST_APPROVAL_DECISION": "deny",
+        "TEST_APPROVAL_LOG": approval_log,
+    })
+
+    # Lease wins before approval UX: a non-owner must not trigger a prompt or
+    # mutate policy for a request that will be rejected as leased by another client.
+    write_policy(permissive_with(allowedActions=["navigate", "lease", "release", "leaseStatus"],
+                                 allowedOrigins=[]))
+    try:
+        os.remove(approval_log)
+    except FileNotFoundError:
+        pass
+    leased_env = dict(deny_env)
+    leased_env["TEST_APPROVAL_DECISION"] = "always_allow"
+    with Host(label, cmd, leased_env):
+        owner = Client("tok-alpha")
+        other = Client("legacy-token")
+        lr = owner.req("lease", {"ttlMs": 5000})
+        expect(lr and lr.get("success") is True, f"{label}: lease setup failed, got {lr}")
+        r = other.req("navigate", {"url": "https://example.com/a"})
+        expect(r and r.get("success") is False and r.get("error") == "leased by alpha",
+               f"{label}: leased non-owner should be denied before approval, got {r}")
+        owner.close()
+        other.close()
+    expect(not os.path.exists(approval_log) or os.path.getsize(approval_log) == 0,
+           f"{label}: leased non-owner must not trigger approval prompt")
+    with open(POLICY_FILE) as f:
+        pol = json.load(f)
+    expect("https://example.com" not in pol.get("default", {}).get("allowedOrigins", []),
+           f"{label}: leased non-owner must not persist origin approval")
+    with Host(label, cmd, deny_env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://example.com/a"})
+        expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
+               f"{label}: denied approval prompt should keep policy denial, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: denied approval prompt must not forward")
+        c.close()
+    deny_decisions = [e["decision"] for e in audit_events() if e["action"] == "navigate"]
+    expect("origin_approval_denied" in deny_decisions,
+           f"{label}: denied approval must be auditable, got {deny_decisions}")
+
+
+    # Allow this time: current action forwards, policy file remains unchanged.
+    write_policy(permissive_with(allowedActions=["navigate"], allowedOrigins=[]))
+    once_env = dict(deny_env)
+    once_env["TEST_APPROVAL_DECISION"] = "allow_once"
+    with Host(label, cmd, once_env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://example.com/a"})
+        expect(r and r.get("success") is True,
+               f"{label}: allow_once approval should forward current action, got {r}")
+        expect("navigate" in forwarded_actions(),
+               f"{label}: allow_once approval should forward navigate")
+        c.close()
+    once_decisions = [e["decision"] for e in audit_events() if e["action"] == "navigate"]
+    expect("origin_approval_once" in once_decisions,
+           f"{label}: allow_once approval must be auditable, got {once_decisions}")
+
+    with open(POLICY_FILE) as f:
+        pol = json.load(f)
+    expect("https://example.com" not in pol.get("default", {}).get("allowedOrigins", []),
+           f"{label}: allow_once must not persist origin grants")
+
+    # Allow this time also covers domain-pattern targets such as getCookies
+    # (`*://example.com`), not only concrete http/https URL origins.
+    write_policy(permissive_with(allowedActions=["getCookies"], allowedOrigins=[]))
+    with Host(label, cmd, once_env):
+        c = Client("tok-alpha")
+        r = c.req("getCookies", {"domain": "example.com"})
+        expect(r and r.get("success") is True,
+               f"{label}: allow_once approval should forward getCookies domain target, got {r}")
+        expect("getCookies" in forwarded_actions(),
+               f"{label}: allow_once approval should forward getCookies")
+        c.close()
+    cookie_decisions = [e["decision"] for e in audit_events() if e["action"] == "getCookies"]
+    expect("origin_approval_once" in cookie_decisions,
+           f"{label}: getCookies allow_once approval must be auditable, got {cookie_decisions}")
+    with open(POLICY_FILE) as f:
+        pol = json.load(f)
+    expect("*://example.com" not in pol.get("default", {}).get("allowedOrigins", []),
+           f"{label}: getCookies allow_once must not persist wildcard origin grants")
+
+    # Always allow: current action forwards and local policy gains the origin.
+    write_policy(permissive_with(allowedActions=["navigate"], allowedOrigins=[]))
+    always_env = dict(deny_env)
+    always_env["TEST_APPROVAL_DECISION"] = "always_allow"
+    with Host(label, cmd, always_env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://example.com/a"})
+        expect(r and r.get("success") is True,
+               f"{label}: always_allow approval should forward current action, got {r}")
+        c.close()
+    always_decisions = [e["decision"] for e in audit_events() if e["action"] == "navigate"]
+    expect("origin_approval_persisted" in always_decisions,
+           f"{label}: always_allow approval must be auditable, got {always_decisions}")
+
+    with open(POLICY_FILE) as f:
+        pol = json.load(f)
+    expect("https://example.com" in pol.get("default", {}).get("allowedOrigins", []),
+           f"{label}: always_allow must persist origin grant in local policy")
+
+    # Site approval must not bypass destructive-action confirmation.
+    write_policy(permissive_with(allowedActions=["executeScriptCDP"],
+                                 allowedOrigins=[],
+                                 requireConfirmation=["executeScriptCDP"]))
+    set_tab_origins({7: "https://example.com"})
+    with Host(label, cmd, once_env):
+        c = Client("tok-alpha")
+        r = c.req("executeScriptCDP", {"tabId": 7, "code": "1"})
+        expect(r and r.get("confirmationRequired") is True and r.get("success") is False,
+               f"{label}: origin approval must still require destructive confirmation, got {r}")
+        expect("executeScriptCDP" not in forwarded_actions(),
+               f"{label}: unconfirmed destructive action must not forward after origin approval")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
 
 
 EXAMPLE_DENIED_ORIGINS = [
@@ -635,6 +786,7 @@ def run_against(label, cmd, env):
                f"{label}: policyCheck must not forward an origin lookup")
         c.close()
 
+
     # --- Content redaction: redactPatterns mask getHTML/extractText/script ---
     write_policy(permissive_with(redactPatterns=[r"\d{3}-\d{2}-\d{4}", "(?i)bearer [a-z0-9]+"]))
     html_result = lambda a, p: {"success": True, "html": "<p>SSN 123-45-6789</p>"} if a == "getHTML" else (
@@ -661,6 +813,31 @@ def run_against(label, cmd, env):
         expect(r and "123-45-6789" in json.dumps(r),
                f"{label}: getHTML without redactPatterns should be unchanged, got {r}")
         c.close()
+
+
+
+def check_example_policy_is_conservative():
+    policy_path = os.path.join(SCRIPT_DIR, "bridge_policy.example.json")
+    with open(policy_path) as f:
+        policy = json.load(f)
+    client = policy.get("clients", {}).get("default", {})
+    allowed = set(client.get("allowedOrigins") or [])
+    expected = {"https://github.com", "https://chatgpt.com", "https://claude.ai",
+                "https://google.com", "https://accounts.google.com"}
+    expect(allowed == expected,
+           f"example policy should keep a narrow onboarding allow-list, got {sorted(allowed)}")
+    privileged = {
+        "https://mail.google.com", "https://drive.google.com", "https://calendar.google.com",
+        "https://vercel.com", "https://app.vercel.com", "https://dashboard.cloudflare.com",
+        "https://dash.cloudflare.com", "https://dashboard.stripe.com",
+        "https://console.aws.amazon.com", "https://*.console.aws.amazon.com",
+        "https://console.cloud.google.com", "https://portal.azure.com",
+        "https://platform.openai.com", "https://paypal.com", "https://venmo.com",
+        "https://x.com", "https://twitter.com", "https://www.linkedin.com",
+        "https://www.facebook.com", "https://www.instagram.com", "https://www.threads.net",
+    }
+    leaked = allowed & privileged
+    expect(not leaked, f"example policy must not ship privileged/personal origins: {sorted(leaked)}")
 
 
 def check_classification_parity():
@@ -692,8 +869,11 @@ def check_classification_parity():
 
 def main():
     check_classification_parity()
+    check_example_policy_is_conservative()
     env = make_env()
-    run_against("python", [sys.executable, os.path.join(SCRIPT_DIR, "bridge.py")], env)
+    python_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "bridge.py")]
+    check_python_origin_approval(python_cmd, env)
+    run_against("python", python_cmd, env)
 
     rust_bin = os.path.join(SCRIPT_DIR, "host-rs", "target", "release", "bridge-host")
     try:
