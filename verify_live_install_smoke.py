@@ -27,7 +27,7 @@ def choose_free_port():
         return probe.getsockname()[1]
 
 
-def run_setup(tmp, env):
+def run_setup(tmp, env, bridge_port):
     proc = subprocess.run(
         [
             "./setup.sh",
@@ -35,6 +35,8 @@ def run_setup(tmp, env):
             str(tmp / "extension"),
             "--state-dir",
             str(tmp / "state"),
+            "--host-port",
+            str(bridge_port),
             "--print-json",
         ],
         cwd=SCRIPT_DIR,
@@ -122,14 +124,28 @@ def setup_created_manifest_paths(tmp):
     return []
 
 
-def assert_reported_paths(setup_json):
-    expected_keys = ["extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher"]
+def assert_reported_paths(setup_json, bridge_port):
+    expected_keys = [
+        "extensionDir",
+        "extensionId",
+        "hostManifest",
+        "policyFile",
+        "tokenFile",
+        "tokensFile",
+        "launcher",
+        "extensionIdFile",
+        "hostPort",
+    ]
     if list(setup_json.keys()) != expected_keys:
         raise AssertionError(f"setup JSON keys mismatch: {list(setup_json.keys())}")
     for key in expected_keys:
         if key == "extensionId":
             if not setup_json[key]:
                 raise AssertionError("extensionId is empty")
+            continue
+        if key == "hostPort":
+            if setup_json[key] != str(bridge_port):
+                raise AssertionError(f"setup hostPort mismatch: {setup_json[key]!r} != {bridge_port!r}")
             continue
         path = Path(setup_json[key])
         if not path.exists():
@@ -282,8 +298,8 @@ def main():
         bridge_port = choose_free_port()
         env = os.environ.copy()
         env.update({"HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": str(tmp_path / "xdg")})
-        setup_json = run_setup(tmp_path, env)
-        assert_reported_paths(setup_json)
+        setup_json = run_setup(tmp_path, env, bridge_port)
+        assert_reported_paths(setup_json, bridge_port)
         for manifest_path in setup_created_manifest_paths(tmp_path):
             assert_manifest(manifest_path, setup_json["launcher"], setup_json["extensionId"])
 

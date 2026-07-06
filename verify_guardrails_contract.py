@@ -805,6 +805,47 @@ def run_against(label, cmd, env):
                f"{label}: executeScript SSN should be redacted, got {r}")
         c.close()
 
+    # --- Batch redaction: each result item uses the corresponding step action ---
+    write_policy(permissive_with(redactPatterns=[r"\d{3}-\d{2}-\d{4}", "(?i)bearer [a-z0-9]+"]))
+    batch_steps = [
+        {"action": "getCookies", "payload": {"domain": "example.com"}},
+        {"action": "storageState", "payload": {}},
+        {"action": "getHTML", "payload": {"tabId": 7}},
+        {"action": "extractText", "payload": {"tabId": 7}},
+        {"action": "executeScript", "payload": {"tabId": 7, "code": "1"}},
+        {"action": "executeScriptCDP", "payload": {"tabId": 7, "code": "1"}},
+        {"action": "batch", "payload": {"steps": [
+            {"action": "getCookies", "payload": {"domain": "nested.example.com"}},
+            {"action": "extractText", "payload": {"tabId": 7}},
+        ]}},
+    ]
+    batch_payload = {"steps": batch_steps}
+    batch_result = lambda a, p: [
+        [{"name": "sid", "value": "cookie-secret"}],
+        {"cookies": [{"name": "auth", "value": "storage-cookie"}],
+         "origins": [{"localStorage": [{"name": "token", "value": "storage-token"},
+                                       {"name": "safe", "value": "visible"}]}]},
+        {"html": "<p>SSN 123-45-6789</p>"},
+        {"text": "auth Bearer abc123 token"},
+        {"val": "SSN 999-88-7777"},
+        {"value": {"nested": "Bearer cdp999"}},
+        [[{"name": "nested", "value": "nested-cookie"}], {"text": "nested Bearer nested123"}],
+        {"unmatchedExtra": "Bearer extra999 111-22-3333"},
+    ] if a == "batch" else {"echo": a}
+    with Host(label, cmd, env, result_fn=batch_result):
+        c = Client("tok-alpha")
+        r = c.req("batch", batch_payload)
+        rendered = json.dumps(r, sort_keys=True)
+        expect(r and r.get("success") is True and isinstance(r.get("result"), list),
+               f"{label}: batch redaction should preserve result array shape, got {r}")
+        expect("cookie-secret" not in rendered and "storage-cookie" not in rendered and "storage-token" not in rendered and "nested-cookie" not in rendered,
+               f"{label}: batch cookie/storage secrets should be redacted, got {r}")
+        expect("123-45-6789" not in rendered and "abc123" not in rendered and "999-88-7777" not in rendered and "cdp999" not in rendered and "nested123" not in rendered,
+               f"{label}: batch content redactPatterns should apply per step, got {r}")
+        expect("visible" in rendered and "unmatchedExtra" in rendered and "extra999" in rendered and "111-22-3333" in rendered,
+               f"{label}: batch redaction should preserve safe values and mismatched extras unchanged, got {r}")
+        c.close()
+
     # --- No redactPatterns: content passes through unchanged ---
     write_policy(PERMISSIVE)
     with Host(label, cmd, env, result_fn=lambda a, p: {"success": True, "html": "<p>SSN 123-45-6789</p>"}):

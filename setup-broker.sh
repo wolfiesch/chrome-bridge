@@ -128,6 +128,9 @@ if [[ "$NO_LOAD" -eq 0 ]]; then
   launchctl kickstart -k "gui/$UID/$LABEL"
   LOADED=true
 fi
+echo "Load unpacked: $EXT_DIR"
+echo "Use the state directory token when testing this broker: BRIDGE_TOKEN_FILE=$STATE_TOKEN"
+echo "State directory: $STATE_DIR"
 
 if [[ "$PRINT_JSON" -eq 1 ]]; then
   python3 - "$LABEL" "$PLIST" "$STATE_DIR" "$EXT_DIR" "$PUBLIC_PORT" "$BACKEND_PORT" "$HOST_IMPL" "$LOADED" <<'PY'

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Offline contract test for extension identity and install/deploy scripts."""
 import base64
+import importlib.util
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import extension_identity
@@ -14,6 +16,14 @@ import extension_identity
 SCRIPT_DIR = Path(__file__).resolve().parent
 failures = []
 
+
+PACKAGE_RELEASE_SPEC = importlib.util.spec_from_file_location(
+    "package_release", SCRIPT_DIR / "scripts" / "package_release.py"
+)
+if PACKAGE_RELEASE_SPEC is None or PACKAGE_RELEASE_SPEC.loader is None:
+    raise RuntimeError("cannot load scripts/package_release.py")
+package_release = importlib.util.module_from_spec(PACKAGE_RELEASE_SPEC)
+PACKAGE_RELEASE_SPEC.loader.exec_module(package_release)
 
 def expect(cond, msg):
     if not cond:
@@ -39,6 +49,60 @@ def mode(path):
 
 def visible_names(path):
     return sorted(p.name for p in Path(path).iterdir() if not p.name.startswith("."))
+
+
+def expect_zip_names(zip_path, expected, label):
+    with zipfile.ZipFile(zip_path) as archive:
+        names = sorted(archive.namelist())
+    expect(names == sorted(expected), f"{label} mismatch: got {names}")
+
+
+def expect_source_archive_omits_scratch_files(repo_root, dist, version):
+    scratch_files = [
+        "mcp/uv.lock",
+        ".env",
+        "bridge_token.txt",
+        "bridge_tokens.txt",
+        "bridge_tokens.txt.lock",
+        "bridge_token_release-test.txt",
+        ".bridge_tokens.release-test",
+        "com.automation.bridge.json",
+        "com.automation.bridge.rust.json",
+        "bridge-host-launch.sh",
+        "bridge-host-python-launch.sh",
+        "bridge_policy.json",
+        "extension_id.txt",
+        "verify_release_scratch_contract.py",
+        "verify_xchat_capture_contract.py",
+    ]
+    created = []
+    try:
+        for relative in scratch_files:
+            path = repo_root / relative
+            if path.exists():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("local scratch\n", encoding="utf-8")
+            created.append(path)
+
+        source_zip = package_release.add_source_zip(repo_root, dist, version)
+        with zipfile.ZipFile(source_zip) as archive:
+            source_names = set(archive.namelist())
+
+        for relative in scratch_files:
+            expect(relative not in source_names, f"source package should omit local scratch file {relative}")
+
+        expected_tracked_public_files = [
+            "bridge_policy.example.json",
+            "bridge_tokens.txt.example",
+            "com.automation.bridge.json.template",
+        ]
+        for relative in expected_tracked_public_files:
+            expect(relative in source_names, f"source package should keep tracked public template {relative}")
+    finally:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+
 
 
 def main():
@@ -131,6 +195,26 @@ def main():
             expect(setup_info.get("hostPort") == "19223",
                    "setup JSON should include hostPort 19223")
 
+        store_extension_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        store_state_dir = tmp / "store-state"
+        store_ext_dir = tmp / "store-extension"
+        r = run([
+            "./setup.sh",
+            "--state-dir", str(store_state_dir),
+            "--ext", str(store_ext_dir),
+            "--extension-id", store_extension_id,
+            "--host-port", "19223",
+            "--print-json",
+        ], env=install_env)
+        expect(r.returncode == 0, f"setup provided extension-id failed: {r.stderr}")
+        if r.returncode == 0:
+            expect("Load unpacked:" not in r.stdout,
+                   "setup with provided extension-id should not imply an unpacked extension was deployed")
+            expect("Install or package the extension that owns this ID" in r.stdout,
+                   "setup with provided extension-id should print packaged/store extension guidance")
+            expect(not store_ext_dir.exists(),
+                   "setup with provided extension-id should not deploy the extension directory")
+
         rust_state_dir = tmp / "state-rs"
         r = run([
             "./setup-rs.sh",
@@ -155,6 +239,65 @@ def main():
             expect("Build the Rust host first" in (r.stdout + r.stderr),
                    f"setup-rs missing build-first message: stdout={r.stdout} stderr={r.stderr}")
 
+        rust_store_state_dir = tmp / "store-state-rs"
+        rust_store_ext_dir = tmp / "store-extension-rs"
+        r = run([
+            "./setup-rs.sh",
+            "--state-dir", str(rust_store_state_dir),
+            "--ext", str(rust_store_ext_dir),
+            "--extension-id", store_extension_id,
+            "--host-port", "19223",
+            "--print-json",
+        ], env=install_env)
+        expect("Load unpacked:" not in r.stdout,
+               "setup-rs with provided extension-id should not imply an unpacked extension was deployed")
+        if r.returncode == 0:
+            expect("Install or package the extension that owns this ID" in r.stdout,
+                   "setup-rs with provided extension-id should print packaged/store extension guidance")
+            expect(not rust_store_ext_dir.exists(),
+                   "setup-rs with provided extension-id should not deploy the extension directory")
+
+        broker_python_ok = run(["python3", "-c", "import plistlib"]).returncode == 0
+        if sys.platform == "darwin" and broker_python_ok:
+            broker_state_dir = tmp / "broker-state"
+            broker_ext_dir = tmp / "broker-extension"
+            r = run([
+                "./setup-broker.sh",
+                "--state-dir", str(broker_state_dir),
+                "--ext", str(broker_ext_dir),
+                "--backend-port", "19224",
+                "--public-port", "9224",
+                "--no-load",
+                "--print-json",
+            ], env=install_env)
+            expect(r.returncode == 0, f"setup-broker --no-load failed: {r.stderr}")
+            if r.returncode == 0:
+                expect(f"Load unpacked: {broker_ext_dir}" in r.stdout,
+                       "setup-broker success should print which extension directory to load")
+                expect(f"BRIDGE_TOKEN_FILE={broker_state_dir / 'bridge_token.txt'}" in r.stdout,
+                       "setup-broker success should print state-dir token advice")
+
+        dist = tmp / "dist"
+        dist.mkdir()
+        backup = SCRIPT_DIR / "bridge_policy.json.bak-contract"
+        try:
+            backup.write_text('{"local": true}\n', encoding="utf-8")
+            package_release.add_source_zip(SCRIPT_DIR, dist, "contract")
+            package_release.add_extension_zip(SCRIPT_DIR, dist, "contract")
+            expect_zip_names(
+                dist / "chrome-native-bridge-extension-unpacked-contract.zip",
+                ["background.js", "manifest.json", "wake.html", "wake.js"],
+                "extension package contents",
+            )
+            with zipfile.ZipFile(dist / "chrome-native-bridge-source-contract.zip") as archive:
+                source_names = set(archive.namelist())
+            expect("bridge_policy.json.bak-contract" not in source_names,
+                   "source package should exclude local policy backups")
+            expect("bridge_policy.example.json" in source_names,
+                   "source package should include example policy")
+            expect_source_archive_omits_scratch_files(SCRIPT_DIR, dist, "scratch-contract")
+        finally:
+            backup.unlink(missing_ok=True)
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")
         return 1

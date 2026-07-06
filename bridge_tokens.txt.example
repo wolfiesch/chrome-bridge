@@ -11,6 +11,6 @@
 # Copy this file to `bridge_tokens.txt` (same directory) or point
 # BRIDGE_TOKENS_FILE at your own path, then add real clients below.
 #
-# Examples (commented out):
-# alice:3f9c1d7a2b8e4f06a1c5d9e8b7f60213
-# ci-runner:9a2b4c6d8e0f1a3b5c7d9e1f2a4b6c8d
+# Examples (commented out; replace placeholder tokens with locally generated secrets):
+# agent-a:replace-with-a-random-local-token
+# agent-b:replace-with-another-random-local-token

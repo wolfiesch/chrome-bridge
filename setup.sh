@@ -89,9 +89,11 @@ else
 fi
 chmod 600 "$POLICY_FILE"
 
+DEPLOYED_EXTENSION=0
 if [[ -z "$EXTENSION_ID" ]]; then
   "$SCRIPT_DIR/deploy.sh" --ext "$EXT_DIR" --with-local-key --key-file "$KEY_FILE"
   EXTENSION_ID="$(python3 "$SCRIPT_DIR/extension_identity.py" id --key "$KEY_FILE")"
+  DEPLOYED_EXTENSION=1
 else
   echo "Using provided extension ID: $EXTENSION_ID"
 fi
@@ -146,8 +148,13 @@ case "$(uname -s)" in
       "$CONFIG_HOME/chromium/NativeMessagingHosts"
     ) ;;
   *)
-    echo "Unsupported OS for auto-registration; copy $HOST_MANIFEST into your browser's NativeMessagingHosts directory manually."
-    echo "Load unpacked: $EXT_DIR"
+    echo "Unsupported OS for auto-registration. Register $HOST_MANIFEST with your browser's native-messaging host mechanism manually."
+    if [[ "$DEPLOYED_EXTENSION" -eq 1 ]]; then
+      echo "Load unpacked: $EXT_DIR"
+    else
+      echo "Install or package the extension that owns this ID: $EXTENSION_ID"
+      echo "Use the packaged/store extension for this registration; no unpacked extension was deployed."
+    fi
     echo "Then run: python3 test_client.py ping"
     if [[ "$PRINT_JSON" -eq 1 ]]; then
       python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
@@ -168,7 +175,12 @@ for HOST_DIR in "${HOST_DIRS[@]}"; do
 done
 
 echo "Registered with $REGISTERED browser variant(s)."
-echo "Load unpacked: $EXT_DIR"
+if [[ "$DEPLOYED_EXTENSION" -eq 1 ]]; then
+  echo "Load unpacked: $EXT_DIR"
+else
+  echo "Install or package the extension that owns this ID: $EXTENSION_ID"
+  echo "Use the packaged/store extension for this registration; no unpacked extension was deployed."
+fi
 echo "Then run: python3 test_client.py ping"
 
 if [[ "$PRINT_JSON" -eq 1 ]]; then
