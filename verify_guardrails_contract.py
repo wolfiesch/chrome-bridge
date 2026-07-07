@@ -842,8 +842,8 @@ def run_against(label, cmd, env):
                f"{label}: batch cookie/storage secrets should be redacted, got {r}")
         expect("123-45-6789" not in rendered and "abc123" not in rendered and "999-88-7777" not in rendered and "cdp999" not in rendered and "nested123" not in rendered,
                f"{label}: batch content redactPatterns should apply per step, got {r}")
-        expect("visible" in rendered and "unmatchedExtra" in rendered and "extra999" in rendered and "111-22-3333" in rendered,
-               f"{label}: batch redaction should preserve safe values and mismatched extras unchanged, got {r}")
+        expect("visible" in rendered and "unmatchedExtra" in rendered and "extra999" not in rendered and "111-22-3333" not in rendered,
+               f"{label}: batch redaction should preserve safe values and mask unmatched extras with redactPatterns, got {r}")
         c.close()
 
     # --- No redactPatterns: content passes through unchanged ---

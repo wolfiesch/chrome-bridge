@@ -100,11 +100,22 @@ def should_exclude(path: Path, repo_root: Path, dist_dir: Path) -> bool:
 
 
 def tracked_source_paths(repo_root: Path) -> list[Path]:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "ls-files", "-z"],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        print("ERROR: source packaging requires git; install git or run from a checkout.", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip() if exc.stderr else ""
+        message = "ERROR: source packaging requires a git checkout; run from the repository root."
+        if detail:
+            message = f"{message} git said: {detail}"
+        print(message, file=sys.stderr)
+        raise SystemExit(2) from exc
     tracked = [
         repo_root / raw.decode("utf-8")
         for raw in result.stdout.split(b"\0")

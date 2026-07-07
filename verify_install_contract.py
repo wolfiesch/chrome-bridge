@@ -99,9 +99,22 @@ def expect_source_archive_omits_scratch_files(repo_root, dist, version):
         ]
         for relative in expected_tracked_public_files:
             expect(relative in source_names, f"source package should keep tracked public template {relative}")
+        expect_package_requires_git_checkout()
     finally:
         for path in reversed(created):
             path.unlink(missing_ok=True)
+
+
+def expect_package_requires_git_checkout():
+    with tempfile.TemporaryDirectory() as td:
+        non_repo = Path(td) / "source"
+        non_repo.mkdir()
+        try:
+            package_release.tracked_source_paths(non_repo)
+        except SystemExit as exc:
+            expect(exc.code == 2, f"non-git package error should exit 2, got {exc.code}")
+        else:
+            expect(False, "source packaging should fail clearly outside a git checkout")
 
 
 

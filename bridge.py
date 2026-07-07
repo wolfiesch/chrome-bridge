@@ -878,17 +878,24 @@ def redact_response(action, response, redact_enabled, patterns=None, payload=Non
     if action == 'batch':
         steps = (payload or {}).get('steps') if isinstance(payload, dict) else None
         result = response.get('result')
-        if not isinstance(steps, list) or not isinstance(result, list):
+        if not isinstance(result, list):
             return response
+        fallback_patterns = _compile_patterns(patterns)
+        def redact_unknown_batch_item(item):
+            return _redact_content_value(item, fallback_patterns) if fallback_patterns else item
+        if not isinstance(steps, list):
+            out = dict(response)
+            out['result'] = [redact_unknown_batch_item(item) for item in result]
+            return out
         redacted = []
         for i, item in enumerate(result):
             if i >= len(steps):
-                redacted.append(item)
+                redacted.append(redact_unknown_batch_item(item))
                 continue
             step = steps[i]
             step_action = step.get('action') if isinstance(step, dict) else None
             if not isinstance(step_action, str):
-                redacted.append(item)
+                redacted.append(redact_unknown_batch_item(item))
                 continue
             step_payload = step.get('payload') if isinstance(step.get('payload'), dict) else {}
             wrapped = redact_response(step_action, {"result": item}, redact_enabled, patterns, step_payload)

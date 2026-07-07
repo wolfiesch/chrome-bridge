@@ -1169,7 +1169,15 @@ fn redact_response(
             .and_then(|p| p.get("steps"))
             .and_then(|s| s.as_array());
         let result = obj.get("result").and_then(|r| r.as_array());
-        let (Some(steps), Some(result)) = (steps, result) else {
+        let Some(result) = result else {
+            return Value::Object(obj);
+        };
+        let fallback_patterns = compile_patterns(patterns);
+        let redact_unknown_batch_item =
+            |item: &Value| redact_content_value(item.clone(), &fallback_patterns);
+        let Some(steps) = steps else {
+            let redacted = result.iter().map(redact_unknown_batch_item).collect();
+            obj.insert("result".to_string(), Value::Array(redacted));
             return Value::Object(obj);
         };
         let mut redacted = Vec::with_capacity(result.len());
@@ -1179,7 +1187,7 @@ fn redact_response(
                 .and_then(|s| s.get("action"))
                 .and_then(|a| a.as_str())
             else {
-                redacted.push(item.clone());
+                redacted.push(redact_unknown_batch_item(item));
                 continue;
             };
             let step_payload = steps
