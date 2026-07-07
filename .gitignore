@@ -16,6 +16,7 @@ extension_id.txt
 bridge-host-launch.sh
 bridge-host-python-launch.sh
 bridge_policy*.json
+bridge_policy*.json.*
 !bridge_policy.example.json
 
 # Logs and caches
@@ -25,6 +26,10 @@ bridge_audit.jsonl
 __pycache__/
 *.pyc
 .chrome-bridge-puppeteer-*/
+mcp/uv.lock
+.venv/
+mcp/.venv/
+.wip/
 
 # OS noise
 .DS_Store

@@ -1058,6 +1058,20 @@ const REDACT_KEY_SUBSTRINGS: [&str; 7] =
 fn redact_storage_value(value: Value) -> Value {
     match value {
         Value::Object(map) => {
+            if map
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|name| {
+                    let lower = name.to_lowercase();
+                    REDACT_KEY_SUBSTRINGS.iter().any(|s| lower.contains(s))
+                })
+                .unwrap_or(false)
+                && map.contains_key("value")
+            {
+                let mut out = map;
+                out.insert("value".to_string(), Value::String("<redacted>".to_string()));
+                return Value::Object(out);
+            }
             let mut out = serde_json::Map::new();
             for (k, v) in map {
                 let lower = k.to_lowercase();
@@ -1141,6 +1155,7 @@ fn redact_response(
     response: Value,
     redact_enabled: bool,
     patterns: Option<&Value>,
+    payload: Option<&Value>,
 ) -> Value {
     if !redact_enabled {
         return response;
@@ -1149,6 +1164,51 @@ fn redact_response(
         Value::Object(m) => m,
         other => return other,
     };
+    if action == "batch" {
+        let steps = payload
+            .and_then(|p| p.get("steps"))
+            .and_then(|s| s.as_array());
+        let result = obj.get("result").and_then(|r| r.as_array());
+        let Some(result) = result else {
+            return Value::Object(obj);
+        };
+        let fallback_patterns = compile_patterns(patterns);
+        let redact_unknown_batch_item =
+            |item: &Value| redact_content_value(item.clone(), &fallback_patterns);
+        let Some(steps) = steps else {
+            let redacted = result.iter().map(redact_unknown_batch_item).collect();
+            obj.insert("result".to_string(), Value::Array(redacted));
+            return Value::Object(obj);
+        };
+        let mut redacted = Vec::with_capacity(result.len());
+        for (i, item) in result.iter().enumerate() {
+            let Some(step_action) = steps
+                .get(i)
+                .and_then(|s| s.get("action"))
+                .and_then(|a| a.as_str())
+            else {
+                redacted.push(redact_unknown_batch_item(item));
+                continue;
+            };
+            let step_payload = steps
+                .get(i)
+                .and_then(|s| s.get("payload"));
+            let wrapped = redact_response(
+                step_action,
+                json!({ "result": item.clone() }),
+                redact_enabled,
+                patterns,
+                step_payload,
+            );
+            let unwrapped = wrapped
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| item.clone());
+            redacted.push(unwrapped);
+        }
+        obj.insert("result".to_string(), Value::Array(redacted));
+        return Value::Object(obj);
+    }
     if action == "getCookies" {
         // result.cookies (object) | result (array) | response.cookies (array)
         if let Some(Value::Object(result)) = obj.get("result") {
@@ -1558,7 +1618,7 @@ fn handle_socket_client(
                 let ext_decision = if success { "extension_success" } else { "extension_error" };
                 let reason = response.get("error").and_then(|v| v.as_str());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, ext_decision, reason, Some(&req_id));
-                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref());
+                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref(), payload.as_ref());
                 if write_line(&mut stream, &response).is_err() {
                     return;
                 }

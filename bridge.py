@@ -816,6 +816,11 @@ _REDACT_KEY_SUBSTRINGS = ('token', 'secret', 'password', 'cookie', 'session', 'c
 
 def _redact_storage_value(value):
     if isinstance(value, dict):
+        name = value.get('name')
+        if isinstance(name, str) and any(s in name.lower() for s in _REDACT_KEY_SUBSTRINGS) and 'value' in value:
+            out = dict(value)
+            out['value'] = "<redacted>"
+            return out
         out = {}
         for k, v in value.items():
             if isinstance(k, str) and any(s in k.lower() for s in _REDACT_KEY_SUBSTRINGS):
@@ -865,11 +870,39 @@ def _redact_content_value(value, compiled):
     return value
 
 
-def redact_response(action, response, redact_enabled, patterns=None):
+def redact_response(action, response, redact_enabled, patterns=None, payload=None):
     # Redact sensitive response values before returning them to socket clients.
     # Operates on a returned copy; never mutates audit/queue/routing structures.
     if not redact_enabled or not isinstance(response, dict):
         return response
+    if action == 'batch':
+        steps = (payload or {}).get('steps') if isinstance(payload, dict) else None
+        result = response.get('result')
+        if not isinstance(result, list):
+            return response
+        fallback_patterns = _compile_patterns(patterns)
+        def redact_unknown_batch_item(item):
+            return _redact_content_value(item, fallback_patterns) if fallback_patterns else item
+        if not isinstance(steps, list):
+            out = dict(response)
+            out['result'] = [redact_unknown_batch_item(item) for item in result]
+            return out
+        redacted = []
+        for i, item in enumerate(result):
+            if i >= len(steps):
+                redacted.append(redact_unknown_batch_item(item))
+                continue
+            step = steps[i]
+            step_action = step.get('action') if isinstance(step, dict) else None
+            if not isinstance(step_action, str):
+                redacted.append(redact_unknown_batch_item(item))
+                continue
+            step_payload = step.get('payload') if isinstance(step.get('payload'), dict) else {}
+            wrapped = redact_response(step_action, {"result": item}, redact_enabled, patterns, step_payload)
+            redacted.append(wrapped.get("result", item) if isinstance(wrapped, dict) else item)
+        out = dict(response)
+        out['result'] = redacted
+        return out
     if action == 'getCookies':
         result = response.get('result')
         cookies = None
@@ -1188,7 +1221,7 @@ def handle_socket_client(client_socket):
             ext_decision = "extension_success" if response.get("success") else "extension_error"
             _audit(audit_enabled, name, action, targets, ext_decision, response.get("error"), req_id)
             redact_patterns = policy_for_client(policy, name).get('redactPatterns')
-            response = redact_response(action, response, redact_enabled, redact_patterns)
+            response = redact_response(action, response, redact_enabled, redact_patterns, payload)
             client_socket.sendall((json.dumps(response) + "\n").encode('utf-8'))
     except Exception as e:
         logging.error(f"Error handling socket client: {e}", exc_info=True)

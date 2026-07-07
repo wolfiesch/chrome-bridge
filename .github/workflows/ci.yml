@@ -36,6 +36,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
           cargo build --release --manifest-path host-rs/Cargo.toml
           python3 scripts/package_release.py --version ci --dist /tmp/chrome-bridge-dist
           PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py

@@ -42,8 +42,10 @@ EXCLUDED_GLOBS = {
     ".env",
     ".env.*",
     "bridge_policy*.json",
+    "bridge_policy*.json.*",
     "bridge_token_*.txt",
     "com.automation.bridge*.json",
+    "mcp/uv.lock",
     "*.log",
     "*.pyc",
     "*.pem",
@@ -75,54 +77,8 @@ def is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
-def load_gitignore_patterns(repo_root: Path) -> dict[Path, list[str]]:
-    patterns: dict[Path, list[str]] = {}
-    for gitignore in repo_root.rglob(".gitignore"):
-        if any(part == ".git" for part in gitignore.parts):
-            continue
-        base = gitignore.parent
-        loaded: list[str] = []
-        for raw_line in gitignore.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or line.startswith("!"):
-                continue
-            loaded.append(line)
-        if loaded:
-            patterns[base] = loaded
-    return patterns
 
-
-def match_gitignore_pattern(relative: Path, pattern: str) -> bool:
-    path = relative.as_posix()
-    name = relative.name
-    directory_pattern = pattern.endswith("/")
-    pattern = pattern.rstrip("/")
-    anchored = pattern.startswith("/")
-    pattern = pattern.lstrip("/")
-
-    if not pattern:
-        return False
-
-    if directory_pattern:
-        return path == pattern or path.startswith(f"{pattern}/") or any(part == pattern for part in relative.parts)
-
-    if "/" in pattern or anchored:
-        return fnmatch(path, pattern) or path.startswith(f"{pattern}/")
-
-    return fnmatch(name, pattern) or any(fnmatch(part, pattern) for part in relative.parts)
-
-
-def ignored_by_gitignore(path: Path, repo_root: Path, patterns: dict[Path, list[str]]) -> bool:
-    for base, base_patterns in patterns.items():
-        if not is_relative_to(path, base):
-            continue
-        relative = path.relative_to(base)
-        if any(match_gitignore_pattern(relative, pattern) for pattern in base_patterns):
-            return True
-    return False
-
-
-def should_exclude(path: Path, repo_root: Path, dist_dir: Path, patterns: dict[Path, list[str]]) -> bool:
+def should_exclude(path: Path, repo_root: Path, dist_dir: Path) -> bool:
     relative = path.relative_to(repo_root)
     parts = relative.parts
 
@@ -140,22 +96,46 @@ def should_exclude(path: Path, repo_root: Path, dist_dir: Path, patterns: dict[P
         return True
     if any(fnmatch(relative.as_posix(), pattern) or fnmatch(path.name, pattern) for pattern in EXCLUDED_GLOBS):
         return True
-    if ignored_by_gitignore(path, repo_root, patterns):
-        return True
     return False
+
+
+def tracked_source_paths(repo_root: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        print("ERROR: source packaging requires git; install git or run from a checkout.", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip() if exc.stderr else ""
+        message = "ERROR: source packaging requires a git checkout; run from the repository root."
+        if detail:
+            message = f"{message} git said: {detail}"
+        print(message, file=sys.stderr)
+        raise SystemExit(2) from exc
+    tracked = [
+        repo_root / raw.decode("utf-8")
+        for raw in result.stdout.split(b"\0")
+        if raw
+    ]
+    public_untracked = [
+        repo_root / relative
+        for relative in sorted(ALWAYS_INCLUDE_PATHS)
+        if (repo_root / relative).is_file()
+    ]
+    return sorted({*tracked, *public_untracked}, key=lambda path: path.relative_to(repo_root).as_posix())
 
 
 def add_source_zip(repo_root: Path, dist_dir: Path, version: str) -> Path:
     source_zip = dist_dir / f"chrome-native-bridge-source-{version}.zip"
-    patterns = load_gitignore_patterns(repo_root)
     with zipfile.ZipFile(source_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(repo_root.rglob("*")):
-            if should_exclude(path, repo_root, dist_dir, patterns):
-                if path.is_dir():
-                    continue
+        for path in tracked_source_paths(repo_root):
+            if should_exclude(path, repo_root, dist_dir):
                 continue
-            if path.is_file():
-                archive.write(path, path.relative_to(repo_root).as_posix())
+            archive.write(path, path.relative_to(repo_root).as_posix())
     return source_zip
 
 
@@ -166,6 +146,8 @@ def add_extension_zip(repo_root: Path, dist_dir: Path, version: str) -> Path:
     with zipfile.ZipFile(extension_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(repo_root / "background.js", "background.js")
         archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=False) + "\n")
+        archive.write(repo_root / "wake.html", "wake.html")
+        archive.write(repo_root / "wake.js", "wake.js")
     return extension_zip
 
 

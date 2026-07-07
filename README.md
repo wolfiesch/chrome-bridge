@@ -1,6 +1,6 @@
 # Chrome Native Messaging Automation Bridge
 
-A custom Chrome MV3 extension plus Python native-messaging host lets local scripts drive Chrome without `--remote-debugging-port`, so Chrome never shows the focus-stealing remote-debugging popup. Automation runs inside your real, logged-in profile.
+A custom Chrome MV3 extension plus a native-messaging host lets trusted local clients drive Chrome without `--remote-debugging-port`, so Chrome never shows the focus-stealing remote-debugging popup. Automation runs inside your real, logged-in profile.
 
 The bridge exposes an agent-ready browser-control surface: navigation and history, tab lifecycle, waits, scrolling, screenshots, content extraction, keyboard/pointer primitives, forms and file uploads, viewport control, and console/network/dialog diagnostics.
 
@@ -54,9 +54,15 @@ chrome-native-bridge/
 
 ## Requirements
 
-- Google Chrome, Chrome Beta/Canary, or Chromium with Developer mode.
-- Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`).
-- macOS or Linux. `setup.sh` auto-registers the native host for each installed variant. Windows works but requires manual native-host registration.
+- Google Chrome, Chrome Beta, or Chromium with Developer mode. The macOS installer also registers Chrome Canary.
+- Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`, matching `mcp/pyproject.toml`).
+- macOS or Linux for the documented `setup.sh` and `setup-rs.sh` native-host installers. Broker mode and `setup-broker.sh` are macOS-only because they use launchd. Other platforms may be possible with manual Chrome native-host registration, but they are not covered by these installers.
+
+## Trusted-local security warning
+
+This bridge controls your real Chrome profile. It can read page content, take screenshots, drive forms, download files, inspect cookies through redacted probes, attach Chrome's debugger, and run script/debugger actions when policy allows them. Install it only for trusted local automation on a machine you control. Keep `bridge_token.txt`, `bridge_tokens.txt`, `extension_key.pem`, `bridge_policy.json`, debug logs, and audit logs private and git-ignored.
+
+The example policy is conservative: built-in defaults allow only `ping`, policy inspection, and lease actions until a local policy opts into more. Some README examples and live gates need explicit action/origin grants for the sites you intend to automate.
 
 ## Setup
 
@@ -86,7 +92,7 @@ Advanced setup:
 ./setup.sh --extension-id <id>
 ```
 
-Use this for an already-packaged or future Web Store extension ID. It registers that ID and does not generate or inject a local extension key.
+Use this for an already-packaged or future Web Store extension ID. It registers that packaged/store extension ID separately and does not generate or inject a local extension key for the developer-mode unpacked copy.
 
 ```bash
 cargo build --release --manifest-path host-rs/Cargo.toml
@@ -112,6 +118,8 @@ cargo build --release --manifest-path host-rs/Cargo.toml
 ./setup-broker.sh --host rust
 ```
 
+After setup completes, load the state-dir extension path printed by `setup-broker.sh` and disable any older bridge extension. Broker mode uses state under `~/Library/Application Support/chrome-native-bridge` by default, including its own extension key, extension ID, token, policy, and launcher. If you are migrating from a repo-local install, reload exactly the printed state-dir extension so the loaded extension ID matches the broker native-host registration.
+
 Verify the broker process and public endpoint:
 
 ```bash
@@ -125,7 +133,7 @@ Disable broker mode:
 ./uninstall-broker.sh
 ```
 
-`extension_key.pem` is a private local identity key. Keep it git-ignored and never commit it. A future Web Store extension will have a separate store-managed ID.
+`extension_key.pem` is a private local identity key for the developer-mode unpacked extension. Keep it git-ignored and never commit it. A packaged or Web Store extension has a separate store-managed ID; register that ID with `./setup.sh --extension-id <store-id>`.
 
 ## Command reference
 
@@ -349,7 +357,7 @@ The default sample policy is intentionally fail-closed and denies loopback URLs.
 
 Pull requests run `.github/workflows/ci.yml`. Tags that match `v*` run `.github/workflows/release.yml`.
 
-The extension artifact is an unpacked, developer-mode bundle and remains unkeyed. Later Web Store packaging uses the store-managed ID:
+The extension artifact is an unpacked, developer-mode bundle and remains unkeyed. A packaged or Web Store extension uses its own store-managed ID and must be registered separately:
 
 ```bash
 ./setup.sh --extension-id <store-id>
@@ -402,7 +410,7 @@ The server reuses `test_client.py`'s transport verbatim, so the MCP tools and th
 
 ### Tools
 
-P2 ships a grouped tool set. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
+The MCP server ships a grouped tool set. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
 
 Read-only:
 
@@ -532,48 +540,34 @@ python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --i
 
 The benchmark harness talks to the bridge over one keep-alive TCP connection (see `BridgeClient` in `benchmark_harness.py`) instead of spawning `python3 test_client.py` per operation. The native host (`bridge.py`) serves many newline-delimited requests per connection, awaiting each extension response on a per-request queue before reading the next, so request/response order is preserved on a shared socket.
 
-This removed the per-operation Python interpreter startup (~30 ms) and TCP handshake that dominated latency. Median-of-medians dropped from ~41 ms to ~6 ms, and pure-overhead ops (`wait-selector`, `get-html`, `performance-metrics`) fell to ~2 ms — essentially one socket round trip. The CLI (`test_client.py`) still uses one connection per command; the persistent client is the harness/agent fast path. Set `CHROME_BRIDGE_CLIENT` to force the harness back onto an external launcher.
+This avoids per-operation Python interpreter startup and TCP connection setup in the harness path. Exact latency depends on the local browser profile, machine load, adapter versions, and benchmark run. Generate a fresh report before making comparative speed claims. The CLI (`test_client.py`) still uses one connection per command; the persistent client is the harness/agent path. Set `CHROME_BRIDGE_CLIENT` to force the harness back onto an external launcher.
 
 ### Batched bridge actions
 
-Multi-step Chrome Bridge operations (console/network monitoring, dialog handling) use a composite `batch` action so several sub-commands run in a single native-message round trip. The batch fails as a whole if any sub-command throws or returns `success: false`.
+The bridge supports a composite `batch` action for workflows where several sub-commands should share one native-message request. The batch fails as a whole if any sub-command throws or returns `success: false`.
 
 ```bash
 python3 test_client.py batch '[{"action":"startMonitoring"},{"action":"click","payload":{"selector":"#log"}},{"action":"consoleMessages","delayMs":100}]' <tabId>
 ```
 
-Batching collapses the three sub-commands of each monitoring op into one round trip; the residual ~100 ms is the deliberate `delayMs` settle window, not transport.
+Treat batching as a capability, not a benchmark claim. If you publish batching latency, cite a fresh raw result artifact from a harness path that actually invokes `batch`.
 
-### Measured head-to-head
+### Generating head-to-head results
 
-Median ms per operation, 5 iterations, identical local HTTP fixture, all three adapters run back-to-back in one session, all 18 ops `pass` for every adapter. Navigation is normalized to `domcontentloaded` so `wait-load` is comparable.
+Do not treat static README examples as maintained speed evidence. Run the measured adapters locally, then compare the generated result files:
 
-| Operation | Chrome Bridge | Playwright | Puppeteer |
-| --- | ---: | ---: | ---: |
-| ping | 4.83 | 1.97 | 0.34 |
-| navigate | 16.36 | 10.93 | 7.96 |
-| wait-load | 255.97 | 5.19 | 18.84 |
-| wait-selector | 1.96 | 11.29 | 5.69 |
-| click | 9.71 | 26.38 | 8.87 |
-| fill | 3.47 | 3.58 | 1.26 |
-| select | 2.48 | 2.61 | 1.51 |
-| upload | 7.62 | 6.18 | 6.42 |
-| screenshot | 51.06 | 61.32 | 28.26 |
-| extract-text | 2.35 | 1.38 | 2.32 |
-| get-html | 2.44 | 1.41 | 0.58 |
-| observe-state | 4.35 | 1.72 | 2.19 |
-| console-monitoring | 106.26 | 72.85 | 57.70 |
-| network-monitoring | 105.96 | 83.63 | 55.83 |
-| dialog-handling | 104.40 | 32.29 | 14.21 |
-| storage-state | 3.65 | 2.12 | 0.54 |
-| geolocation | 17.43 | 11.75 | 1.19 |
-| performance-metrics | 1.91 | 0.95 | 0.35 |
+```bash
+python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --output /tmp/chrome-bridge-results.json
+python3 benchmark_harness.py run --adapter playwright --iterations 5 --output /tmp/playwright-results.json
+python3 benchmark_harness.py run --adapter puppeteer --iterations 5 --output /tmp/puppeteer-results.json
+python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --input /tmp/playwright-results.json --input /tmp/puppeteer-results.json --output /tmp/head-to-head.md
+```
 
-Median-of-medians: Chrome Bridge ~6.2 ms, Playwright ~5.7 ms, Puppeteer ~4.0 ms. With the persistent client, Chrome Bridge is competitive with the in-process drivers rather than multiples slower; it wins `wait-selector` outright and beats Playwright on `click` (though it trails Puppeteer there slightly). Two real gaps remain: `wait-load` (~256 ms — `waitForLoad` polls more conservatively than Playwright's load-state signal) and the monitoring ops (the 100 ms settle window). The earlier "~41 ms, 4x slower" figure was per-operation subprocess spawn, now eliminated. Timings vary with machine load; rerun locally for current numbers.
+Only rows marked `measured` in the generated report support speed or capability claims. Static metadata rows describe expected strengths and limits only. When publishing exact timings, keep the raw JSON and generated Markdown report, and record the source commit, host build identity, OS/hardware/browser/tool versions, command lines, iteration count, timeout/warmup policy, fixture URL, profile/cache state, and run timestamp.
 
-## Usage telemetry
+## Local usage diagnostics
 
-`usage_telemetry.py` mines local agent logs to count how often the bridge's browser tools are actually used, and breaks the total down by source so you can see each one's magnitude as a share of the whole. It reads three sources, all local and read-only:
+`usage_telemetry.py` is an advanced local diagnostic script. It mines local agent logs to count how often the bridge's browser tools are used and breaks the total down by source so you can see each one's magnitude as a share of the whole. It is not product telemetry: it only reads local files you point it at and never sends data anywhere.
 
 - **claude** — Claude Code transcripts under `~/.claude/projects` (`--projects-dir`). MCP `tool_use` blocks matching `--server-match` (default `chrome[-_]devtools`).
 - **codex** — Codex rollout sessions under `~/.codex/sessions` (`--codex-dir`). Canonical `mcp_tool_call_end` events (deduped by `call_id`; the bare `function_call` twin is ignored) whose `server`/`tool` match `--server-match`.
@@ -612,7 +606,7 @@ tail -f bridge_debug.log
 - Host policy in `bridge_policy.json` (`BRIDGE_POLICY_FILE`) is the enforcement layer for every raw TCP/CLI/MCP client: the TCP API is localhost-only and token-gated, but token holders bypass MCP scoping, so deny/allow/confirmation rules are enforced in the native host before any action reaches the extension.
 - MCP `readonly`/`allow_sensitive` controls are usability scoping, not the security boundary, because a client with the token can call the raw TCP API directly. Use `bridge_policy.json` for real restrictions; use `browser_policy_check` (or `test_client.py policyCheck`) to see what the host would decide.
 - Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, `policyInfo`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in. `policyInfo` is additionally answered host-side before the action gate (like `policyCheck`), so a client can always discover the active policy/audit file paths even under a deny-all policy; it returns only those paths, never policy contents.
-- Actions listed in `requireConfirmation` return an opaque `confirmationToken`; clients must resend the same action and payload through `browser_confirm_action` or `test_client.py confirm` before the host forwards it.
+- Actions listed in `requireConfirmation` return an opaque `confirmationToken`; clients must resend the same action and payload through `browser_confirm_action` or `test_client.py confirm` before the host forwards it. This same-channel confirmation is friction against accidental use by a trusted token holder, not protection from a compromised token holder.
 - Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
 - Python host only: set `BRIDGE_POLICY_APPROVAL_MODE=gui` (default on macOS) to show a native prompt when an otherwise-allowed action is blocked only because the target origin is not in `allowedOrigins`. The prompt offers `Deny`, `Allow This Time`, and `Always Allow`. `Allow This Time` creates a TTL-bound one-shot in-memory origin grant for the exact client/action/payload/target; `Always Allow` adds that origin to the local `bridge_policy.json`. Origin approval only authorizes the site, then the host re-runs normal policy evaluation, so actions in `requireConfirmation` still require a confirmation token. Set `BRIDGE_POLICY_APPROVAL_MODE=off` to disable prompts, or `BRIDGE_POLICY_APPROVAL_MODE=command` with `BRIDGE_POLICY_APPROVAL_COMMAND` for tests/custom frontends. Rust host users currently get the conservative deny/doctor flow without this GUI approval UX.
 - GitHub attachment helpers (`githubAttachUploadedFiles`, `githubSubmitComment`) are narrow tab-scoped actions. They remain subject to host origin policy and also reject any tab whose URL origin is not `https://github.com`, so they do not require broad `executeScript*` allowlisting.
