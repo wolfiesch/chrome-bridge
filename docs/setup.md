@@ -1,0 +1,142 @@
+# Setup and project layout
+
+Chrome Bridge is published from the canonical GitHub repository `wolfiesch/chrome-bridge`. Your local checkout directory may have a different name; commands in this document assume you are running from the repository root.
+
+## Layout
+
+```text
+chrome-bridge/
+├── extension/                          <- public unkeyed extension source copy
+│   ├── manifest.json
+│   ├── background.js
+│   ├── wake.html
+│   └── wake.js
+├── background.js                       <- editable service-worker source
+├── wake.html / wake.js                 <- extension wake page for suspended-worker recovery
+├── manifest.json                       <- public unkeyed source manifest
+├── extension_identity.py               <- local key and extension ID helper
+├── bridge.py                           <- native host
+├── broker.py                           <- opt-in launchd TCP broker for stable client port 9223
+├── bridge_policy.example.json          <- explicit opt-in policy template
+├── com.automation.bridge.json.template <- host-manifest template (setup.sh fills it in)
+├── setup.sh / setup-rs.sh              <- generates token/policy, deploys extension, registers host
+├── setup-broker.sh                     <- installs launchd broker mode on macOS
+├── uninstall-broker.sh                 <- stops launchd broker mode
+├── bridge_wake.py                      <- shared wake-page discovery/opening helper
+├── test_client.py                      <- CLI client
+├── benchmark_harness.py                <- benchmark and comparison harness
+├── verify_bridge.py                    <- offline framing/auth test
+├── verify_cli_contract.py              <- offline CLI dispatch test
+├── verify_heartbeat_contract.py        <- offline heartbeat/structure test
+├── verify_benchmark_harness.py         <- offline benchmark contract test
+├── verify_install_contract.py           <- offline install/identity contract test
+├── verify_agent_actions_live.py        <- manual live browser gate
+└── README.md
+```
+
+`setup.sh` generates `bridge_token.txt` (0600 shared secret), installs `bridge_policy.json` from `bridge_policy.example.json` when absent, deploys a local keyed extension manifest, and writes `com.automation.bridge.json`. `setup-rs.sh` additionally generates `com.automation.bridge.rust.json` and the `bridge-host-launch.sh` wrapper. The optional `bridge_tokens.txt` named-token registry (see Multi-client tokens and leasing) is also a local secret. All of these are git-ignored and stay local. Keep Python files out of Chrome-loaded extension directories: running them creates `__pycache__`, and Chrome refuses folders containing `_`-prefixed names.
+
+## Components
+
+| File | Role |
+|---|---|
+| `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
+| `extension/background.js` | Service worker: connects to the native host, runs browser actions, uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep, and handles wake-page messages. |
+| `wake.html`, `wake.js` | Minimal extension page opened by the CLI after `ECONNREFUSED`; it messages the service worker to call `connectNative()` and then closes its tab. |
+| `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
+| `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
+| `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
+| `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
+| `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
+| `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
+
+## Requirements
+
+- Google Chrome, Chrome Beta, or Chromium with Developer mode. The macOS installer also registers Chrome Canary.
+- Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`, matching `mcp/pyproject.toml`).
+- macOS or Linux for the documented `setup.sh` and `setup-rs.sh` native-host installers. Broker mode and `setup-broker.sh` are macOS-only because they use launchd. Other platforms may be possible with manual Chrome native-host registration, but they are not covered by these installers.
+
+## Setup
+
+Default local install:
+
+```bash
+./setup.sh
+```
+
+The script generates or reuses `extension_key.pem`, deploys `background.js` plus a keyed manifest into a per-user extension directory, registers the native host for that deterministic extension ID, creates `bridge_token.txt` when absent, and installs `bridge_policy.json` from the example template when absent. It prints the extension directory at the end.
+
+Then:
+
+1. Open `chrome://extensions/` and enable Developer mode.
+2. Load unpacked: the extension directory printed by `./setup.sh`.
+3. Enable only one bridge extension at a time. Duplicate bridge extensions race to bind port `9223`.
+4. Verify:
+   ```bash
+   python3 test_client.py ping
+   python3 test_client.py policyCheck getTabs '{}'
+   ```
+   Expected: `ping` succeeds. `policyCheck getTabs '{}'` is allowed when setup installed the example policy.
+
+Advanced setup:
+
+```bash
+./setup.sh --extension-id <id>
+```
+
+Use this for an already-packaged or future Web Store extension ID. It registers that packaged/store extension ID separately and does not generate or inject a local extension key for the developer-mode unpacked copy.
+
+```bash
+cargo build --release --manifest-path host-rs/Cargo.toml
+./setup-rs.sh
+```
+
+Use this to register the Rust host with the same extension-ID resolution flow.
+
+## Launchd broker mode
+
+Broker mode is optional on macOS. launchd keeps a small Python broker listening on public port `9223`; Chrome-launched Python or Rust native hosts bind backend port `19223`. Clients keep using `BRIDGE_PORT=9223`, or no override. On first install, `setup-broker.sh` seeds the state-dir token from the repo token so the existing `chrome-bridge` CLI keeps working; if both token files already exist and differ, the script warns and clients should set `BRIDGE_TOKEN_FILE` to the state token path.
+
+Install Python-host broker mode:
+
+```bash
+./setup-broker.sh --host python
+```
+
+Install Rust-host broker mode after building Rust:
+
+```bash
+cargo build --release --manifest-path host-rs/Cargo.toml
+./setup-broker.sh --host rust
+```
+
+After setup completes, load the state-dir extension path printed by `setup-broker.sh` and disable any older bridge extension. Broker mode uses state under `~/Library/Application Support/chrome-native-bridge` by default, including its own extension key, extension ID, token, policy, and launcher. If you are migrating from a repo-local install, reload exactly the printed state-dir extension so the loaded extension ID matches the broker native-host registration.
+
+Verify the broker process and public endpoint:
+
+```bash
+launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker
+chrome-bridge ping
+```
+
+Disable broker mode:
+
+```bash
+./uninstall-broker.sh
+```
+
+`extension_key.pem` is a private local identity key for the developer-mode unpacked extension. Keep it git-ignored and never commit it. A packaged or Web Store extension has a separate store-managed ID; register that ID with `./setup.sh --extension-id <store-id>`.
+
+## Troubleshooting
+
+The host writes a local `bridge_debug.log` (git-ignored) next to `bridge.py`:
+
+```bash
+tail -f bridge_debug.log
+```
+
+- `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the service worker did not wake. The CLI tries one external wake by opening `chrome-extension://<extension-id>/wake.html`; set `BRIDGE_WAKE_DISABLED=1` to skip it, `BRIDGE_EXTENSION_ID` or `BRIDGE_EXTENSION_ID_FILE` to override ID discovery, and `BRIDGE_WAKE_COMMAND` to override the opener in tests or nonstandard Chrome installs.
+- `Connection refused` in broker mode: launchd broker is not loaded. Run `launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker`.
+- `broker backend unavailable: native host did not start`: broker is up, but Chrome, the extension, or the native host did not wake within `BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS`. Reload the extension and check `broker_debug.log` plus `bridge_debug.log`.
+- `FATAL: could not bind 127.0.0.1:9223`: two direct-mode bridge extensions are enabled, or direct mode is racing the broker.
+- `unauthorized`: token mismatch, or the native-host manifest authorized the wrong extension ID. Re-run `./setup.sh`, reload the printed extension directory, and disable duplicate bridge extensions.
