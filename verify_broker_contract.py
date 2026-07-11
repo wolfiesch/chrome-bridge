@@ -77,23 +77,8 @@ def stop_broker(proc):
             proc.wait(timeout=5)
 
 
-def write_wake_command(tmp):
-    wake_marker = tmp / "wake-called"
-    wake_cmd = tmp / "wake-command.py"
-    wake_cmd.write_text(
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(wake_marker)!r}).write_text(sys.argv[1], encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    return wake_marker, wake_cmd
-
-
-def fake_backend_after_wake(port, marker):
-    deadline = time.monotonic() + 5
-    while not marker.exists():
-        if time.monotonic() > deadline:
-            return
-        time.sleep(0.05)
+def delayed_fake_backend(port):
+    time.sleep(0.5)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", port))
@@ -127,18 +112,15 @@ def read_line(sock):
     return json.loads(buffer.split(b"\n", 1)[0].decode("utf-8"))
 
 
-def test_wake_then_proxy_persistent_socket():
+def test_delayed_backend_then_proxy_persistent_socket():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         (tmp / "bridge_token.txt").write_text("broker-token\n", encoding="utf-8")
-        wake_marker, wake_cmd = write_wake_command(tmp)
         public_port = unused_port()
         backend_port = unused_port()
-        threading.Thread(target=fake_backend_after_wake, args=(backend_port, wake_marker), daemon=True).start()
+        threading.Thread(target=delayed_fake_backend, args=(backend_port,), daemon=True).start()
         proc = start_broker(public_port, backend_port, tmp, {
             "BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS": "5",
-            "BRIDGE_EXTENSION_ID": "abcdefghijklmnopabcdefghijklmnop",
-            "BRIDGE_WAKE_COMMAND": f"{sys.executable} {wake_cmd}",
         })
         try:
             with connect_client(public_port, proc) as client:
@@ -148,10 +130,6 @@ def test_wake_then_proxy_persistent_socket():
                 client.sendall(b'{"action":"getTabs","payload":{},"token":"broker-token"}\n')
                 response = read_line(client)
                 expect(response.get("result", {}).get("echo") == "getTabs", f"getTabs echo mismatch: {response}")
-            expect(
-                wake_marker.read_text(encoding="utf-8") == "chrome-extension://abcdefghijklmnopabcdefghijklmnop/wake.html",
-                "wake command received wrong URL",
-            )
         finally:
             stop_broker(proc)
 
@@ -159,48 +137,25 @@ def test_wake_then_proxy_persistent_socket():
 def test_backend_unavailable_error():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        wake_marker, wake_cmd = write_wake_command(tmp)
         public_port = unused_port()
         backend_port = unused_port()
         proc = start_broker(public_port, backend_port, tmp, {
             "BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS": "1",
-            "BRIDGE_EXTENSION_ID": "abcdefghijklmnopabcdefghijklmnop",
-            "BRIDGE_WAKE_COMMAND": f"{sys.executable} {wake_cmd}",
         })
         try:
             with connect_client(public_port, proc) as client:
                 response = read_line(client)
             expect(response.get("success") is False, f"expected failure response: {response}")
             expect(response.get("error") == BACKEND_ERROR, f"broker error mismatch: {response}")
-            expect(response.get("wakeAttempted") is True, f"wakeAttempted mismatch: {response}")
-        finally:
-            stop_broker(proc)
-
-
-def test_wake_disabled():
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        public_port = unused_port()
-        backend_port = unused_port()
-        proc = start_broker(public_port, backend_port, tmp, {
-            "BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS": "1",
-            "BRIDGE_WAKE_DISABLED": "1",
-        })
-        try:
-            with connect_client(public_port, proc) as client:
-                response = read_line(client)
-            expect(response.get("success") is False, f"expected failure response: {response}")
-            expect(response.get("error") == BACKEND_ERROR, f"broker error mismatch: {response}")
-            expect(response.get("wakeAttempted") is False, f"wakeAttempted mismatch: {response}")
+            expect(response.get("status") == "browser_unavailable", f"broker status mismatch: {response}")
         finally:
             stop_broker(proc)
 
 
 def main():
     for test in [
-        test_wake_then_proxy_persistent_socket,
+        test_delayed_backend_then_proxy_persistent_socket,
         test_backend_unavailable_error,
-        test_wake_disabled,
     ]:
         try:
             test()

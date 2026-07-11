@@ -6,7 +6,7 @@ import re
 import socket
 import sys
 import time
-from bridge_wake import bridge_extension_id, token_file_path, wake_bridge_extension
+from bridge_wake import token_file_path
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -80,7 +80,6 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
     retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
     deadline = time.monotonic() + retry_seconds
     sock = None
-    wake_attempted = False
 
     try:
         while True:
@@ -99,9 +98,6 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                     sock.close()
                 except Exception:
                     pass
-                if not wake_attempted:
-                    wake_bridge_extension(SCRIPT_DIR)
-                    wake_attempted = True
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.5)
@@ -138,7 +134,10 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
             f"click 'service worker' to wake it, then check {os.path.join(SCRIPT_DIR, 'bridge_debug.log')}."
         )
     except ConnectionRefusedError:
-        return 111, None, "Error: Connection refused. Is Google Chrome running with the loaded extension?"
+        return 111, None, (
+            "Error: browser unavailable. Chrome may be closed, the extension may be disabled, "
+            "or the native connection may be disconnected. No tab was opened automatically."
+        )
     except Exception as e:
         return 1, None, f"Error communicating with bridge: {e}"
     finally:
@@ -165,10 +164,8 @@ def result_payload(response):
     return result if isinstance(result, dict) else response
 
 
-def save_screenshot(tab_id, output_path, quiet=False):
-    payload = {"tabId": tab_id, "format": "png"}
-    if quiet:
-        payload["quiet"] = True
+def save_screenshot(tab_id, output_path, quiet=True):
+    payload = {"tabId": tab_id, "format": "png", "quiet": quiet}
     exit_code, response, stderr = send_command_data("screenshot", payload)
     if exit_code != 0:
         if response is not None:
@@ -470,7 +467,7 @@ def _policy_doctor(audit_file, policy_file):
 def print_usage():
     print("Usage:")
     print("  python3 test_client.py ping")
-    print("  python3 test_client.py navigate <url>")
+    print("  python3 test_client.py navigate <url> [--foreground]")
     print("  python3 test_client.py getTabs")
     print("  python3 test_client.py getCookies <domain>")
     print("  python3 test_client.py executeScript <tabId> <code>")
@@ -488,7 +485,7 @@ def print_usage():
     print("  python3 test_client.py waitForText <tabId> <text> [timeoutMs]")
     print("  python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
     print("  python3 test_client.py getCurrentState <tabId>")
-    print("  python3 test_client.py screenshot <tabId> <outputPath>")
+    print("  python3 test_client.py screenshot <tabId> <outputPath> [--visible]")
     print("  python3 test_client.py extractText <tabId> [maxChars]")
     print("  python3 test_client.py getHTML <tabId> <outputPath>")
     print("  python3 test_client.py hover <tabId> <selector>")
@@ -543,9 +540,8 @@ def main():
         sys.exit(send_command("ping"))
     elif action == "navigate":
         require_args(args, 3, "Missing URL.")
-        payload = {"url": args[2]}
-        if len(args) > 3 and args[3] == "--background":
-            payload["active"] = False
+        foreground = len(args) > 3 and args[3] == "--foreground"
+        payload = {"url": args[2], "active": foreground}
         sys.exit(send_command("navigate", payload))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
@@ -583,8 +579,9 @@ def main():
         require_args(args, 4, "Usage: python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
         sys.exit(send_command("waitForUrl", {"tabId": parse_int(args[2], "tabId"), "substring": args[3], "timeoutMs": parse_timeout(args, 4)}))
     elif action == "screenshot":
-        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--quiet]")
-        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3], len(args) > 4 and args[4] == "--quiet"))
+        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--visible]")
+        visible = len(args) > 4 and args[4] == "--visible"
+        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3], quiet=not visible))
     elif action == "extractText":
         require_args(args, 3, "Usage: python3 test_client.py extractText <tabId> [maxChars]")
         max_chars = parse_int(args[3], "maxChars") if len(args) > 3 else 20000

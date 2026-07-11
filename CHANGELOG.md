@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Routine CLI and broker retries no longer open a visible extension wake tab when the native backend is unavailable.
+- Navigation now opens inactive tabs by default; pass `--foreground` for an intentional user-visible tab.
+- Screenshots now use the background-safe debugger path by default; pass `--visible` for an intentional visible-tab capture.
+- Added `scripts/diagnose_install.py` to report deployed-file drift and broker/backend connection state without waking Chrome.
+
 All notable user-facing changes for Chrome Native Messaging Automation Bridge are recorded here.
 
 ## 1.0.1 - Public release candidate

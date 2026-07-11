@@ -9,8 +9,6 @@ import sys
 import threading
 import time
 
-from bridge_wake import wake_bridge_extension
-
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 BACKEND_ERROR = "broker backend unavailable: native host did not start"
 
@@ -58,21 +56,24 @@ def configure_logging() -> None:
     )
 
 
-def connect_backend(deadline: float) -> tuple[socket.socket | None, bool]:
-    wake_attempted = False
+def connect_backend(deadline: float) -> socket.socket | None:
     while True:
         try:
             backend = socket.create_connection(("127.0.0.1", BRIDGE_BACKEND_PORT), timeout=1)
-            return backend, wake_attempted
+            logging.info("Native backend connected on 127.0.0.1:%s", BRIDGE_BACKEND_PORT)
+            return backend
         except ConnectionRefusedError:
-            if not wake_attempted and os.environ.get("BRIDGE_WAKE_DISABLED") != "1":
-                wake_bridge_extension(SCRIPT_DIR)
-                wake_attempted = True
+            logging.debug("Native backend is not listening on 127.0.0.1:%s", BRIDGE_BACKEND_PORT)
         except OSError as exc:
             logging.debug("Backend connect failed: %s", exc)
 
         if time.monotonic() >= deadline:
-            return None, wake_attempted
+            logging.warning(
+                "Native backend unavailable on 127.0.0.1:%s after %.1fs; refusing without opening Chrome",
+                BRIDGE_BACKEND_PORT,
+                BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS,
+            )
+            return None
         time.sleep(0.5)
 
 
@@ -97,9 +98,13 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     try:
         client_socket.settimeout(BRIDGE_BROKER_SOCKET_IDLE_TIMEOUT)
         deadline = time.monotonic() + BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS
-        backend_socket, wake_attempted = connect_backend(deadline)
+        backend_socket = connect_backend(deadline)
         if backend_socket is None:
-            response = {"success": False, "error": BACKEND_ERROR, "wakeAttempted": wake_attempted}
+            response = {
+                "success": False,
+                "status": "browser_unavailable",
+                "error": BACKEND_ERROR,
+            }
             client_socket.sendall(json.dumps(response).encode("utf-8") + b"\n")
             return
         backend_socket.settimeout(BRIDGE_BROKER_SOCKET_IDLE_TIMEOUT)

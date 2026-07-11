@@ -12,7 +12,7 @@ chrome-bridge/
 │   ├── wake.html
 │   └── wake.js
 ├── background.js                       <- editable service-worker source
-├── wake.html / wake.js                 <- extension wake page for suspended-worker recovery
+├── wake.html / wake.js                 <- legacy explicit wake page; routine retries never open it
 ├── manifest.json                       <- public unkeyed source manifest
 ├── extension_identity.py               <- local key and extension ID helper
 ├── bridge.py                           <- native host
@@ -41,8 +41,8 @@ chrome-bridge/
 | File | Role |
 |---|---|
 | `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
-| `extension/background.js` | Service worker: connects to the native host, runs browser actions, uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep, and handles wake-page messages. |
-| `wake.html`, `wake.js` | Minimal extension page opened by the CLI after `ECONNREFUSED`; it messages the service worker to call `connectNative()` and then closes its tab. |
+| `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
+| `wake.html`, `wake.js` | Legacy explicit recovery page retained for packaging compatibility. The CLI and broker never open it during routine retries. |
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
 | `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
@@ -135,8 +135,10 @@ The host writes a local `bridge_debug.log` (git-ignored) next to `bridge.py`:
 tail -f bridge_debug.log
 ```
 
-- `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the service worker did not wake. The CLI tries one external wake by opening `chrome-extension://<extension-id>/wake.html`; set `BRIDGE_WAKE_DISABLED=1` to skip it, `BRIDGE_EXTENSION_ID` or `BRIDGE_EXTENSION_ID_FILE` to override ID discovery, and `BRIDGE_WAKE_COMMAND` to override the opener in tests or nonstandard Chrome installs.
+Run `python3 scripts/diagnose_install.py` for a read-only comparison of repository and deployed files plus broker/backend connection state. It never launches Chrome or opens a tab.
+
+- `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the native connection is down. Routine retries never open Chrome or create a tab. Open Chrome normally, then inspect the extension service worker and `bridge_debug.log`.
 - `Connection refused` in broker mode: launchd broker is not loaded. Run `launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker`.
-- `broker backend unavailable: native host did not start`: broker is up, but Chrome, the extension, or the native host did not wake within `BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS`. Reload the extension and check `broker_debug.log` plus `bridge_debug.log`.
+- `broker backend unavailable: native host did not start`: broker is up, but Chrome, the extension, or the native host did not connect within `BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS`. The broker returns `status: browser_unavailable` without opening Chrome. Reload the extension and check `broker_debug.log` plus `bridge_debug.log`.
 - `FATAL: could not bind 127.0.0.1:9223`: two direct-mode bridge extensions are enabled, or direct mode is racing the broker.
 - `unauthorized`: token mismatch, or the native-host manifest authorized the wrong extension ID. Re-run `./setup.sh`, reload the printed extension directory, and disable duplicate bridge extensions.

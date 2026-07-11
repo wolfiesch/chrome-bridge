@@ -461,8 +461,8 @@ function sendResponseToHost(response) {
   }
 }
 
-async function navigateToUrl(url, active = true) {
-  const tab = await chrome.tabs.create({ url, active: active !== false });
+async function navigateToUrl(url, active = false) {
+  const tab = await chrome.tabs.create({ url, active: active === true });
   return { tabId: tab.id };
 }
 
@@ -1166,7 +1166,7 @@ async function getCurrentState(tabId) {
   };
 }
 
-async function captureScreenshot(tabId, format, quiet = false) {
+async function captureScreenshot(tabId, format, quiet = true) {
   const screenshotFormat = format || "png";
   if (quiet) {
     return withDebugger(tabId, async (target) => {

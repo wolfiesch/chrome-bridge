@@ -24,7 +24,7 @@ with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
 CASES = [
     (["ping"], 111),
     (["navigate", "https://example.com"], 111),
-    (["navigate", "https://example.com", "--background"], 111),
+    (["navigate", "https://example.com", "--foreground"], 111),
     (["getCookies", "example.com"], 111),
     (["executeScript", "1", "document.title"], 111),
     (["getTabs"], 111),
@@ -43,7 +43,7 @@ CASES = [
     (["waitForUrl", "1", "github.com", "5000"], 111),
     (["getCurrentState", "1"], 111),
     (["screenshot", "1", "/tmp/chrome-bridge-shot.png"], 111),
-    (["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"], 111),
+    (["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--visible"], 111),
     (["extractText", "1", "2000"], 111),
     (["getHTML", "1", "/tmp/chrome-bridge-page.html"], 111),
     (["hover", "1", "#target"], 111),
@@ -164,11 +164,17 @@ check(
 )
 check("waitForHandoff read_timeout_ms", result.get("read_timeout_ms"), 60000)
 
-result = dispatch(["navigate", "https://example.com", "--background"])
-check("background navigate payload", result.get("payload"), {"url": "https://example.com", "active": False})
+result = dispatch(["navigate", "https://example.com"])
+check("default navigate payload", result.get("payload"), {"url": "https://example.com", "active": False})
 
-result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"])
-check("quiet screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
+result = dispatch(["navigate", "https://example.com", "--foreground"])
+check("foreground navigate payload", result.get("payload"), {"url": "https://example.com", "active": True})
+
+result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png"])
+check("default screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
+
+result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--visible"])
+check("visible screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": False})
 
 result = dispatch(["githubAttachUploadedFiles", "1", "input[type=file]", ".js-comment-form", "15000"])
 check("githubAttachUploadedFiles action", result.get("action"), "githubAttachUploadedFiles")

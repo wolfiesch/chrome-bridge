@@ -1258,7 +1258,12 @@ def socket_server_loop():
             logging.error(f"Error in socket server accept: {e}", exc_info=True)
 
 def main():
-    logging.info("Native Messaging Host started.")
+    logging.info(
+        "Native Messaging Host started: pid=%s port=%s parentPid=%s",
+        os.getpid(),
+        os.environ.get('BRIDGE_PORT', '9223'),
+        os.getppid(),
+    )
     # Start the local TCP listener thread
     t = threading.Thread(target=socket_server_loop, daemon=True)
     t.start()

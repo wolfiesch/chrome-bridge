@@ -77,9 +77,18 @@ class Client:
     def __init__(self, token):
         self.token = token
         self.buf = b""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10)
-        self.sock.connect(("127.0.0.1", PORT))
+        deadline = time.monotonic() + 3
+        while True:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            try:
+                self.sock.connect(("127.0.0.1", PORT))
+                break
+            except ConnectionRefusedError:
+                self.sock.close()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def req(self, action, payload=None, confirmation_token=None):
         cmd = {"action": action, "payload": payload or {}, "token": self.token}

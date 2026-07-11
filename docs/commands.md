@@ -8,7 +8,7 @@ Examples below write `chrome-bridge <action>` as shorthand for `python3 test_cli
 
 ```bash
 chrome-bridge ping
-chrome-bridge navigate <url>
+chrome-bridge navigate <url> [--foreground]
 chrome-bridge getTabs
 chrome-bridge getCookies <domain>
 chrome-bridge executeScript <tabId> <code>
@@ -39,12 +39,12 @@ chrome-bridge waitForUrl <tabId> <substring> [timeoutMs]
 
 ```bash
 chrome-bridge getCurrentState <tabId>
-chrome-bridge screenshot <tabId> <outputPath>
+chrome-bridge screenshot <tabId> <outputPath> [--visible]
 chrome-bridge extractText <tabId> [maxChars]
 chrome-bridge getHTML <tabId> <outputPath>
 ```
 
-`screenshot` writes a PNG file and prints path, MIME type, and byte count only. `getHTML` writes UTF-8 HTML to a file and prints path and byte count only.
+Navigation opens an inactive tab by default. Use `--foreground` only when the user needs to see the new tab. Screenshots use the background-safe debugger path by default; `--visible` explicitly selects the tab before capturing the visible window. `screenshot` writes a PNG file and prints path, MIME type, and byte count only. `getHTML` writes UTF-8 HTML to a file and prints path and byte count only.
 
 ### Pointer, keyboard, and forms
 
