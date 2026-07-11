@@ -20,7 +20,7 @@ jobs:
       - name: Run CI gates
         run: |
           python3 -m pip install -e ./mcp
-          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/package_release.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py
           node --check background.js
           node --check wake.js
           diff -q manifest.json extension/manifest.json
@@ -30,6 +30,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
+          PYTHONDONTWRITEBYTECODE=1 ./verify_task_session_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_github_attachment_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py

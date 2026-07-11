@@ -451,6 +451,7 @@ fn mutating_actions() -> &'static [&'static str] {
         "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
         "setColorScheme", "setUserAgent", "startInterception", "stopInterception",
         "startMonitoring", "stopMonitoring", "handleDialog", "downloadUrl", "batch",
+        "createTaskSession", "navigateTaskSession", "closeTaskSession",
     ]
 }
 
@@ -469,12 +470,13 @@ fn origin_exempt_action(action: &str) -> bool {
     matches!(
         action,
         "ping" | "getTabs" | "navigate" | "downloadUrl" | "getCookies"
-            | "sessionStatus" | "batch" | "lease" | "release" | "leaseStatus"
+            | "sessionStatus" | "createTaskSession" | "navigateTaskSession"
+            | "getTaskSessions" | "closeTaskSession" | "batch" | "lease" | "release" | "leaseStatus"
             | "policyCheck" | "policyInfo"
     )
 }
 
-const TARGET_REQUIRED_ACTIONS: [&str; 3] = ["navigate", "downloadUrl", "getCookies"];
+const TARGET_REQUIRED_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "downloadUrl", "getCookies"];
 
 /// Actions reserved for host-internal use (tab-origin lookup). A socket client
 /// may never invoke these; they are rejected as unknown.
@@ -670,7 +672,7 @@ fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
         _ => return Vec::new(),
     };
     match action {
-        "navigate" | "downloadUrl" => payload
+        "navigate" | "navigateTaskSession" | "downloadUrl" => payload
             .get("url")
             .and_then(|u| u.as_str())
             .map(normalize_url_targets)

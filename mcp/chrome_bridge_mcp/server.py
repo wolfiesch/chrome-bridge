@@ -60,6 +60,37 @@ def browser_navigate(url: str) -> str:
     return _text(call("navigate", {"url": url}))
 
 
+def browser_task_session_create(name: str) -> str:
+    """Create a durable browser task session that owns only its own tabs."""
+    return _text(call("createTaskSession", {"name": name}))
+
+
+def browser_task_session_navigate(
+    session_id: str,
+    url: str,
+    reuse: bool = True,
+    foreground: bool = False,
+) -> str:
+    """Open or reuse a tab owned by ``session_id`` without focusing it by default."""
+    return _text(call("navigateTaskSession", {
+        "sessionId": session_id,
+        "url": url,
+        "reuse": reuse,
+        "active": foreground,
+    }))
+
+
+def browser_task_session_list(session_id: Optional[str] = None) -> str:
+    """List task sessions and their owned tabs, or inspect one session."""
+    payload = {"sessionId": session_id} if session_id else {}
+    return _text(call("getTaskSessions", payload))
+
+
+def browser_task_session_close(session_id: str) -> str:
+    """Close only the tabs owned by ``session_id`` and remove the session."""
+    return _text(call("closeTaskSession", {"sessionId": session_id}))
+
+
 def browser_snapshot(tab_id: Optional[int] = None) -> str:
     """Accessibility snapshot of the page: the structured view of what is on it.
 
@@ -366,6 +397,7 @@ def browser_wait_for_handoff(
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
     (browser_list_tabs, False, False),
+    (browser_task_session_list, False, False),
     (browser_snapshot, False, False),
     (browser_extract_text, False, False),
     (browser_screenshot, False, False),
@@ -375,6 +407,9 @@ _TOOLS = [
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
     (browser_navigate, True, False),
+    (browser_task_session_create, True, False),
+    (browser_task_session_navigate, True, False),
+    (browser_task_session_close, True, False),
     (browser_click, True, False),
     (browser_type, True, False),
     (browser_fill, True, False),

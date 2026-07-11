@@ -28,6 +28,11 @@ CASES = [
     (["getCookies", "example.com"], 111),
     (["executeScript", "1", "document.title"], 111),
     (["getTabs"], 111),
+    (["taskSession", "create", "research"], 111),
+    (["taskSession", "navigate", "session-1", "https://example.com"], 111),
+    (["taskSession", "show"], 111),
+    (["taskSession", "show", "session-1"], 111),
+    (["taskSession", "close", "session-1"], 111),
     (["executeScriptCDP", "1", "document.title"], 111),
     (["click", "1", "#submit"], 111),
     (["type", "1", "input[name=q]", "hello"], 111),
@@ -169,6 +174,28 @@ check("default navigate payload", result.get("payload"), {"url": "https://exampl
 
 result = dispatch(["navigate", "https://example.com", "--foreground"])
 check("foreground navigate payload", result.get("payload"), {"url": "https://example.com", "active": True})
+
+result = dispatch(["taskSession", "create", "research"])
+check("task session create action", result.get("action"), "createTaskSession")
+check("task session create payload", result.get("payload"), {"name": "research"})
+
+result = dispatch(["taskSession", "navigate", "session-1", "https://example.com"])
+check("task session navigate action", result.get("action"), "navigateTaskSession")
+check("task session navigate payload", result.get("payload"), {
+    "sessionId": "session-1", "url": "https://example.com", "active": False, "reuse": True,
+})
+
+result = dispatch(["taskSession", "navigate", "session-1", "https://example.com", "--foreground", "--new"])
+check("task session foreground payload", result.get("payload"), {
+    "sessionId": "session-1", "url": "https://example.com", "active": True, "reuse": False,
+})
+
+result = dispatch(["taskSession", "show", "session-1"])
+check("task session show payload", result.get("payload"), {"sessionId": "session-1"})
+
+result = dispatch(["taskSession", "close", "session-1"])
+check("task session close action", result.get("action"), "closeTaskSession")
+check("task session close payload", result.get("payload"), {"sessionId": "session-1"})
 
 result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png"])
 check("default screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})

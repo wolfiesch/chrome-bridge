@@ -277,6 +277,7 @@ MUTATING_ACTIONS = {
     'setColorScheme', 'setUserAgent',
     'startInterception', 'stopInterception', 'startMonitoring', 'stopMonitoring',
     'handleDialog', 'downloadUrl', 'batch',
+    'createTaskSession', 'navigateTaskSession', 'closeTaskSession',
 }
 DESTRUCTIVE_ACTIONS = {
     'executeScript', 'executeScriptCDP', 'startInterception', 'downloadUrl',
@@ -291,7 +292,8 @@ DESTRUCTIVE_ACTIONS = {
 # by default rather than silently exempt).
 ORIGIN_EXEMPT_ACTIONS = {
     'ping', 'getTabs', 'navigate', 'downloadUrl', 'getCookies', 'sessionStatus',
-    'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
+    'createTaskSession', 'getTaskSessions', 'closeTaskSession',
+    'navigateTaskSession', 'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
 }
 
 # Actions a socket client may never invoke directly: they are reserved for
@@ -299,7 +301,7 @@ ORIGIN_EXEMPT_ACTIONS = {
 # "unknown action" so the reserved surface is not externally reachable.
 RESERVED_ACTIONS = {'__tabOrigin'}
 
-TARGET_REQUIRED_ACTIONS = {'navigate', 'downloadUrl', 'getCookies'}
+TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'getCookies'}
 
 # Built-in fail-closed default. A policy file must explicitly opt into browser
 # automation beyond host-side liveness/policy/lease operations.
@@ -406,7 +408,7 @@ def targets_from_payload(action, payload):
     # Ordered list of normalized policy targets derived from a request payload.
     if not isinstance(payload, dict):
         return []
-    if action == 'navigate' or action == 'downloadUrl':
+    if action in ('navigate', 'navigateTaskSession', 'downloadUrl'):
         url = payload.get('url')
         return normalize_url_targets(url) if isinstance(url, str) else []
     if action == 'getCookies':

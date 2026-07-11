@@ -26,6 +26,20 @@ chrome-bridge goBack <tabId>
 chrome-bridge goForward <tabId>
 ```
 
+### Task-owned tabs
+
+Task sessions give an agent a set of tabs that survives extension-worker restarts and belongs only to that task. New tabs are inactive by default and placed in a named Chrome tab group. Closing a session can only close tabs recorded as belonging to that session. Session records are cleared when Chrome itself restarts so stale tab numbers can never point at unrelated restored tabs.
+
+```bash
+chrome-bridge taskSession create "GPU research"
+chrome-bridge taskSession navigate <sessionId> <url>
+chrome-bridge taskSession navigate <sessionId> <url> --new
+chrome-bridge taskSession show [sessionId]
+chrome-bridge taskSession close <sessionId>
+```
+
+Use `--foreground` only when the user intentionally needs to see the session tab. Prefer task sessions over omitted tab IDs so a human tab change cannot redirect the agent.
+
 ### Waits
 
 ```bash

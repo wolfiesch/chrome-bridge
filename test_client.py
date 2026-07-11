@@ -469,6 +469,10 @@ def print_usage():
     print("  python3 test_client.py ping")
     print("  python3 test_client.py navigate <url> [--foreground]")
     print("  python3 test_client.py getTabs")
+    print("  python3 test_client.py taskSession create <name>")
+    print("  python3 test_client.py taskSession navigate <sessionId> <url> [--foreground] [--new]")
+    print("  python3 test_client.py taskSession show [sessionId]")
+    print("  python3 test_client.py taskSession close <sessionId>")
     print("  python3 test_client.py getCookies <domain>")
     print("  python3 test_client.py executeScript <tabId> <code>")
     print("  python3 test_client.py executeScriptCDP <tabId> <code>")
@@ -545,6 +549,29 @@ def main():
         sys.exit(send_command("navigate", payload))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
+    elif action == "taskSession":
+        require_args(args, 3, "Usage: python3 test_client.py taskSession create|navigate|show|close ...")
+        op = args[2]
+        if op == "create":
+            require_args(args, 4, "Usage: python3 test_client.py taskSession create <name>")
+            sys.exit(send_command("createTaskSession", {"name": args[3]}))
+        if op == "navigate":
+            require_args(args, 5, "Usage: python3 test_client.py taskSession navigate <sessionId> <url> [--foreground] [--new]")
+            flags = set(args[5:])
+            sys.exit(send_command("navigateTaskSession", {
+                "sessionId": args[3],
+                "url": args[4],
+                "active": "--foreground" in flags,
+                "reuse": "--new" not in flags,
+            }))
+        if op == "show":
+            payload = {"sessionId": args[3]} if len(args) > 3 else {}
+            sys.exit(send_command("getTaskSessions", payload))
+        if op == "close":
+            require_args(args, 4, "Usage: python3 test_client.py taskSession close <sessionId>")
+            sys.exit(send_command("closeTaskSession", {"sessionId": args[3]}))
+        print(f"Unknown taskSession operation: {op}", file=sys.stderr)
+        sys.exit(64)
     elif action == "getCookies":
         require_args(args, 3, "Missing domain.")
         sys.exit(send_command("getCookies", {"domain": args[2]}))

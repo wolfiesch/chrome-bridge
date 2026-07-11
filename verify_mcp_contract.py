@@ -133,6 +133,12 @@ def default_result(action, payload):
         return TABS
     if action == "navigate":
         return {"tabId": 99}
+    if action == "createTaskSession":
+        return {"sessionId": "session-1", "name": payload.get("name"), "tabIds": []}
+    if action == "navigateTaskSession":
+        return {"sessionId": payload.get("sessionId"), "tabId": 99, "active": payload.get("active")}
+    if action == "getTaskSessions":
+        return []
     if action == "observe":
         return [{"role": "button", "name": "OK"}]
     if action == "extractText":
@@ -163,6 +169,17 @@ def main():
     server.browser_navigate("https://x.test")
     action, payload = last_request()
     expect(action == "navigate" and payload == {"url": "https://x.test"}, "navigate payload mismatch")
+
+    server.browser_task_session_create("research")
+    expect(last_request() == ("createTaskSession", {"name": "research"}), "task session create mismatch")
+    server.browser_task_session_navigate("session-1", "https://x.test")
+    expect(last_request() == ("navigateTaskSession", {
+        "sessionId": "session-1", "url": "https://x.test", "reuse": True, "active": False,
+    }), "task session navigate mismatch")
+    server.browser_task_session_list("session-1")
+    expect(last_request() == ("getTaskSessions", {"sessionId": "session-1"}), "task session list mismatch")
+    server.browser_task_session_close("session-1")
+    expect(last_request() == ("closeTaskSession", {"sessionId": "session-1"}), "task session close mismatch")
 
     # 3. snapshot with explicit tab_id -> observe with that tabId (no active-tab lookup).
     with received_lock:

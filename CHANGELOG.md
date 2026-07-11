@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added durable task sessions with owned tabs, named Chrome tab groups, safe session cleanup, CLI commands, and typed MCP tools.
+- Added a machine-readable background reliability harness that detects active-tab changes, frontmost-app changes, unexpected tabs, and owned tabs becoming active.
 - Routine CLI and broker retries no longer open a visible extension wake tab when the native backend is unavailable.
 - Navigation now opens inactive tabs by default; pass `--foreground` for an intentional user-visible tab.
 - Screenshots now use the background-safe debugger path by default; pass `--visible` for an intentional visible-tab capture.

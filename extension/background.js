@@ -5,6 +5,7 @@ const RECONNECT_ALARM = "chromeBridgeReconnect";
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 30000;
+const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
 // Persist retry state across SW suspension. A bare module variable is lost when
 // the MV3 service worker suspends, so we keep backoff state in chrome.storage.
 // The manifest grants "storage"; prefer storage.session (resets on browser
@@ -231,6 +232,7 @@ chrome.runtime.onInstalled.addListener(() => {
   connectToHost();
 });
 chrome.runtime.onStartup.addListener(() => {
+  if (chrome.storage && chrome.storage.local) chrome.storage.local.remove(TASK_SESSIONS_KEY);
   scheduleHeartbeat();
   connectToHost();
 });
@@ -296,6 +298,18 @@ async function dispatchAction(action, payload) {
         break;
       case "getTabs":
         result = await getTabs();
+        break;
+      case "createTaskSession":
+        result = await createTaskSession(payload.name);
+        break;
+      case "navigateTaskSession":
+        result = await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse);
+        break;
+      case "getTaskSessions":
+        result = await getTaskSessions(payload.sessionId);
+        break;
+      case "closeTaskSession":
+        result = await closeTaskSession(payload.sessionId);
         break;
       case "executeScript":
         result = await runScriptInTab(payload.tabId, payload.code);
@@ -478,6 +492,144 @@ async function getTabs() {
     status: tab.status
   }));
 }
+
+async function loadTaskSessions() {
+  const store = chrome.storage && chrome.storage.local;
+  if (!store) return {};
+  const data = await store.get(TASK_SESSIONS_KEY);
+  return data[TASK_SESSIONS_KEY] || {};
+}
+
+async function saveTaskSessions(sessions) {
+  const store = chrome.storage && chrome.storage.local;
+  if (store) await store.set({ [TASK_SESSIONS_KEY]: sessions });
+}
+
+function newTaskSessionId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `task-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function validOwnedTabs(tabIds) {
+  const valid = [];
+  for (const tabId of tabIds || []) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab) valid.push(tabId);
+    } catch (error) {
+      // Closed tabs are removed from the durable ownership record.
+    }
+  }
+  return valid;
+}
+
+async function createTaskSession(name) {
+  const sessions = await loadTaskSessions();
+  const sessionId = newTaskSessionId();
+  sessions[sessionId] = {
+    sessionId,
+    name: String(name || "Browser task"),
+    tabIds: [],
+    groupId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  await saveTaskSessions(sessions);
+  return sessions[sessionId];
+}
+
+async function getTaskSessions(sessionId) {
+  const sessions = await loadTaskSessions();
+  let changed = false;
+  for (const session of Object.values(sessions)) {
+    const valid = await validOwnedTabs(session.tabIds);
+    if (valid.length !== (session.tabIds || []).length) {
+      session.tabIds = valid;
+      session.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (changed) await saveTaskSessions(sessions);
+  if (sessionId) {
+    if (!sessions[sessionId]) throw new Error("unknown task session");
+    return sessions[sessionId];
+  }
+  return Object.values(sessions);
+}
+
+async function groupTaskTab(session, tabId) {
+  if (!chrome.tabs.group || !chrome.tabGroups) return;
+  try {
+    const options = { tabIds: [tabId] };
+    if (Number.isInteger(session.groupId)) options.groupId = session.groupId;
+    session.groupId = await chrome.tabs.group(options);
+    await chrome.tabGroups.update(session.groupId, {
+      title: session.name.slice(0, 40),
+      color: "blue",
+      collapsed: false
+    });
+  } catch (error) {
+    console.warn("Could not group task tab:", error);
+    session.groupId = null;
+    try {
+      session.groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      await chrome.tabGroups.update(session.groupId, {
+        title: session.name.slice(0, 40), color: "blue", collapsed: false
+      });
+    } catch (retryError) {
+      console.warn("Could not create replacement task group:", retryError);
+    }
+  }
+}
+
+async function navigateTaskSession(sessionId, url, active = false, reuse = true) {
+  const sessions = await loadTaskSessions();
+  const session = sessions[sessionId];
+  if (!session) throw new Error("unknown task session");
+  session.tabIds = await validOwnedTabs(session.tabIds);
+  let tab = null;
+  if (reuse !== false && session.tabIds.length) {
+    tab = await chrome.tabs.update(session.tabIds[0], { url, active: active === true });
+    if (active === true && tab.windowId !== undefined) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } else {
+    tab = await chrome.tabs.create({ url, active: active === true });
+    session.tabIds.push(tab.id);
+    await groupTaskTab(session, tab.id);
+  }
+  session.updatedAt = Date.now();
+  await saveTaskSessions(sessions);
+  return { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active };
+}
+
+async function closeTaskSession(sessionId) {
+  const sessions = await loadTaskSessions();
+  const session = sessions[sessionId];
+  if (!session) throw new Error("unknown task session");
+  const tabIds = await validOwnedTabs(session.tabIds);
+  delete sessions[sessionId];
+  await saveTaskSessions(sessions);
+  // Delete ownership first. chrome.tabs.remove emits onRemoved events; if the
+  // record still exists, an event listener can race and re-save an empty copy.
+  if (tabIds.length) await chrome.tabs.remove(tabIds);
+  return { success: true, sessionId, closedTabIds: tabIds };
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const sessions = await loadTaskSessions();
+  let changed = false;
+  for (const session of Object.values(sessions)) {
+    if ((session.tabIds || []).includes(tabId)) {
+      session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
+      session.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (changed) await saveTaskSessions(sessions);
+});
 
 // Reserved internal action used by the native host's tab-origin policy check.
 // Returns only the target tab's URL/origin (no page content) so the host can

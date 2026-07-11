@@ -8,11 +8,12 @@ The server reuses `test_client.py`'s transport verbatim, so the MCP tools and th
 
 ### Tools
 
-The MCP server ships a grouped tool set. Tab-scoped tools take an optional `tab_id`; omit it to target the active tab.
+The MCP server ships a grouped tool set. Legacy tab-scoped tools take an optional `tab_id`; omitting it targets the active tab. For new workflows, prefer task-session tools so a human tab change cannot redirect the agent.
 
 Read-only:
 
 - `browser_list_tabs`
+- `browser_task_session_list`
 - `browser_snapshot` (accessibility snapshot)
 - `browser_extract_text`
 - `browser_screenshot` (returned inline as an image)
@@ -28,6 +29,7 @@ Sensitive:
 Mutating:
 
 - `browser_navigate`
+- `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_close`
 - `browser_click`, `browser_type`, `browser_fill`, `browser_hover`
 - `browser_scroll`, `browser_press`, `browser_drag`
 - `browser_select`
