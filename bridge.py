@@ -1061,8 +1061,8 @@ def handle_socket_client(client_socket):
             # full policy, live-origin, lease, and confirmation checks again.
             # This lets CLI/MCP users resume safely without reconstructing JSON.
             if action == 'confirm':
-                resume_payload = cmd.get("payload") or {}
-                resume_token = resume_payload.get("confirmationToken")
+                resume_payload = cmd.get("payload")
+                resume_token = resume_payload.get("confirmationToken") if isinstance(resume_payload, dict) else None
                 resumed = resume_confirmation(resume_token)
                 if resumed is None:
                     policy = current_policy()

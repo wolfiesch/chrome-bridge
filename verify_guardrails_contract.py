@@ -504,6 +504,12 @@ def run_against(label, cmd, env):
                f"{label}: invalid token-only confirm must fail closed, got {r}")
         expect(len(forwarded_actions()) == before_invalid,
                f"{label}: invalid token-only confirm must not forward")
+        r = c2.req("confirm", "not-an-object")
+        expect(r and r.get("success") is False and "invalid or expired" in str(r.get("error", "")),
+               f"{label}: malformed token-only confirm payload must fail closed, got {r}")
+        r = c2.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: malformed confirm payload must not crash the client handler, got {r}")
         c2.close()
         r = c.req("executeScript", {"tabId": 1, "code": "2"}, confirmation_token=token)
         expect(r and r.get("confirmationRequired") is True and r.get("confirmationToken") != token,

@@ -32,6 +32,23 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         close_body.index("await saveTaskSessions(sessions)") < close_body.index("await chrome.tabs.remove(tabIds)"),
         f"{path.name} must persist session deletion before tab removal events fire",
     )
+    navigate_body = text.split("async function navigateTaskSession", 1)[1].split("async function closeTaskSession", 1)[0]
+    expect(
+        "const reusedTabId = session.tabIds[0]" in navigate_body
+        and "session.tabIds.filter((tabId) => tabId !== reusedTabId)" in navigate_body,
+        f"{path.name} must replace a reused tab that closes during navigation",
+    )
+    expect(
+        "try {\n      await chrome.tabs.remove(tabIds);" in close_body
+        and "Could not remove every task-session tab" in close_body,
+        f"{path.name} must tolerate tabs closing during session cleanup",
+    )
+
+adapter = (ROOT / "adapters" / "browser_use" / "chrome_bridge_session.py").read_text(encoding="utf-8")
+expect(
+    'if not line:\n            self.close()\n            raise ChromeBridgeError("Received empty response from bridge.")' in adapter,
+    "browser-use adapter must close a dead socket immediately after EOF",
+)
 
 for path in (ROOT / "manifest.json", ROOT / "extension" / "manifest.json"):
     manifest = json.loads(path.read_text(encoding="utf-8"))

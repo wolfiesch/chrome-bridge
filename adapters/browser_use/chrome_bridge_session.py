@@ -216,6 +216,7 @@ class ChromeBridgeSession:
             if self._socket is not None and read_timeout_ms is not None:
                 self._socket.settimeout(old_timeout)
         if not line:
+            self.close()
             raise ChromeBridgeError("Received empty response from bridge.")
         try:
             response = json.loads(line.decode("utf-8"))

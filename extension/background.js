@@ -595,9 +595,19 @@ async function navigateTaskSession(sessionId, url, active = false, reuse = true)
   session.tabIds = await validOwnedTabs(session.tabIds);
   let tab = null;
   if (reuse !== false && session.tabIds.length) {
-    tab = await chrome.tabs.update(session.tabIds[0], { url, active: active === true });
-    if (active === true && tab.windowId !== undefined) {
-      await chrome.windows.update(tab.windowId, { focused: true });
+    const reusedTabId = session.tabIds[0];
+    try {
+      tab = await chrome.tabs.update(reusedTabId, { url, active: active === true });
+      if (active === true && tab.windowId !== undefined) {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
+    } catch (error) {
+      // The owned tab can close after validOwnedTabs() checks it. Replace only
+      // that raced tab and preserve any other tabs owned by the session.
+      tab = await chrome.tabs.create({ url, active: active === true });
+      session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
+      session.tabIds.push(tab.id);
+      await groupTaskTab(session, tab.id);
     }
   } else {
     tab = await chrome.tabs.create({ url, active: active === true });
@@ -618,7 +628,15 @@ async function closeTaskSession(sessionId) {
   await saveTaskSessions(sessions);
   // Delete ownership first. chrome.tabs.remove emits onRemoved events; if the
   // record still exists, an event listener can race and re-save an empty copy.
-  if (tabIds.length) await chrome.tabs.remove(tabIds);
+  if (tabIds.length) {
+    try {
+      await chrome.tabs.remove(tabIds);
+    } catch (error) {
+      // A tab can close between validOwnedTabs() and remove(). Ownership is
+      // already durably deleted, so this race should not fail the close call.
+      console.warn("Could not remove every task-session tab:", error);
+    }
+  }
   return { success: true, sessionId, closedTabIds: tabIds };
 }
 
