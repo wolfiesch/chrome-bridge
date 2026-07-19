@@ -77,9 +77,18 @@ class Client:
     def __init__(self, token):
         self.token = token
         self.buf = b""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(10)
-        self.sock.connect(("127.0.0.1", PORT))
+        deadline = time.monotonic() + 3
+        while True:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            try:
+                self.sock.connect(("127.0.0.1", PORT))
+                break
+            except ConnectionRefusedError:
+                self.sock.close()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def req(self, action, payload=None, confirmation_token=None):
         cmd = {"action": action, "payload": payload or {}, "token": self.token}
@@ -478,6 +487,30 @@ def run_against(label, cmd, env):
                f"{label}: confirmed executeScript should succeed, got {r}")
         expect("executeScript" in forwarded_actions(),
                f"{label}: confirmed executeScript should forward")
+        token_only_payload = {"tabId": 1, "code": "token-only"}
+        r = c.req("executeScript", token_only_payload)
+        token_only = (r or {}).get("confirmationToken")
+        expect((r or {}).get("resumeCommand") == f"chrome-bridge confirm {token_only}",
+               f"{label}: confirmation response should expose token-only resume command, got {r}")
+        # Resume through a different authenticated local identity, matching the
+        # real MCP-issued-token -> default-CLI confirmation flow.
+        c2 = Client("legacy-token")
+        r = c2.req("confirm", {"confirmationToken": token_only})
+        expect(r and r.get("success") is True,
+               f"{label}: cross-client token-only confirm should resume the original identity/action, got {r}")
+        before_invalid = len(forwarded_actions())
+        r = c2.req("confirm", {"confirmationToken": "not-a-real-token"})
+        expect(r and r.get("success") is False and "invalid or expired" in str(r.get("error", "")),
+               f"{label}: invalid token-only confirm must fail closed, got {r}")
+        expect(len(forwarded_actions()) == before_invalid,
+               f"{label}: invalid token-only confirm must not forward")
+        r = c2.req("confirm", "not-an-object")
+        expect(r and r.get("success") is False and "invalid or expired" in str(r.get("error", "")),
+               f"{label}: malformed token-only confirm payload must fail closed, got {r}")
+        r = c2.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: malformed confirm payload must not crash the client handler, got {r}")
+        c2.close()
         r = c.req("executeScript", {"tabId": 1, "code": "2"}, confirmation_token=token)
         expect(r and r.get("confirmationRequired") is True and r.get("confirmationToken") != token,
                f"{label}: reused token with different payload should require fresh confirmation, got {r}")
@@ -485,7 +518,11 @@ def run_against(label, cmd, env):
         time.sleep(0.3)
         exec_events = [e for e in audit_events() if e["action"] == "executeScript"]
         decisions = [e["decision"] for e in exec_events]
-        expected_order = ["confirmation_required", "confirmation_accepted", "allow", "extension_success", "confirmation_required"]
+        expected_order = [
+            "confirmation_required", "confirmation_accepted", "allow", "extension_success",
+            "confirmation_required", "confirmation_accepted", "allow", "extension_success",
+            "confirmation_required",
+        ]
         expect(decisions == expected_order,
                f"{label}: confirmation audit order = {decisions}")
 

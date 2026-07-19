@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ os.environ.pop("BRIDGE_MCP_ALLOW_SENSITIVE", None)
 
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "mcp"))
 from chrome_bridge_mcp import server  # noqa: E402
+from chrome_bridge_mcp import transport  # noqa: E402
 from chrome_bridge_mcp.transport import BridgeError  # noqa: E402
 
 # Captured requests the mock bridge received.
@@ -133,6 +135,12 @@ def default_result(action, payload):
         return TABS
     if action == "navigate":
         return {"tabId": 99}
+    if action == "createTaskSession":
+        return {"sessionId": "session-1", "name": payload.get("name"), "tabIds": []}
+    if action == "navigateTaskSession":
+        return {"sessionId": payload.get("sessionId"), "tabId": 99, "active": payload.get("active")}
+    if action == "getTaskSessions":
+        return []
     if action == "observe":
         return [{"role": "button", "name": "OK"}]
     if action == "extractText":
@@ -164,11 +172,22 @@ def main():
     action, payload = last_request()
     expect(action == "navigate" and payload == {"url": "https://x.test"}, "navigate payload mismatch")
 
+    server.browser_task_session_create("research")
+    expect(last_request() == ("createTaskSession", {"name": "research"}), "task session create mismatch")
+    server.browser_task_session_navigate("session-1", "https://x.test")
+    expect(last_request() == ("navigateTaskSession", {
+        "sessionId": "session-1", "url": "https://x.test", "reuse": True, "active": False,
+    }), "task session navigate mismatch")
+    server.browser_task_session_list("session-1")
+    expect(last_request() == ("getTaskSessions", {"sessionId": "session-1"}), "task session list mismatch")
+    server.browser_task_session_close("session-1")
+    expect(last_request() == ("closeTaskSession", {"sessionId": "session-1"}), "task session close mismatch")
+
     # 3. snapshot with explicit tab_id -> observe with that tabId (no active-tab lookup).
     with received_lock:
         received.clear()
     server.browser_snapshot(tab_id=11)
-    expect(last_request() == ("observe", {"tabId": 11}), "snapshot explicit tabId mismatch")
+    expect(last_request() == ("observe", {"tabId": 11, "compact": True, "limit": 50}), "snapshot explicit tabId mismatch")
     with received_lock:
         only_observe = [a for a, _ in received] == ["observe"]
     expect(only_observe, "snapshot with explicit tabId must not call getTabs")
@@ -180,7 +199,12 @@ def main():
     with received_lock:
         seq = [a for a, _ in received]
     expect(seq == ["getTabs", "observe"], f"snapshot active-tab resolve sequence wrong: {seq}")
-    expect(last_request() == ("observe", {"tabId": 22}), "snapshot should target active tab 22")
+    expect(last_request() == ("observe", {"tabId": 22, "compact": True, "limit": 50}), "snapshot should target active tab 22")
+
+    server.browser_snapshot(tab_id=11, compact=False, roles=["button", "link"], name="save", limit=10)
+    expect(last_request() == ("observe", {
+        "tabId": 11, "compact": False, "roles": ["button", "link"], "name": "save", "limit": 10,
+    }), "filtered snapshot payload mismatch")
 
     # 5. extract_text default max_chars.
     server.browser_extract_text(tab_id=11)
@@ -217,6 +241,9 @@ def main():
     server.browser_confirm_action("executeScript", "confirm-token", {"tabId": 11, "code": "1"})
     expect(last_request() == ("executeScript", {"tabId": 11, "code": "1"}), "browser_confirm_action payload mismatch")
     expect(last_raw_request().get("confirmationToken") == "confirm-token", "browser_confirm_action confirmation token mismatch")
+
+    server.browser_confirm("confirm-token")
+    expect(last_request() == ("confirm", {"confirmationToken": "confirm-token"}), "browser_confirm token-only payload mismatch")
 
     # 9b. browser_policy_check forwards policyCheck with action/payload, no tab resolve.
     with received_lock:
@@ -279,6 +306,15 @@ def main():
     expect(act == "uploadFile" and payload["files"] == [os.path.abspath(real)], "upload_file should forward abs path")
     os.unlink(real)
 
+    # First-class GitHub PR-body helper validates and forwards local files.
+    fd, real = tempfile.mkstemp()
+    os.close(fd)
+    server.browser_github_attach_pr_body([real], tab_id=11, timeout_ms=15000)
+    expect(last_request() == ("githubAttachPrBody", {
+        "tabId": 11, "files": [os.path.abspath(real)], "timeoutMs": 15000,
+    }), "github PR-body attachment payload mismatch")
+    os.unlink(real)
+
     # 16. Gating: default build hides sensitive tools (cookies + action escape hatch).
     default_names = _tool_names(server.build_server())
     expect("browser_get_cookies" not in default_names, "cookies must be hidden by default")
@@ -286,6 +322,8 @@ def main():
     expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
     expect("browser_policy_check" in default_names, "policy_check must be present by default (read-only, non-sensitive)")
     expect("browser_confirm_action" in default_names, "confirm_action must be present by default (mutating, non-sensitive)")
+    expect("browser_confirm" in default_names, "token-only confirm must be present by default")
+    expect("browser_github_attach_pr_body" in default_names, "GitHub PR-body helper must be present by default")
 
     # 17. allow_sensitive exposes sensitive tools.
     sens_names = _tool_names(server.build_server(allow_sensitive=True))
@@ -296,6 +334,7 @@ def main():
     expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
     expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
     expect("browser_confirm_action" not in ro_names, "readonly must hide browser_confirm_action (mutating)")
+    expect("browser_confirm" not in ro_names, "readonly must hide token-only confirm (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
     expect("browser_policy_check" in ro_names, "readonly must keep policy_check (read-only)")
 
@@ -304,6 +343,7 @@ def main():
     tools = {t.name: t for t in srv._tool_manager.list_tools()}
     expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
     expect(tools["browser_confirm_action"].annotations.destructiveHint is True, "confirm_action should be destructiveHint=True")
+    expect(tools["browser_confirm"].annotations.destructiveHint is True, "token-only confirm should be destructiveHint=True")
     expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
     res_uris = _resource_uris(srv)
     expect("browser://tabs" in res_uris, "browser://tabs resource missing")
@@ -387,6 +427,58 @@ def main():
         expect("boom" in str(exc), "BridgeError should carry the bridge error message")
     stop_event.set()
     t.join(timeout=5)
+
+    # 21. The MCP transport retries exactly once when connection setup failed
+    # before the host could receive the action. It must not replay ambiguous
+    # timeout/empty-response failures after a possible mutation.
+    saved_send = transport._client.send_command_data
+    os.environ["BRIDGE_MCP_RECONNECT_DELAY_MS"] = "0"
+    wire_calls = []
+
+    def connect_then_succeed(*args, **kwargs):
+        wire_calls.append((args, kwargs))
+        if len(wire_calls) == 1:
+            return 111, None, "browser unavailable"
+        return 0, {"success": True, "result": "pong"}, ""
+
+    transport._client.send_command_data = connect_then_succeed
+    try:
+        expect(transport.call("ping") == "pong", "safe MCP reconnect should return second response")
+        expect(len(wire_calls) == 2, "safe MCP reconnect should make exactly two attempts")
+    finally:
+        transport._client.send_command_data = saved_send
+
+    wire_calls.clear()
+
+    def ambiguous_timeout(*args, **kwargs):
+        wire_calls.append((args, kwargs))
+        return 124, None, "timed out"
+
+    transport._client.send_command_data = ambiguous_timeout
+    try:
+        try:
+            transport.call("click", {"tabId": 1, "selector": "#save"})
+            expect(False, "ambiguous timeout should raise without replay")
+        except BridgeError:
+            pass
+        expect(len(wire_calls) == 1, "ambiguous MCP failure must not replay a mutating action")
+    finally:
+        transport._client.send_command_data = saved_send
+
+    # 22. A packaged-style import with only mcp/ on PYTHONPATH must still load
+    # repo sibling helpers. This reproduces the former MCP startup crash.
+    startup_env = os.environ.copy()
+    startup_env["PYTHONPATH"] = os.path.join(SCRIPT_DIR, "mcp")
+    startup_env["BRIDGE_REPO_ROOT"] = SCRIPT_DIR
+    startup = subprocess.run(
+        [sys.executable, "-c", "import chrome_bridge_mcp.transport; print('startup-ok')"],
+        cwd="/tmp",
+        env=startup_env,
+        text=True,
+        capture_output=True,
+    )
+    expect(startup.returncode == 0 and "startup-ok" in startup.stdout,
+           f"packaged MCP startup import failed: {startup.stderr.strip()}")
 
     if failures:
         print(f"\n{len(failures)} contract failure(s).")

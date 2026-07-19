@@ -6,7 +6,7 @@ import re
 import socket
 import sys
 import time
-from bridge_wake import bridge_extension_id, token_file_path, wake_bridge_extension
+from bridge_wake import token_file_path
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -57,6 +57,46 @@ def expand_output_path(path):
     return os.path.abspath(os.path.expanduser(path))
 
 
+def parse_observe_args(args):
+    """Parse the small, intentionally dependency-free observe flag surface."""
+    payload = {
+        "tabId": parse_int(args[2], "tabId"),
+        "compact": True,
+    }
+    explicit_limit = None
+    index = 3
+    roles = []
+    while index < len(args):
+        flag = args[index]
+        if flag == "--full":
+            payload["compact"] = False
+            index += 1
+            continue
+        if flag == "--compact":
+            payload["compact"] = True
+            index += 1
+            continue
+        if flag in {"--role", "--name", "--limit"}:
+            if index + 1 >= len(args):
+                print(f"Missing value for {flag}", file=sys.stderr)
+                sys.exit(2)
+            value = args[index + 1]
+            if flag == "--role":
+                roles.extend(part.strip().lower() for part in value.split(",") if part.strip())
+            elif flag == "--name":
+                payload["name"] = value
+            else:
+                explicit_limit = parse_int(value, "limit")
+            index += 2
+            continue
+        print(f"Unknown observe option: {flag}", file=sys.stderr)
+        sys.exit(2)
+    if roles:
+        payload["roles"] = roles
+    payload["limit"] = explicit_limit if explicit_limit is not None else (50 if payload["compact"] else 250)
+    return payload
+
+
 
 
 def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
@@ -80,7 +120,6 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
     retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
     deadline = time.monotonic() + retry_seconds
     sock = None
-    wake_attempted = False
 
     try:
         while True:
@@ -99,9 +138,6 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                     sock.close()
                 except Exception:
                     pass
-                if not wake_attempted:
-                    wake_bridge_extension(SCRIPT_DIR)
-                    wake_attempted = True
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.5)
@@ -138,7 +174,10 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
             f"click 'service worker' to wake it, then check {os.path.join(SCRIPT_DIR, 'bridge_debug.log')}."
         )
     except ConnectionRefusedError:
-        return 111, None, "Error: Connection refused. Is Google Chrome running with the loaded extension?"
+        return 111, None, (
+            "Error: browser unavailable. Chrome may be closed, the extension may be disabled, "
+            "or the native connection may be disconnected. No tab was opened automatically."
+        )
     except Exception as e:
         return 1, None, f"Error communicating with bridge: {e}"
     finally:
@@ -165,10 +204,8 @@ def result_payload(response):
     return result if isinstance(result, dict) else response
 
 
-def save_screenshot(tab_id, output_path, quiet=False):
-    payload = {"tabId": tab_id, "format": "png"}
-    if quiet:
-        payload["quiet"] = True
+def save_screenshot(tab_id, output_path, quiet=True):
+    payload = {"tabId": tab_id, "format": "png", "quiet": quiet}
     exit_code, response, stderr = send_command_data("screenshot", payload)
     if exit_code != 0:
         if response is not None:
@@ -469,86 +506,188 @@ def _policy_doctor(audit_file, policy_file):
 
 def print_usage():
     print("Usage:")
-    print("  python3 test_client.py ping")
-    print("  python3 test_client.py navigate <url>")
-    print("  python3 test_client.py getTabs")
-    print("  python3 test_client.py getCookies <domain>")
-    print("  python3 test_client.py executeScript <tabId> <code>")
-    print("  python3 test_client.py executeScriptCDP <tabId> <code>")
-    print("  python3 test_client.py click <tabId> <selector>")
-    print("  python3 test_client.py type <tabId> <selector> <text>")
-    print("  python3 test_client.py observe <tabId>")
-    print("  python3 test_client.py activateTab <tabId>")
-    print("  python3 test_client.py closeTab <tabId>")
-    print("  python3 test_client.py reload <tabId>")
-    print("  python3 test_client.py goBack <tabId>")
-    print("  python3 test_client.py goForward <tabId>")
-    print("  python3 test_client.py waitForLoad <tabId> [timeoutMs]")
-    print("  python3 test_client.py waitForSelector <tabId> <selector> [timeoutMs]")
-    print("  python3 test_client.py waitForText <tabId> <text> [timeoutMs]")
-    print("  python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
-    print("  python3 test_client.py getCurrentState <tabId>")
-    print("  python3 test_client.py screenshot <tabId> <outputPath>")
-    print("  python3 test_client.py extractText <tabId> [maxChars]")
-    print("  python3 test_client.py getHTML <tabId> <outputPath>")
-    print("  python3 test_client.py hover <tabId> <selector>")
-    print("  python3 test_client.py scroll <tabId> <deltaX> <deltaY> [selector]")
-    print("  python3 test_client.py press <tabId> <keySpec>")
-    print("  python3 test_client.py drag <tabId> <fromSelector> <toSelector>")
-    print("  python3 test_client.py fill <tabId> <selector> <text>")
-    print("  python3 test_client.py select <tabId> <selector> <value>")
-    print("  python3 test_client.py uploadFile <tabId> <selector> <path...>")
-    print("  python3 test_client.py githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]")
-    print("  python3 test_client.py githubSubmitComment <tabId> [formSelector] [timeoutMs]")
+    print("  chrome-bridge <command> [arguments]")
+    print("  chrome-bridge help <command>")
+    print("  chrome-bridge <command> --help")
+    print("")
+    print("Common commands:")
+    print("  ping                              Check bridge health")
+    print("  getTabs                           List open tabs")
+    print("  navigate <url> [--foreground]     Open a tab in the background by default")
+    print("  observe <tabId> [filters]         Concise accessibility view; use --full for all fields")
+    print("  click <tabId> <selector>          Click by CSS, text, ARIA name, label, or role")
+    print("  fill <tabId> <selector> <text>    Clear and fill a form field")
+    print("  screenshot <tabId> <path>         Save a background-safe screenshot")
+    print("  github-attach-pr-body <tabId> <files...>")
+    print("                                    Edit a GitHub PR body, attach files, and save")
+    print("  confirm <token>                   Resume a confirmation-gated action")
+    print("  taskSession <operation> ...       Manage task-owned background tabs")
+    print("  policy <operation> ...            Inspect or update local policy")
+    print("")
     print("    selectors: CSS, css=<selector>, label=<text>, text=<text>, role=<role>[name=<text>],")
-    print("               <host> >>> <shadow-selector>, frame=<iframe-selector> >> <target-selector>")
-    print("  python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
-    print("  python3 test_client.py setCpuThrottling <tabId> <rate>")
-    print("  python3 test_client.py setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]")
-    print("  python3 test_client.py clearNetworkConditions <tabId>")
-    print("  python3 test_client.py setColorScheme <tabId> light|dark|no-preference")
-    print("  python3 test_client.py setUserAgent <tabId> <userAgent...>")
-    print("  python3 test_client.py startMonitoring <tabId>")
-    print("  python3 test_client.py stopMonitoring <tabId>")
-    print("  python3 test_client.py consoleMessages <tabId>")
-    print("  python3 test_client.py networkRequests <tabId>")
-    print("  python3 test_client.py handleDialog <tabId> accept|dismiss [promptText]")
-    print("  python3 test_client.py downloadUrl <url> [filename]")
-    print("  python3 test_client.py storageState <tabId> <outputPath>")
-    print("  python3 test_client.py setGeolocation <tabId> <latitude> <longitude> [accuracy]")
-    print("  python3 test_client.py clearGeolocation <tabId>")
-    print("  python3 test_client.py startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]")
-    print("  python3 test_client.py stopInterception <tabId>")
-    print("  python3 test_client.py interceptedRequests <tabId>")
-    print("  python3 test_client.py performanceMetrics <tabId>")
-    print("  python3 test_client.py sessionStatus <domain> [<domain> ...]")
-    print("  python3 test_client.py waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]")
-    print("  python3 test_client.py policyCheck <action> [payloadJson]")
-    print("  python3 test_client.py confirm <action> <confirmationToken> <payloadJson>")
-    print("  python3 test_client.py policy info")
-    print("  python3 test_client.py policy show")
-    print("  python3 test_client.py policy doctor")
-    print("  python3 test_client.py policy allow-action <action> [client]")
-    print("  python3 test_client.py policy allow-origin <pattern> [client]")
+    print("               aria=<accessible-name>, <host> >>> <shadow-selector>,")
+    print("               frame=<iframe-selector> >> <target-selector>")
+
+
+COMMAND_HELP = {
+    "observe": (
+        "chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
+        "Print a compact accessibility view by default. Filters are applied before the limit.",
+    ),
+    "click": (
+        "chrome-bridge click <tabId> <selector>",
+        "Click using CSS or a semantic selector such as text=Save, aria=More options, label=Email, or role=button[name=Save].",
+    ),
+    "executeScript": (
+        "chrome-bridge executeScript <tabId> <code>",
+        "Run page JavaScript. If policy requires confirmation, resume with: chrome-bridge confirm <token>",
+    ),
+    "executeScriptCDP": (
+        "chrome-bridge executeScriptCDP <tabId> <code>",
+        "Run JavaScript through Chrome DevTools. If policy requires confirmation, resume with: chrome-bridge confirm <token>",
+    ),
+    "confirm": (
+        "chrome-bridge confirm <confirmationToken>",
+        "Resume the exact action and payload stored by the host. Tokens are one-use and expire after 60 seconds by default.",
+    ),
+    "github-attach-pr-body": (
+        "chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]",
+        "On a GitHub pull-request page, open the body editor, attach the files, wait for GitHub CDN links, and save without replacing existing text.",
+    ),
+    "taskSession": (
+        "chrome-bridge taskSession create|navigate|show|close ...",
+        "Create and manage tabs owned by one task. Navigation stays in the background unless --foreground is given.",
+    ),
+    "policy": (
+        "chrome-bridge policy info|show|doctor|allow-action|allow-origin ...",
+        "Inspect the active local policy, explain recent denials, or add a narrow action/origin grant.",
+    ),
+}
+
+# Exact one-line usage for the rest of the public CLI. The longer explanations
+# above cover commands with non-obvious safety or selector behavior; every
+# command still gets a useful ``<command> --help`` response.
+COMMAND_USAGES = {
+    "ping": "chrome-bridge ping",
+    "navigate": "chrome-bridge navigate <url> [--foreground]",
+    "getTabs": "chrome-bridge getTabs",
+    "getCookies": "chrome-bridge getCookies <domain>",
+    "type": "chrome-bridge type <tabId> <selector> <text>",
+    "fill": "chrome-bridge fill <tabId> <selector> <text>",
+    "hover": "chrome-bridge hover <tabId> <selector>",
+    "scroll": "chrome-bridge scroll <tabId> <deltaX> <deltaY> [selector]",
+    "press": "chrome-bridge press <tabId> <keySpec>",
+    "drag": "chrome-bridge drag <tabId> <fromSelector> <toSelector>",
+    "select": "chrome-bridge select <tabId> <selector> <value>",
+    "uploadFile": "chrome-bridge uploadFile <tabId> <selector> <path...>",
+    "githubAttachUploadedFiles": "chrome-bridge githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]",
+    "githubSubmitComment": "chrome-bridge githubSubmitComment <tabId> [formSelector] [timeoutMs]",
+    "githubAttachPrBody": "chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]",
+    "activateTab": "chrome-bridge activateTab <tabId>",
+    "closeTab": "chrome-bridge closeTab <tabId>",
+    "reload": "chrome-bridge reload <tabId>",
+    "goBack": "chrome-bridge goBack <tabId>",
+    "goForward": "chrome-bridge goForward <tabId>",
+    "waitForLoad": "chrome-bridge waitForLoad <tabId> [timeoutMs]",
+    "waitForSelector": "chrome-bridge waitForSelector <tabId> <selector> [timeoutMs]",
+    "waitForText": "chrome-bridge waitForText <tabId> <text> [timeoutMs]",
+    "waitForUrl": "chrome-bridge waitForUrl <tabId> <substring> [timeoutMs]",
+    "getCurrentState": "chrome-bridge getCurrentState <tabId>",
+    "screenshot": "chrome-bridge screenshot <tabId> <outputPath> [--visible]",
+    "extractText": "chrome-bridge extractText <tabId> [maxChars]",
+    "getHTML": "chrome-bridge getHTML <tabId> <outputPath>",
+    "setViewport": "chrome-bridge setViewport <tabId> <width> <height> [deviceScaleFactor]",
+    "setCpuThrottling": "chrome-bridge setCpuThrottling <tabId> <rate>",
+    "setNetworkConditions": "chrome-bridge setNetworkConditions <tabId> <offline:0|1> [latencyMs] [downBps] [upBps]",
+    "clearNetworkConditions": "chrome-bridge clearNetworkConditions <tabId>",
+    "setColorScheme": "chrome-bridge setColorScheme <tabId> light|dark|no-preference",
+    "setUserAgent": "chrome-bridge setUserAgent <tabId> <userAgent...>",
+    "startMonitoring": "chrome-bridge startMonitoring <tabId>",
+    "stopMonitoring": "chrome-bridge stopMonitoring <tabId>",
+    "consoleMessages": "chrome-bridge consoleMessages <tabId>",
+    "networkRequests": "chrome-bridge networkRequests <tabId>",
+    "handleDialog": "chrome-bridge handleDialog <tabId> accept|dismiss [promptText]",
+    "downloadUrl": "chrome-bridge downloadUrl <url> [filename]",
+    "storageState": "chrome-bridge storageState <tabId> <outputPath>",
+    "setGeolocation": "chrome-bridge setGeolocation <tabId> <latitude> <longitude> [accuracy]",
+    "clearGeolocation": "chrome-bridge clearGeolocation <tabId>",
+    "startInterception": "chrome-bridge startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]",
+    "stopInterception": "chrome-bridge stopInterception <tabId>",
+    "interceptedRequests": "chrome-bridge interceptedRequests <tabId>",
+    "performanceMetrics": "chrome-bridge performanceMetrics <tabId>",
+    "sessionStatus": "chrome-bridge sessionStatus <domain> [domain...]",
+    "waitForHandoff": "chrome-bridge waitForHandoff <message> [mode] [target] [timeoutMs] [tabId]",
+    "policyCheck": "chrome-bridge policyCheck <action> [payloadJson]",
+    "batch": "chrome-bridge batch <stepsJson> [tabId]",
+}
+
+
+def print_command_help(command):
+    entry = COMMAND_HELP.get(command)
+    if entry is not None:
+        usage, description = entry
+        print(f"Usage: {usage}")
+        print(description)
+        return 0
+    usage = COMMAND_USAGES.get(command)
+    if usage is None:
+        print(f"No help is available for unknown command: {command}", file=sys.stderr)
+        return 64
+    print(f"Usage: {usage}")
+    print("See docs/commands.md for behavior, selector forms, and safety notes.")
+    return 0
 
 def main():
     if len(sys.argv) < 2:
         print_usage()
-        sys.exit(1)
+        sys.exit(0)
 
     action = sys.argv[1]
     args = sys.argv
+
+    if action in {"-h", "--help"}:
+        print_usage()
+        sys.exit(0)
+    if action == "help":
+        if len(args) == 2:
+            print_usage()
+            sys.exit(0)
+        sys.exit(print_command_help(args[2]))
+    if len(args) > 2 and args[2] in {"-h", "--help"}:
+        sys.exit(print_command_help(action))
 
     if action == "ping":
         sys.exit(send_command("ping"))
     elif action == "navigate":
         require_args(args, 3, "Missing URL.")
-        payload = {"url": args[2]}
-        if len(args) > 3 and args[3] == "--background":
-            payload["active"] = False
+        foreground = len(args) > 3 and args[3] == "--foreground"
+        payload = {"url": args[2], "active": foreground}
         sys.exit(send_command("navigate", payload))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
+    elif action == "taskSession":
+        require_args(args, 3, "Usage: python3 test_client.py taskSession create|navigate|show|close ...")
+        op = args[2]
+        if op == "create":
+            require_args(args, 4, "Usage: python3 test_client.py taskSession create <name>")
+            sys.exit(send_command("createTaskSession", {"name": args[3]}))
+        if op == "navigate":
+            require_args(args, 5, "Usage: python3 test_client.py taskSession navigate <sessionId> <url> [--foreground] [--new]")
+            flags = set(args[5:])
+            sys.exit(send_command("navigateTaskSession", {
+                "sessionId": args[3],
+                "url": args[4],
+                "active": "--foreground" in flags,
+                "reuse": "--new" not in flags,
+            }))
+        if op == "show":
+            payload = {"sessionId": args[3]} if len(args) > 3 else {}
+            sys.exit(send_command("getTaskSessions", payload))
+        if op == "close":
+            require_args(args, 4, "Usage: python3 test_client.py taskSession close <sessionId>")
+            sys.exit(send_command("closeTaskSession", {"sessionId": args[3]}))
+        print(f"Unknown taskSession operation: {op}", file=sys.stderr)
+        sys.exit(64)
     elif action == "getCookies":
         require_args(args, 3, "Missing domain.")
         sys.exit(send_command("getCookies", {"domain": args[2]}))
@@ -566,7 +705,7 @@ def main():
         sys.exit(send_command("type", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "text": args[4]}))
     elif action == "observe":
         require_args(args, 3, "Usage: python3 test_client.py observe <tabId>")
-        sys.exit(send_command("observe", {"tabId": parse_int(args[2], "tabId")}))
+        sys.exit(send_command("observe", parse_observe_args(args)))
     elif action in {"activateTab", "closeTab", "reload", "goBack", "goForward", "getCurrentState", "startMonitoring", "stopMonitoring", "consoleMessages", "networkRequests"}:
         require_args(args, 3, f"Usage: python3 test_client.py {action} <tabId>")
         sys.exit(send_command(action, {"tabId": parse_int(args[2], "tabId")}))
@@ -583,8 +722,9 @@ def main():
         require_args(args, 4, "Usage: python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
         sys.exit(send_command("waitForUrl", {"tabId": parse_int(args[2], "tabId"), "substring": args[3], "timeoutMs": parse_timeout(args, 4)}))
     elif action == "screenshot":
-        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--quiet]")
-        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3], len(args) > 4 and args[4] == "--quiet"))
+        require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--visible]")
+        visible = len(args) > 4 and args[4] == "--visible"
+        sys.exit(save_screenshot(parse_int(args[2], "tabId"), args[3], quiet=not visible))
     elif action == "extractText":
         require_args(args, 3, "Usage: python3 test_client.py extractText <tabId> [maxChars]")
         max_chars = parse_int(args[3], "maxChars") if len(args) > 3 else 20000
@@ -634,6 +774,29 @@ def main():
         if len(args) > 4:
             payload["timeoutMs"] = parse_int(args[4], "timeoutMs")
         sys.exit(send_command("githubSubmitComment", payload))
+    elif action in {"github-attach-pr-body", "githubAttachPrBody"}:
+        require_args(args, 4, "Usage: chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]")
+        paths = []
+        timeout_ms = 30000
+        index = 3
+        while index < len(args):
+            if args[index] == "--timeout":
+                if index + 1 >= len(args):
+                    print("Missing value for --timeout", file=sys.stderr)
+                    sys.exit(2)
+                timeout_ms = parse_int(args[index + 1], "timeoutMs")
+                index += 2
+                continue
+            paths.append(args[index])
+            index += 1
+        if not paths:
+            print("At least one attachment file is required", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("githubAttachPrBody", {
+            "tabId": parse_int(args[2], "tabId"),
+            "files": expand_existing_files(paths),
+            "timeoutMs": timeout_ms,
+        }))
     elif action == "setViewport":
         require_args(args, 5, "Usage: python3 test_client.py setViewport <tabId> <width> <height> [deviceScaleFactor]")
         scale = parse_float(args[5], "deviceScaleFactor") if len(args) > 5 else 1
@@ -710,7 +873,12 @@ def main():
             payload["tabId"] = parse_int(args[3], "tabId")
         sys.exit(send_command("batch", payload))
     elif action == "confirm":
-        require_args(args, 5, "Usage: python3 test_client.py confirm <action> <confirmationToken> <payloadJson>")
+        require_args(args, 3, "Usage: chrome-bridge confirm <confirmationToken>")
+        if len(args) == 3:
+            sys.exit(send_command("confirm", {"confirmationToken": args[2]}))
+        # Backward compatibility for the old, hard-to-use form. New callers
+        # should use the token-only host resume path above.
+        require_args(args, 5, "Usage: chrome-bridge confirm <confirmationToken> OR confirm <action> <confirmationToken> <payloadJson>")
         try:
             payload = json.loads(args[4])
         except Exception as exc:

@@ -22,6 +22,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CLIENT_COUNT = 10
 CLIENT_NAMES = [f"client{i}" for i in range(CLIENT_COUNT)]
 CLIENT_TOKENS = {name: f"tok-{name}" for name in CLIENT_NAMES}
+# The main contention waves open dozens of fresh TCP connections. Two seconds
+# is too tight on a cold or loaded CI runner and tests normal lease expiry rather
+# than enforcement. Dedicated short-TTL cases below still cover expiry behavior.
+STRESS_LEASE_TTL_MS = 10000
 failures = []
 
 
@@ -209,7 +213,7 @@ def run_against(label, cmd, base_env):
         wait_for_host(port, time.time() + 5)
 
         # 1. Ten clients race at once; exactly one wins and status reports it.
-        winner, _ = race_for_lease(f"{label} race 1", port, 2000)
+        winner, _ = race_for_lease(f"{label} race 1", port, STRESS_LEASE_TTL_MS)
         if winner is None:
             return
 
@@ -239,7 +243,7 @@ def run_against(label, cmd, base_env):
 
         # 4. After release, a new ten-client race still has exactly one winner.
         assert_release(label, port, winner)
-        winner2, _ = race_for_lease(f"{label} race 2 after release", port, 2000)
+        winner2, _ = race_for_lease(f"{label} race 2 after release", port, STRESS_LEASE_TTL_MS)
         if winner2 is None:
             return
         assert_release(label, port, winner2)
@@ -249,7 +253,7 @@ def run_against(label, cmd, base_env):
         resp = request_once(short_owner, port, "lease", {"ttlMs": 150})
         expect(resp and resp.get("success"), f"{label}: short lease acquire should succeed, got {resp}")
         time.sleep(0.25)
-        winner3, _ = race_for_lease(f"{label} race 3 after TTL expiry", port, 2000)
+        winner3, _ = race_for_lease(f"{label} race 3 after TTL expiry", port, STRESS_LEASE_TTL_MS)
         if winner3 is None:
             return
         assert_release(label, port, winner3)

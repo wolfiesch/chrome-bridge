@@ -18,7 +18,7 @@ policy = json.loads((SCRIPT_DIR / "bridge_policy.example.json").read_text(encodi
 client_actions = policy["clients"]["default"]["allowedActions"]
 confirm_actions = policy["clients"]["default"].get("requireConfirmation", [])
 
-for action in ["githubAttachUploadedFiles", "githubSubmitComment"]:
+for action in ["githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody"]:
     if action not in background:
         fail(f"background.js missing {action} dispatch")
     if action not in client_actions:
@@ -33,12 +33,26 @@ for needle in [
     "Close with comment",
     "Comment",
     "Add comment",
+    ".js-command-palette-pull-body",
+    "DOM.setFileInputFiles",
+    "githubPrBodyAttachAndSaveExpression",
+    "Update comment",
+    "matched.closest?.('button, a, input, select, textarea, [role]')",
+    "Matched element is not clickable",
 ]:
     if needle not in background:
         fail(f"background.js missing GitHub attachment/comment needle {needle}")
 
 if "const assetPattern = /user-attachments\\\\/assets\\\\/" not in background:
     fail("background.js must poll for GitHub user-attachments/assets markdown")
+if r"https:\/\/github\.com\/user-attachments\/assets\/" not in background:
+    fail("PR-body helper must wait for full GitHub CDN attachment URLs")
+if "githubAttachPrBody(payload.tabId, payload.files, payload.timeoutMs)" not in background:
+    fail("background.js must dispatch the first-class GitHub PR-body helper")
+if "if (result?.success === false) throw new Error(result.err || 'GitHub PR-body attachment failed')" not in background:
+    fail("GitHub PR-body helper failures must reach CLI and MCP callers as failures")
+if "Expected exactly one GitHub pull-request body save button" not in background:
+    fail("GitHub PR-body helper must fail closed rather than guessing a save button")
 
 gate_start = background.find("async function assertGitHubTab")
 gate_end = background.find("function githubAttachExpression", gate_start)

@@ -6,6 +6,7 @@
   "permissions": [
     "nativeMessaging",
     "tabs",
+    "tabGroups",
     "scripting",
     "activeTab",
     "cookies",

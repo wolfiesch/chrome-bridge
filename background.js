@@ -5,6 +5,7 @@ const RECONNECT_ALARM = "chromeBridgeReconnect";
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 30000;
+const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
 // Persist retry state across SW suspension. A bare module variable is lost when
 // the MV3 service worker suspends, so we keep backoff state in chrome.storage.
 // The manifest grants "storage"; prefer storage.session (resets on browser
@@ -231,6 +232,7 @@ chrome.runtime.onInstalled.addListener(() => {
   connectToHost();
 });
 chrome.runtime.onStartup.addListener(() => {
+  if (chrome.storage && chrome.storage.local) chrome.storage.local.remove(TASK_SESSIONS_KEY);
   scheduleHeartbeat();
   connectToHost();
 });
@@ -297,6 +299,18 @@ async function dispatchAction(action, payload) {
       case "getTabs":
         result = await getTabs();
         break;
+      case "createTaskSession":
+        result = await createTaskSession(payload.name);
+        break;
+      case "navigateTaskSession":
+        result = await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse);
+        break;
+      case "getTaskSessions":
+        result = await getTaskSessions(payload.sessionId);
+        break;
+      case "closeTaskSession":
+        result = await closeTaskSession(payload.sessionId);
+        break;
       case "executeScript":
         result = await runScriptInTab(payload.tabId, payload.code);
         break;
@@ -310,7 +324,7 @@ async function dispatchAction(action, payload) {
         result = await typeSelector(payload.tabId, payload.selector, payload.text);
         break;
       case "observe":
-        result = await observeTab(payload.tabId);
+        result = await observeTab(payload.tabId, payload);
         break;
       case "getCookies":
         result = await chrome.cookies.getAll({ domain: payload.domain });
@@ -377,6 +391,10 @@ async function dispatchAction(action, payload) {
         break;
       case "githubSubmitComment":
         result = await githubSubmitComment(payload.tabId, payload.formSelector, payload.timeoutMs);
+        break;
+      case "githubAttachPrBody":
+        result = await githubAttachPrBody(payload.tabId, payload.files, payload.timeoutMs);
+        if (result?.success === false) throw new Error(result.err || 'GitHub PR-body attachment failed');
         break;
       case "uploadFile":
         result = await uploadFile(payload.tabId, payload.selector, payload.files);
@@ -461,8 +479,8 @@ function sendResponseToHost(response) {
   }
 }
 
-async function navigateToUrl(url, active = true) {
-  const tab = await chrome.tabs.create({ url, active: active !== false });
+async function navigateToUrl(url, active = false) {
+  const tab = await chrome.tabs.create({ url, active: active === true });
   return { tabId: tab.id };
 }
 
@@ -478,6 +496,162 @@ async function getTabs() {
     status: tab.status
   }));
 }
+
+async function loadTaskSessions() {
+  const store = chrome.storage && chrome.storage.local;
+  if (!store) return {};
+  const data = await store.get(TASK_SESSIONS_KEY);
+  return data[TASK_SESSIONS_KEY] || {};
+}
+
+async function saveTaskSessions(sessions) {
+  const store = chrome.storage && chrome.storage.local;
+  if (store) await store.set({ [TASK_SESSIONS_KEY]: sessions });
+}
+
+function newTaskSessionId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `task-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function validOwnedTabs(tabIds) {
+  const valid = [];
+  for (const tabId of tabIds || []) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab) valid.push(tabId);
+    } catch (error) {
+      // Closed tabs are removed from the durable ownership record.
+    }
+  }
+  return valid;
+}
+
+async function createTaskSession(name) {
+  const sessions = await loadTaskSessions();
+  const sessionId = newTaskSessionId();
+  sessions[sessionId] = {
+    sessionId,
+    name: String(name || "Browser task"),
+    tabIds: [],
+    groupId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  await saveTaskSessions(sessions);
+  return sessions[sessionId];
+}
+
+async function getTaskSessions(sessionId) {
+  const sessions = await loadTaskSessions();
+  let changed = false;
+  for (const session of Object.values(sessions)) {
+    const valid = await validOwnedTabs(session.tabIds);
+    if (valid.length !== (session.tabIds || []).length) {
+      session.tabIds = valid;
+      session.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (changed) await saveTaskSessions(sessions);
+  if (sessionId) {
+    if (!sessions[sessionId]) throw new Error("unknown task session");
+    return sessions[sessionId];
+  }
+  return Object.values(sessions);
+}
+
+async function groupTaskTab(session, tabId) {
+  if (!chrome.tabs.group || !chrome.tabGroups) return;
+  try {
+    const options = { tabIds: [tabId] };
+    if (Number.isInteger(session.groupId)) options.groupId = session.groupId;
+    session.groupId = await chrome.tabs.group(options);
+    await chrome.tabGroups.update(session.groupId, {
+      title: session.name.slice(0, 40),
+      color: "blue",
+      collapsed: false
+    });
+  } catch (error) {
+    console.warn("Could not group task tab:", error);
+    session.groupId = null;
+    try {
+      session.groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      await chrome.tabGroups.update(session.groupId, {
+        title: session.name.slice(0, 40), color: "blue", collapsed: false
+      });
+    } catch (retryError) {
+      console.warn("Could not create replacement task group:", retryError);
+    }
+  }
+}
+
+async function navigateTaskSession(sessionId, url, active = false, reuse = true) {
+  const sessions = await loadTaskSessions();
+  const session = sessions[sessionId];
+  if (!session) throw new Error("unknown task session");
+  session.tabIds = await validOwnedTabs(session.tabIds);
+  let tab = null;
+  if (reuse !== false && session.tabIds.length) {
+    const reusedTabId = session.tabIds[0];
+    try {
+      tab = await chrome.tabs.update(reusedTabId, { url, active: active === true });
+      if (active === true && tab.windowId !== undefined) {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      }
+    } catch (error) {
+      // The owned tab can close after validOwnedTabs() checks it. Replace only
+      // that raced tab and preserve any other tabs owned by the session.
+      tab = await chrome.tabs.create({ url, active: active === true });
+      session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
+      session.tabIds.push(tab.id);
+      await groupTaskTab(session, tab.id);
+    }
+  } else {
+    tab = await chrome.tabs.create({ url, active: active === true });
+    session.tabIds.push(tab.id);
+    await groupTaskTab(session, tab.id);
+  }
+  session.updatedAt = Date.now();
+  await saveTaskSessions(sessions);
+  return { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active };
+}
+
+async function closeTaskSession(sessionId) {
+  const sessions = await loadTaskSessions();
+  const session = sessions[sessionId];
+  if (!session) throw new Error("unknown task session");
+  const tabIds = await validOwnedTabs(session.tabIds);
+  delete sessions[sessionId];
+  await saveTaskSessions(sessions);
+  // Delete ownership first. chrome.tabs.remove emits onRemoved events; if the
+  // record still exists, an event listener can race and re-save an empty copy.
+  if (tabIds.length) {
+    try {
+      await chrome.tabs.remove(tabIds);
+    } catch (error) {
+      // A tab can close between validOwnedTabs() and remove(). Ownership is
+      // already durably deleted, so this race should not fail the close call.
+      console.warn("Could not remove every task-session tab:", error);
+    }
+  }
+  return { success: true, sessionId, closedTabIds: tabIds };
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const sessions = await loadTaskSessions();
+  let changed = false;
+  for (const session of Object.values(sessions)) {
+    if ((session.tabIds || []).includes(tabId)) {
+      session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
+      session.updatedAt = Date.now();
+      changed = true;
+    }
+  }
+  if (changed) await saveTaskSessions(sessions);
+});
 
 // Reserved internal action used by the native host's tab-origin policy check.
 // Returns only the target tab's URL/origin (no page content) so the host can
@@ -649,6 +823,11 @@ function parseLocatorToken(rawToken, rawLocator) {
     const text = token.slice("label=".length).trim();
     if (!text) throw new Error(`Missing label text in ${rawLocator}`);
     return { kind: "label", text };
+  }
+  if (token.startsWith("aria=")) {
+    const name = token.slice("aria=".length).trim();
+    if (!name) throw new Error(`Missing accessible name in ${rawLocator}`);
+    return { kind: "aria", name };
   }
   if (token.startsWith("role=")) {
     const roleSpec = token.slice("role=".length).trim();
@@ -838,6 +1017,13 @@ function locatorResolverSource() {
           controls.find((item) => labelText(item).includes(wanted) || normalize(item.getAttribute('aria-label')).includes(wanted) || byIdText(item.getAttribute('aria-labelledby')).includes(wanted) || normalize(item.getAttribute('placeholder')).includes(wanted));
         return el ? { success: true, el } : { success: false, err: 'No form control found for label ' + token.text };
       }
+      if (token.kind === 'aria') {
+        const wanted = normalize(token.name);
+        const matches = candidateElements(root);
+        const el = matches.find((item) => accessibleName(item) === wanted) ||
+          matches.find((item) => accessibleName(item).includes(wanted));
+        return el ? { success: true, el } : { success: false, err: 'No element found for accessible name ' + token.name };
+      }
       if (token.kind === 'role') {
         const name = normalize(token.name);
         const matches = candidateElements(root).filter((el) => (el.getAttribute('role') || implicitRole(el)) === token.role);
@@ -900,7 +1086,13 @@ function domClickExpression(locator) {
     ${locatorResolverSource()}
     const resolved = resolveLocator(${JSON.stringify(locator)});
     if (!resolved.success) return resolved;
-    const el = resolved.el;
+    const matched = resolved.el;
+    const el = typeof matched.click === 'function'
+      ? matched
+      : matched.closest?.('button, a, input, select, textarea, [role]') || matched;
+    if (typeof el.click !== 'function') {
+      return { success: false, err: 'Matched element is not clickable' };
+    }
     el.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = el.getBoundingClientRect();
     const eventInit = {
@@ -1151,7 +1343,7 @@ async function waitForText(tabId, text, timeoutMs) {
 
 async function getCurrentState(tabId) {
   const tab = await chrome.tabs.get(tabId);
-  const observe = await observeTab(tabId);
+  const observe = await observeTab(tabId, { compact: true, limit: 50 });
   return {
     success: true,
     tab: {
@@ -1166,7 +1358,7 @@ async function getCurrentState(tabId) {
   };
 }
 
-async function captureScreenshot(tabId, format, quiet = false) {
+async function captureScreenshot(tabId, format, quiet = true) {
   const screenshotFormat = format || "png";
   if (quiet) {
     return withDebugger(tabId, async (target) => {
@@ -1529,6 +1721,183 @@ async function githubSubmitComment(tabId, formSelector, timeoutMs) {
   });
 }
 
+function githubPrBodyEditorExpression(timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    const timeoutMs = ${JSON.stringify(timeoutMs || 30000)};
+    const deadline = Date.now() + timeoutMs;
+    const root = document.querySelector('.js-command-palette-pull-body');
+    if (!root) {
+      resolve({ success: false, err: 'No GitHub pull-request body container found' });
+      return;
+    }
+    const findEditor = () => {
+      const form = root.querySelector('form.js-comment-update');
+      const textarea = form && form.querySelector('textarea.js-comment-field');
+      const input = form && form.querySelector('file-attachment input[type="file"]');
+      const attachment = input && input.closest('file-attachment');
+      return form && textarea && input && attachment && form.offsetParent !== null
+        ? { form, textarea, input, attachment }
+        : null;
+    };
+    const waitForEditor = () => {
+      const editor = findEditor();
+      if (editor) {
+        resolve({ success: true });
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body editor' });
+        return;
+      }
+      setTimeout(waitForEditor, 200);
+    };
+    if (findEditor()) {
+      resolve({ success: true, alreadyOpen: true });
+      return;
+    }
+    const menu = root.querySelector('summary[aria-haspopup="menu"]');
+    if (!menu || !menu.querySelector('svg[aria-label="Show options"]')) {
+      resolve({ success: false, err: 'No GitHub pull-request body options menu found' });
+      return;
+    }
+    menu.click();
+    const waitForEdit = () => {
+      const editButtons = Array.from(root.querySelectorAll('button.js-comment-edit-button[aria-label="Edit comment"]'))
+        .filter((button) => button.offsetParent !== null);
+      if (editButtons.length === 1) {
+        editButtons[0].click();
+        waitForEditor();
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body Edit action', matches: editButtons.length });
+        return;
+      }
+      setTimeout(waitForEdit, 200);
+    };
+    waitForEdit();
+  }))()`;
+}
+
+function githubPrBodyInputExpression() {
+  return `(() => {
+    const root = document.querySelector('.js-command-palette-pull-body');
+    const form = root && root.querySelector('form.js-comment-update');
+    const inputs = form && form.offsetParent !== null
+      ? Array.from(form.querySelectorAll('file-attachment input[type="file"]'))
+      : [];
+    if (inputs.length !== 1) throw new Error('Expected exactly one GitHub pull-request body file input');
+    return inputs[0];
+  })()`;
+}
+
+function githubPrBodyAttachAndSaveExpression(fileCount, timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    const root = document.querySelector('.js-command-palette-pull-body');
+    const form = root && root.querySelector('form.js-comment-update');
+    const textarea = form && form.querySelector('textarea.js-comment-field');
+    const input = form && form.querySelector('file-attachment input[type="file"]');
+    const attachment = input && input.closest('file-attachment');
+    if (!form || !textarea || !input || !attachment || typeof attachment.attach !== 'function') {
+      resolve({ success: false, err: 'GitHub pull-request body attachment editor is incomplete' });
+      return;
+    }
+    if (!input.files || input.files.length !== ${JSON.stringify(fileCount)}) {
+      resolve({ success: false, err: 'GitHub pull-request body file input did not receive every requested file', files: input.files ? input.files.length : 0 });
+      return;
+    }
+    const assetPattern = /https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9._-]+/g;
+    const before = new Set((textarea.value || '').match(assetPattern) || []);
+    const timeoutMs = ${JSON.stringify(timeoutMs || 30000)};
+    const deadline = Date.now() + timeoutMs;
+    let settled = false;
+    Promise.resolve(attachment.attach(input.files)).catch((error) => {
+      if (!settled) {
+        settled = true;
+        resolve({ success: false, err: String(error && error.message || error) });
+      }
+    });
+    const poll = () => {
+      if (settled) return;
+      const value = textarea.value || '';
+      const assets = Array.from(new Set(value.match(assetPattern) || []));
+      const addedAssets = assets.filter((asset) => !before.has(asset));
+      const uploading = /Uploading/i.test(value);
+      if (!uploading && addedAssets.length >= ${JSON.stringify(fileCount)}) {
+        const submitButtons = Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]'))
+          .filter((button) => !button.disabled && button.offsetParent !== null)
+          .map((button) => ({ button, text: ((button.innerText || button.value || button.textContent || '').trim().replace(/\\s+/g, ' ')) }))
+          .filter(({ text }) => text === 'Update comment' || text === 'Save');
+        if (submitButtons.length !== 1) {
+          settled = true;
+          resolve({ success: false, err: 'Expected exactly one GitHub pull-request body save button', labels: submitButtons.map(({ text }) => text), addedAssets });
+          return;
+        }
+        submitButtons[0].button.click();
+        const label = submitButtons[0].text;
+        const waitForSave = () => {
+          const editorVisible = form.querySelector('textarea.js-comment-field') && form.offsetParent !== null;
+          if (!editorVisible) {
+            settled = true;
+            resolve({ success: true, files: ${JSON.stringify(fileCount)}, assets: addedAssets, saved: true, label });
+            return;
+          }
+          if (Date.now() > deadline) {
+            settled = true;
+            resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body save', files: ${JSON.stringify(fileCount)}, assets: addedAssets });
+            return;
+          }
+          setTimeout(waitForSave, 200);
+        };
+        waitForSave();
+        return;
+      }
+      if (Date.now() > deadline) {
+        settled = true;
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body attachment markdown', files: ${JSON.stringify(fileCount)}, addedAssets, uploading });
+        return;
+      }
+      setTimeout(poll, 250);
+    };
+    poll();
+  }))()`;
+}
+
+async function githubAttachPrBody(tabId, files, timeoutMs) {
+  const gate = await assertGitHubTab(tabId);
+  if (gate.success === false) return gate;
+  let path = null;
+  try {
+    path = new URL(gate.url).pathname;
+  } catch (error) {
+    path = null;
+  }
+  if (!path || !/^\/[^/]+\/[^/]+\/pull\/\d+(?:\/|$)/.test(path)) {
+    return { success: false, err: 'GitHub PR-body attachment requires a /owner/repo/pull/number page', path };
+  }
+  if (!Array.isArray(files) || files.length === 0) {
+    return { success: false, err: 'At least one attachment file is required' };
+  }
+  return withDebugger(tabId, async (target) => {
+    const opened = await evaluateInContext(target, githubPrBodyEditorExpression(timeoutMs), null);
+    const openedValue = opened.val || opened;
+    if (!opened.success || openedValue.success === false) return openedValue;
+
+    const evaluated = await debuggerCommand(target, 'Runtime.evaluate', {
+      expression: githubPrBodyInputExpression(),
+      awaitPromise: true,
+      returnByValue: false,
+      allowUnsafeEvalBlockedByCSP: true
+    });
+    if (evaluated.exceptionDetails || !evaluated.result?.objectId) {
+      return { success: false, err: evaluated.exceptionDetails?.exception?.description || evaluated.exceptionDetails?.text || 'No GitHub pull-request body file input object found' };
+    }
+    await debuggerCommand(target, 'DOM.setFileInputFiles', { objectId: evaluated.result.objectId, files });
+    const attached = await evaluateInContext(target, githubPrBodyAttachAndSaveExpression(files.length, timeoutMs), null);
+    return attached.val || attached;
+  });
+}
+
 async function uploadFile(tabId, selector, files) {
   return withDebugger(tabId, async (target) => {
     let locator;
@@ -1622,19 +1991,42 @@ async function setUserAgent(tabId, userAgent) {
   });
 }
 
-async function observeTab(tabId) {
+async function observeTab(tabId, options = {}) {
   return withDebugger(tabId, async (target) => {
     const ax = await debuggerCommand(target, 'Accessibility.getFullAXTree', {});
-    const nodes = (ax.nodes || []).filter((node) => !node.ignored).slice(0, 250);
-    return nodes.map((node) => ({
-      nodeId: node.nodeId,
-      backendDOMNodeId: node.backendDOMNodeId || null,
-      role: node.role?.value || null,
-      name: node.name?.value || '',
-      value: node.value?.value || null,
-      description: node.description?.value || null,
-      properties: Object.fromEntries((node.properties || []).map((prop) => [prop.name, prop.value?.value ?? prop.value?.description ?? null]))
-    }));
+    const compact = options.compact === true;
+    const requestedRoles = Array.isArray(options.roles)
+      ? new Set(options.roles.map((role) => String(role || '').toLowerCase()).filter(Boolean))
+      : null;
+    const requestedName = String(options.name || '').trim().toLowerCase();
+    const rawLimit = Number(options.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : (compact ? 50 : 250);
+    let nodes = (ax.nodes || []).filter((node) => !node.ignored);
+    if (requestedRoles && requestedRoles.size) {
+      nodes = nodes.filter((node) => requestedRoles.has(String(node.role?.value || '').toLowerCase()));
+    }
+    if (requestedName) {
+      nodes = nodes.filter((node) => String(node.name?.value || '').toLowerCase().includes(requestedName));
+    }
+    if (compact) {
+      const usefulRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'menuitem', 'tab', 'heading', 'img']);
+      nodes = nodes.filter((node) => usefulRoles.has(String(node.role?.value || '').toLowerCase()) || node.name?.value || node.value?.value);
+    }
+    return nodes.slice(0, limit).map((node) => {
+      const basic = {
+        role: node.role?.value || null,
+        name: node.name?.value || '',
+      };
+      if (node.value?.value != null) basic.value = node.value.value;
+      if (compact) return basic;
+      return {
+        nodeId: node.nodeId,
+        backendDOMNodeId: node.backendDOMNodeId || null,
+        ...basic,
+        description: node.description?.value || null,
+        properties: Object.fromEntries((node.properties || []).map((prop) => [prop.name, prop.value?.value ?? prop.value?.description ?? null]))
+      };
+    });
   });
 }
 

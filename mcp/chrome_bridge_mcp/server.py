@@ -60,13 +60,57 @@ def browser_navigate(url: str) -> str:
     return _text(call("navigate", {"url": url}))
 
 
-def browser_snapshot(tab_id: Optional[int] = None) -> str:
-    """Accessibility snapshot of the page: the structured view of what is on it.
+def browser_task_session_create(name: str) -> str:
+    """Create a durable browser task session that owns only its own tabs."""
+    return _text(call("createTaskSession", {"name": name}))
 
-    Prefer this over a screenshot for deciding what to click or read.
+
+def browser_task_session_navigate(
+    session_id: str,
+    url: str,
+    reuse: bool = True,
+    foreground: bool = False,
+) -> str:
+    """Open or reuse a tab owned by ``session_id`` without focusing it by default."""
+    return _text(call("navigateTaskSession", {
+        "sessionId": session_id,
+        "url": url,
+        "reuse": reuse,
+        "active": foreground,
+    }))
+
+
+def browser_task_session_list(session_id: Optional[str] = None) -> str:
+    """List task sessions and their owned tabs, or inspect one session."""
+    payload = {"sessionId": session_id} if session_id else {}
+    return _text(call("getTaskSessions", payload))
+
+
+def browser_task_session_close(session_id: str) -> str:
+    """Close only the tabs owned by ``session_id`` and remove the session."""
+    return _text(call("closeTaskSession", {"sessionId": session_id}))
+
+
+def browser_snapshot(
+    tab_id: Optional[int] = None,
+    compact: bool = True,
+    roles: Optional[list] = None,
+    name: Optional[str] = None,
+    limit: int = 50,
+) -> str:
+    """Filtered accessibility snapshot of what is on the page.
+
+    Compact output is the default to avoid huge accessibility dumps. Filter by
+    one or more ``roles`` and/or a case-insensitive accessible ``name``. Set
+    ``compact=False`` for node ids, descriptions, and accessibility properties.
     """
     tid = resolve_tab_id(tab_id)
-    return _text(call("observe", {"tabId": tid}))
+    payload = {"tabId": tid, "compact": compact, "limit": limit}
+    if roles:
+        payload["roles"] = roles
+    if name:
+        payload["name"] = name
+    return _text(call("observe", payload))
 
 
 def browser_extract_text(tab_id: Optional[int] = None, max_chars: int = 20000) -> str:
@@ -162,6 +206,25 @@ def browser_upload_file(
     expanded = _expand_existing_files(files)
     tid = resolve_tab_id(tab_id)
     return _text(call("uploadFile", {"tabId": tid, "selector": selector, "files": expanded}))
+
+
+def browser_github_attach_pr_body(
+    files: list,
+    tab_id: Optional[int] = None,
+    timeout_ms: int = 30000,
+) -> str:
+    """Attach local files to a GitHub PR body and save the edited body.
+
+    This narrow helper opens only the PR body's editor, uses GitHub's own
+    attachment component, waits for CDN links, and preserves existing text.
+    """
+    expanded = _expand_existing_files(files)
+    tid = resolve_tab_id(tab_id)
+    return _text(call("githubAttachPrBody", {
+        "tabId": tid,
+        "files": expanded,
+        "timeoutMs": timeout_ms,
+    }, read_timeout_ms=timeout_ms))
 
 def browser_set_cpu_throttling(rate: float, tab_id: Optional[int] = None) -> str:
     """Set CPU throttling rate for a tab; ``1`` disables throttling."""
@@ -286,6 +349,11 @@ def browser_confirm_action(action: str, confirmation_token: str, payload: Option
     return _text(call(action, payload or {}, confirmation_token=confirmation_token))
 
 
+def browser_confirm(confirmation_token: str) -> str:
+    """Resume the exact pending action stored for a host-issued token."""
+    return _text(call("confirm", {"confirmationToken": confirmation_token}))
+
+
 def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
     """Ask the host what its policy would decide for ``action``/``payload``.
 
@@ -366,6 +434,7 @@ def browser_wait_for_handoff(
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
     (browser_list_tabs, False, False),
+    (browser_task_session_list, False, False),
     (browser_snapshot, False, False),
     (browser_extract_text, False, False),
     (browser_screenshot, False, False),
@@ -375,6 +444,9 @@ _TOOLS = [
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
     (browser_navigate, True, False),
+    (browser_task_session_create, True, False),
+    (browser_task_session_navigate, True, False),
+    (browser_task_session_close, True, False),
     (browser_click, True, False),
     (browser_type, True, False),
     (browser_fill, True, False),
@@ -384,6 +456,7 @@ _TOOLS = [
     (browser_drag, True, False),
     (browser_select, True, False),
     (browser_upload_file, True, False),
+    (browser_github_attach_pr_body, True, False),
     (browser_set_cpu_throttling, True, False),
     (browser_set_network_conditions, True, False),
     (browser_clear_network_conditions, True, False),
@@ -393,6 +466,7 @@ _TOOLS = [
     (browser_wait_for_handoff, True, False),
     (browser_action, True, True),
     (browser_confirm_action, True, False),
+    (browser_confirm, True, False),
     (browser_lease, True, False),
     (browser_release, True, False),
     (browser_lease_status, False, False),

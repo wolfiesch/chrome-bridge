@@ -24,14 +24,20 @@ with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
 CASES = [
     (["ping"], 111),
     (["navigate", "https://example.com"], 111),
-    (["navigate", "https://example.com", "--background"], 111),
+    (["navigate", "https://example.com", "--foreground"], 111),
     (["getCookies", "example.com"], 111),
     (["executeScript", "1", "document.title"], 111),
     (["getTabs"], 111),
+    (["taskSession", "create", "research"], 111),
+    (["taskSession", "navigate", "session-1", "https://example.com"], 111),
+    (["taskSession", "show"], 111),
+    (["taskSession", "show", "session-1"], 111),
+    (["taskSession", "close", "session-1"], 111),
     (["executeScriptCDP", "1", "document.title"], 111),
     (["click", "1", "#submit"], 111),
     (["type", "1", "input[name=q]", "hello"], 111),
     (["observe", "1"], 111),
+    (["observe", "1", "--full", "--role", "button,link", "--name", "save", "--limit", "10"], 111),
     (["activateTab", "1"], 111),
     (["closeTab", "1"], 111),
     (["reload", "1"], 111),
@@ -43,7 +49,7 @@ CASES = [
     (["waitForUrl", "1", "github.com", "5000"], 111),
     (["getCurrentState", "1"], 111),
     (["screenshot", "1", "/tmp/chrome-bridge-shot.png"], 111),
-    (["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"], 111),
+    (["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--visible"], 111),
     (["extractText", "1", "2000"], 111),
     (["getHTML", "1", "/tmp/chrome-bridge-page.html"], 111),
     (["hover", "1", "#target"], 111),
@@ -58,6 +64,8 @@ CASES = [
     (["githubAttachUploadedFiles", "1", "input[type=file]", ".js-comment-form", "15000"], 111),
     (["githubSubmitComment", "1"], 111),
     (["githubSubmitComment", "1", ".js-comment-form", "15000"], 111),
+    (["github-attach-pr-body", "1", UPLOAD_FIXTURE], 111),
+    (["githubAttachPrBody", "1", UPLOAD_FIXTURE, "--timeout", "15000"], 111),
     (["setViewport", "1", "1280", "720", "1"], 111),
     (["startMonitoring", "1"], 111),
     (["stopMonitoring", "1"], 111),
@@ -78,6 +86,7 @@ CASES = [
     (["clearGeolocation", "1"], 111),
     (["performanceMetrics", "1"], 111),
     (["policy", "info"], 111),
+    (["confirm", "confirm-token"], 111),
     (["noSuchAction"], 64),
 ]
 
@@ -164,11 +173,52 @@ check(
 )
 check("waitForHandoff read_timeout_ms", result.get("read_timeout_ms"), 60000)
 
-result = dispatch(["navigate", "https://example.com", "--background"])
-check("background navigate payload", result.get("payload"), {"url": "https://example.com", "active": False})
+result = dispatch(["navigate", "https://example.com"])
+check("default navigate payload", result.get("payload"), {"url": "https://example.com", "active": False})
 
-result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--quiet"])
-check("quiet screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
+result = dispatch(["navigate", "https://example.com", "--foreground"])
+check("foreground navigate payload", result.get("payload"), {"url": "https://example.com", "active": True})
+
+result = dispatch(["taskSession", "create", "research"])
+check("task session create action", result.get("action"), "createTaskSession")
+check("task session create payload", result.get("payload"), {"name": "research"})
+
+result = dispatch(["taskSession", "navigate", "session-1", "https://example.com"])
+check("task session navigate action", result.get("action"), "navigateTaskSession")
+check("task session navigate payload", result.get("payload"), {
+    "sessionId": "session-1", "url": "https://example.com", "active": False, "reuse": True,
+})
+
+result = dispatch(["taskSession", "navigate", "session-1", "https://example.com", "--foreground", "--new"])
+check("task session foreground payload", result.get("payload"), {
+    "sessionId": "session-1", "url": "https://example.com", "active": True, "reuse": False,
+})
+
+result = dispatch(["taskSession", "show", "session-1"])
+check("task session show payload", result.get("payload"), {"sessionId": "session-1"})
+
+result = dispatch(["taskSession", "close", "session-1"])
+check("task session close action", result.get("action"), "closeTaskSession")
+check("task session close payload", result.get("payload"), {"sessionId": "session-1"})
+
+result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png"])
+check("default screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})
+
+result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png", "--visible"])
+check("visible screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": False})
+
+result = dispatch(["observe", "1"])
+check("default observe payload", result.get("payload"), {"tabId": 1, "compact": True, "limit": 50})
+
+result = dispatch(["observe", "1", "--full", "--role", "button,link", "--name", "save", "--limit", "10"])
+check("filtered observe payload", result.get("payload"), {
+    "tabId": 1, "compact": False, "limit": 10, "roles": ["button", "link"], "name": "save",
+})
+
+result = dispatch(["observe", "1", "--limit", "10", "--full"])
+check("observe option order payload", result.get("payload"), {
+    "tabId": 1, "compact": False, "limit": 10,
+})
 
 result = dispatch(["githubAttachUploadedFiles", "1", "input[type=file]", ".js-comment-form", "15000"])
 check("githubAttachUploadedFiles action", result.get("action"), "githubAttachUploadedFiles")
@@ -186,6 +236,33 @@ check("githubSubmitComment payload", result.get("payload"), {
     "formSelector": ".js-comment-form",
     "timeoutMs": 15000,
 })
+
+result = dispatch(["github-attach-pr-body", "1", UPLOAD_FIXTURE, "--timeout", "15000"])
+check("githubAttachPrBody action", result.get("action"), "githubAttachPrBody")
+check("githubAttachPrBody payload", result.get("payload"), {
+    "tabId": 1,
+    "files": [os.path.abspath(UPLOAD_FIXTURE)],
+    "timeoutMs": 15000,
+})
+check("githubAttachPrBody read timeout", result.get("read_timeout_ms"), None)
+
+result = dispatch(["confirm", "confirm-token"])
+check("token-only confirm action", result.get("action"), "confirm")
+check("token-only confirm payload", result.get("payload"), {"confirmationToken": "confirm-token"})
+
+result = dispatch(["confirm", "executeScript", "legacy-token", '{"tabId":1,"code":"1"}'])
+check("legacy confirm action", result.get("action"), "executeScript")
+check("legacy confirm token", result.get("confirmation_token"), "legacy-token")
+
+# Normal top-level and per-command help never contact the bridge.
+for help_args, needle in [
+    (["--help"], "Common commands:"),
+    (["help", "observe"], "--role"),
+    (["executeScript", "--help"], "chrome-bridge confirm <token>"),
+]:
+    proc = subprocess.run([CLIENT, *help_args], env=ENV, text=True, capture_output=True)
+    check(f"help {' '.join(help_args)} exit", proc.returncode, 0)
+    check(f"help {' '.join(help_args)} content", needle in proc.stdout, True)
 
 # --- policy subcommands: file edits and doctor work against local files using
 #     the paths the host reports via policyInfo (here a fake host). ---
