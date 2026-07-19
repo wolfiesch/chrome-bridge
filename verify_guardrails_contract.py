@@ -487,6 +487,24 @@ def run_against(label, cmd, env):
                f"{label}: confirmed executeScript should succeed, got {r}")
         expect("executeScript" in forwarded_actions(),
                f"{label}: confirmed executeScript should forward")
+        token_only_payload = {"tabId": 1, "code": "token-only"}
+        r = c.req("executeScript", token_only_payload)
+        token_only = (r or {}).get("confirmationToken")
+        expect((r or {}).get("resumeCommand") == f"chrome-bridge confirm {token_only}",
+               f"{label}: confirmation response should expose token-only resume command, got {r}")
+        # Resume through a different authenticated local identity, matching the
+        # real MCP-issued-token -> default-CLI confirmation flow.
+        c2 = Client("legacy-token")
+        r = c2.req("confirm", {"confirmationToken": token_only})
+        expect(r and r.get("success") is True,
+               f"{label}: cross-client token-only confirm should resume the original identity/action, got {r}")
+        before_invalid = len(forwarded_actions())
+        r = c2.req("confirm", {"confirmationToken": "not-a-real-token"})
+        expect(r and r.get("success") is False and "invalid or expired" in str(r.get("error", "")),
+               f"{label}: invalid token-only confirm must fail closed, got {r}")
+        expect(len(forwarded_actions()) == before_invalid,
+               f"{label}: invalid token-only confirm must not forward")
+        c2.close()
         r = c.req("executeScript", {"tabId": 1, "code": "2"}, confirmation_token=token)
         expect(r and r.get("confirmationRequired") is True and r.get("confirmationToken") != token,
                f"{label}: reused token with different payload should require fresh confirmation, got {r}")
@@ -494,7 +512,11 @@ def run_against(label, cmd, env):
         time.sleep(0.3)
         exec_events = [e for e in audit_events() if e["action"] == "executeScript"]
         decisions = [e["decision"] for e in exec_events]
-        expected_order = ["confirmation_required", "confirmation_accepted", "allow", "extension_success", "confirmation_required"]
+        expected_order = [
+            "confirmation_required", "confirmation_accepted", "allow", "extension_success",
+            "confirmation_required", "confirmation_accepted", "allow", "extension_success",
+            "confirmation_required",
+        ]
         expect(decisions == expected_order,
                f"{label}: confirmation audit order = {decisions}")
 

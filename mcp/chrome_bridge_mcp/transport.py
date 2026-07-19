@@ -9,6 +9,7 @@ import importlib.util
 import os
 import sys
 import threading
+import time
 
 # Repo root is the parent of the ``mcp/`` package directory.
 _REPO_ROOT = os.environ.get(
@@ -24,6 +25,13 @@ def _load_test_client():
             f"Cannot locate test_client.py at {path}. Set BRIDGE_REPO_ROOT to the "
             "chrome-native-bridge checkout."
         )
+    # ``test_client.py`` imports sibling helpers such as ``bridge_wake``. A
+    # packaged/uvx MCP launch does not naturally put the checkout root on
+    # sys.path (unlike invoking the CLI from the repo), which used to crash the
+    # MCP process at startup with ModuleNotFoundError while the CLI worked.
+    repo_root = os.path.realpath(_REPO_ROOT)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     spec = importlib.util.spec_from_file_location("chrome_bridge_test_client", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("chrome_bridge_test_client", module)
@@ -52,6 +60,16 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None):
         exit_code, response, stderr = _client.send_command_data(
             action, payload or {}, read_timeout_ms=read_timeout_ms,
             confirmation_token=confirmation_token)
+        # One reconnect attempt is safe only when TCP connection setup failed:
+        # exit 111 means the host never received the action. Never replay after
+        # an empty response or timeout because a mutating action may have run.
+        if exit_code == 111 and response is None:
+            delay_ms = float(os.environ.get("BRIDGE_MCP_RECONNECT_DELAY_MS", "100"))
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000)
+            exit_code, response, stderr = _client.send_command_data(
+                action, payload or {}, read_timeout_ms=read_timeout_ms,
+                confirmation_token=confirmation_token)
 
     if response is None:
         raise BridgeError(stderr or "No response from bridge.")

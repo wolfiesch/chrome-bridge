@@ -324,7 +324,7 @@ async function dispatchAction(action, payload) {
         result = await typeSelector(payload.tabId, payload.selector, payload.text);
         break;
       case "observe":
-        result = await observeTab(payload.tabId);
+        result = await observeTab(payload.tabId, payload);
         break;
       case "getCookies":
         result = await chrome.cookies.getAll({ domain: payload.domain });
@@ -391,6 +391,10 @@ async function dispatchAction(action, payload) {
         break;
       case "githubSubmitComment":
         result = await githubSubmitComment(payload.tabId, payload.formSelector, payload.timeoutMs);
+        break;
+      case "githubAttachPrBody":
+        result = await githubAttachPrBody(payload.tabId, payload.files, payload.timeoutMs);
+        if (result?.success === false) throw new Error(result.err || 'GitHub PR-body attachment failed');
         break;
       case "uploadFile":
         result = await uploadFile(payload.tabId, payload.selector, payload.files);
@@ -802,6 +806,11 @@ function parseLocatorToken(rawToken, rawLocator) {
     if (!text) throw new Error(`Missing label text in ${rawLocator}`);
     return { kind: "label", text };
   }
+  if (token.startsWith("aria=")) {
+    const name = token.slice("aria=".length).trim();
+    if (!name) throw new Error(`Missing accessible name in ${rawLocator}`);
+    return { kind: "aria", name };
+  }
   if (token.startsWith("role=")) {
     const roleSpec = token.slice("role=".length).trim();
     const match = roleSpec.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\[name=([^\]]+)\])?$/);
@@ -990,6 +999,13 @@ function locatorResolverSource() {
           controls.find((item) => labelText(item).includes(wanted) || normalize(item.getAttribute('aria-label')).includes(wanted) || byIdText(item.getAttribute('aria-labelledby')).includes(wanted) || normalize(item.getAttribute('placeholder')).includes(wanted));
         return el ? { success: true, el } : { success: false, err: 'No form control found for label ' + token.text };
       }
+      if (token.kind === 'aria') {
+        const wanted = normalize(token.name);
+        const matches = candidateElements(root);
+        const el = matches.find((item) => accessibleName(item) === wanted) ||
+          matches.find((item) => accessibleName(item).includes(wanted));
+        return el ? { success: true, el } : { success: false, err: 'No element found for accessible name ' + token.name };
+      }
       if (token.kind === 'role') {
         const name = normalize(token.name);
         const matches = candidateElements(root).filter((el) => (el.getAttribute('role') || implicitRole(el)) === token.role);
@@ -1052,7 +1068,13 @@ function domClickExpression(locator) {
     ${locatorResolverSource()}
     const resolved = resolveLocator(${JSON.stringify(locator)});
     if (!resolved.success) return resolved;
-    const el = resolved.el;
+    const matched = resolved.el;
+    const el = typeof matched.click === 'function'
+      ? matched
+      : matched.closest?.('button, a, input, select, textarea, [role]') || matched;
+    if (typeof el.click !== 'function') {
+      return { success: false, err: 'Matched element is not clickable' };
+    }
     el.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = el.getBoundingClientRect();
     const eventInit = {
@@ -1303,7 +1325,7 @@ async function waitForText(tabId, text, timeoutMs) {
 
 async function getCurrentState(tabId) {
   const tab = await chrome.tabs.get(tabId);
-  const observe = await observeTab(tabId);
+  const observe = await observeTab(tabId, { compact: true, limit: 50 });
   return {
     success: true,
     tab: {
@@ -1681,6 +1703,183 @@ async function githubSubmitComment(tabId, formSelector, timeoutMs) {
   });
 }
 
+function githubPrBodyEditorExpression(timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    const timeoutMs = ${JSON.stringify(timeoutMs || 30000)};
+    const deadline = Date.now() + timeoutMs;
+    const root = document.querySelector('.js-command-palette-pull-body');
+    if (!root) {
+      resolve({ success: false, err: 'No GitHub pull-request body container found' });
+      return;
+    }
+    const findEditor = () => {
+      const form = root.querySelector('form.js-comment-update');
+      const textarea = form && form.querySelector('textarea.js-comment-field');
+      const input = form && form.querySelector('file-attachment input[type="file"]');
+      const attachment = input && input.closest('file-attachment');
+      return form && textarea && input && attachment && form.offsetParent !== null
+        ? { form, textarea, input, attachment }
+        : null;
+    };
+    const waitForEditor = () => {
+      const editor = findEditor();
+      if (editor) {
+        resolve({ success: true });
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body editor' });
+        return;
+      }
+      setTimeout(waitForEditor, 200);
+    };
+    if (findEditor()) {
+      resolve({ success: true, alreadyOpen: true });
+      return;
+    }
+    const menu = root.querySelector('summary[aria-haspopup="menu"]');
+    if (!menu || !menu.querySelector('svg[aria-label="Show options"]')) {
+      resolve({ success: false, err: 'No GitHub pull-request body options menu found' });
+      return;
+    }
+    menu.click();
+    const waitForEdit = () => {
+      const editButtons = Array.from(root.querySelectorAll('button.js-comment-edit-button[aria-label="Edit comment"]'))
+        .filter((button) => button.offsetParent !== null);
+      if (editButtons.length === 1) {
+        editButtons[0].click();
+        waitForEditor();
+        return;
+      }
+      if (Date.now() > deadline) {
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body Edit action', matches: editButtons.length });
+        return;
+      }
+      setTimeout(waitForEdit, 200);
+    };
+    waitForEdit();
+  }))()`;
+}
+
+function githubPrBodyInputExpression() {
+  return `(() => {
+    const root = document.querySelector('.js-command-palette-pull-body');
+    const form = root && root.querySelector('form.js-comment-update');
+    const inputs = form && form.offsetParent !== null
+      ? Array.from(form.querySelectorAll('file-attachment input[type="file"]'))
+      : [];
+    if (inputs.length !== 1) throw new Error('Expected exactly one GitHub pull-request body file input');
+    return inputs[0];
+  })()`;
+}
+
+function githubPrBodyAttachAndSaveExpression(fileCount, timeoutMs) {
+  return `(() => new Promise((resolve) => {
+    const root = document.querySelector('.js-command-palette-pull-body');
+    const form = root && root.querySelector('form.js-comment-update');
+    const textarea = form && form.querySelector('textarea.js-comment-field');
+    const input = form && form.querySelector('file-attachment input[type="file"]');
+    const attachment = input && input.closest('file-attachment');
+    if (!form || !textarea || !input || !attachment || typeof attachment.attach !== 'function') {
+      resolve({ success: false, err: 'GitHub pull-request body attachment editor is incomplete' });
+      return;
+    }
+    if (!input.files || input.files.length !== ${JSON.stringify(fileCount)}) {
+      resolve({ success: false, err: 'GitHub pull-request body file input did not receive every requested file', files: input.files ? input.files.length : 0 });
+      return;
+    }
+    const assetPattern = /https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9._-]+/g;
+    const before = new Set((textarea.value || '').match(assetPattern) || []);
+    const timeoutMs = ${JSON.stringify(timeoutMs || 30000)};
+    const deadline = Date.now() + timeoutMs;
+    let settled = false;
+    Promise.resolve(attachment.attach(input.files)).catch((error) => {
+      if (!settled) {
+        settled = true;
+        resolve({ success: false, err: String(error && error.message || error) });
+      }
+    });
+    const poll = () => {
+      if (settled) return;
+      const value = textarea.value || '';
+      const assets = Array.from(new Set(value.match(assetPattern) || []));
+      const addedAssets = assets.filter((asset) => !before.has(asset));
+      const uploading = /Uploading/i.test(value);
+      if (!uploading && addedAssets.length >= ${JSON.stringify(fileCount)}) {
+        const submitButtons = Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]'))
+          .filter((button) => !button.disabled && button.offsetParent !== null)
+          .map((button) => ({ button, text: ((button.innerText || button.value || button.textContent || '').trim().replace(/\\s+/g, ' ')) }))
+          .filter(({ text }) => text === 'Update comment' || text === 'Save');
+        if (submitButtons.length !== 1) {
+          settled = true;
+          resolve({ success: false, err: 'Expected exactly one GitHub pull-request body save button', labels: submitButtons.map(({ text }) => text), addedAssets });
+          return;
+        }
+        submitButtons[0].button.click();
+        const label = submitButtons[0].text;
+        const waitForSave = () => {
+          const editorVisible = form.querySelector('textarea.js-comment-field') && form.offsetParent !== null;
+          if (!editorVisible) {
+            settled = true;
+            resolve({ success: true, files: ${JSON.stringify(fileCount)}, assets: addedAssets, saved: true, label });
+            return;
+          }
+          if (Date.now() > deadline) {
+            settled = true;
+            resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body save', files: ${JSON.stringify(fileCount)}, assets: addedAssets });
+            return;
+          }
+          setTimeout(waitForSave, 200);
+        };
+        waitForSave();
+        return;
+      }
+      if (Date.now() > deadline) {
+        settled = true;
+        resolve({ success: false, err: 'Timed out waiting for GitHub pull-request body attachment markdown', files: ${JSON.stringify(fileCount)}, addedAssets, uploading });
+        return;
+      }
+      setTimeout(poll, 250);
+    };
+    poll();
+  }))()`;
+}
+
+async function githubAttachPrBody(tabId, files, timeoutMs) {
+  const gate = await assertGitHubTab(tabId);
+  if (gate.success === false) return gate;
+  let path = null;
+  try {
+    path = new URL(gate.url).pathname;
+  } catch (error) {
+    path = null;
+  }
+  if (!path || !/^\/[^/]+\/[^/]+\/pull\/\d+(?:\/|$)/.test(path)) {
+    return { success: false, err: 'GitHub PR-body attachment requires a /owner/repo/pull/number page', path };
+  }
+  if (!Array.isArray(files) || files.length === 0) {
+    return { success: false, err: 'At least one attachment file is required' };
+  }
+  return withDebugger(tabId, async (target) => {
+    const opened = await evaluateInContext(target, githubPrBodyEditorExpression(timeoutMs), null);
+    const openedValue = opened.val || opened;
+    if (!opened.success || openedValue.success === false) return openedValue;
+
+    const evaluated = await debuggerCommand(target, 'Runtime.evaluate', {
+      expression: githubPrBodyInputExpression(),
+      awaitPromise: true,
+      returnByValue: false,
+      allowUnsafeEvalBlockedByCSP: true
+    });
+    if (evaluated.exceptionDetails || !evaluated.result?.objectId) {
+      return { success: false, err: evaluated.exceptionDetails?.exception?.description || evaluated.exceptionDetails?.text || 'No GitHub pull-request body file input object found' };
+    }
+    await debuggerCommand(target, 'DOM.setFileInputFiles', { objectId: evaluated.result.objectId, files });
+    const attached = await evaluateInContext(target, githubPrBodyAttachAndSaveExpression(files.length, timeoutMs), null);
+    return attached.val || attached;
+  });
+}
+
 async function uploadFile(tabId, selector, files) {
   return withDebugger(tabId, async (target) => {
     let locator;
@@ -1774,19 +1973,42 @@ async function setUserAgent(tabId, userAgent) {
   });
 }
 
-async function observeTab(tabId) {
+async function observeTab(tabId, options = {}) {
   return withDebugger(tabId, async (target) => {
     const ax = await debuggerCommand(target, 'Accessibility.getFullAXTree', {});
-    const nodes = (ax.nodes || []).filter((node) => !node.ignored).slice(0, 250);
-    return nodes.map((node) => ({
-      nodeId: node.nodeId,
-      backendDOMNodeId: node.backendDOMNodeId || null,
-      role: node.role?.value || null,
-      name: node.name?.value || '',
-      value: node.value?.value || null,
-      description: node.description?.value || null,
-      properties: Object.fromEntries((node.properties || []).map((prop) => [prop.name, prop.value?.value ?? prop.value?.description ?? null]))
-    }));
+    const compact = options.compact === true;
+    const requestedRoles = Array.isArray(options.roles)
+      ? new Set(options.roles.map((role) => String(role || '').toLowerCase()).filter(Boolean))
+      : null;
+    const requestedName = String(options.name || '').trim().toLowerCase();
+    const rawLimit = Number(options.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : (compact ? 50 : 250);
+    let nodes = (ax.nodes || []).filter((node) => !node.ignored);
+    if (requestedRoles && requestedRoles.size) {
+      nodes = nodes.filter((node) => requestedRoles.has(String(node.role?.value || '').toLowerCase()));
+    }
+    if (requestedName) {
+      nodes = nodes.filter((node) => String(node.name?.value || '').toLowerCase().includes(requestedName));
+    }
+    if (compact) {
+      const usefulRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'menuitem', 'tab', 'heading', 'img']);
+      nodes = nodes.filter((node) => usefulRoles.has(String(node.role?.value || '').toLowerCase()) || node.name?.value || node.value?.value);
+    }
+    return nodes.slice(0, limit).map((node) => {
+      const basic = {
+        role: node.role?.value || null,
+        name: node.name?.value || '',
+      };
+      if (node.value?.value != null) basic.value = node.value.value;
+      if (compact) return basic;
+      return {
+        nodeId: node.nodeId,
+        backendDOMNodeId: node.backendDOMNodeId || null,
+        ...basic,
+        description: node.description?.value || null,
+        properties: Object.fromEntries((node.properties || []).map((prop) => [prop.name, prop.value?.value ?? prop.value?.description ?? null]))
+      };
+    });
   });
 }
 

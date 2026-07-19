@@ -138,6 +138,7 @@ tail -f bridge_debug.log
 Run `python3 scripts/diagnose_install.py` for a read-only comparison of repository and deployed files plus broker/backend connection state. It never launches Chrome or opens a tab.
 
 - `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the native connection is down. Routine retries never open Chrome or create a tab. Open Chrome normally, then inspect the extension service worker and `bridge_debug.log`.
+- MCP says `server not connected` while `chrome-bridge ping` works: update to a build containing the packaged-startup path fix, then restart the MCP client once so it launches the corrected server. The MCP package now adds `BRIDGE_REPO_ROOT` before importing repo-local helpers and retries one safe pre-send connection failure automatically; a separate `PYTHONPATH` entry is no longer required.
 - `Connection refused` in broker mode: launchd broker is not loaded. Run `launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker`.
 - `broker backend unavailable: native host did not start`: broker is up, but Chrome, the extension, or the native host did not connect within `BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS`. The broker returns `status: browser_unavailable` without opening Chrome. Reload the extension and check `broker_debug.log` plus `bridge_debug.log`.
 - `FATAL: could not bind 127.0.0.1:9223`: two direct-mode bridge extensions are enabled, or direct mode is racing the broker.

@@ -193,6 +193,10 @@ type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 struct Confirmation {
     fingerprint: String,
     expires_at: u128,
+    client: String,
+    action: String,
+    payload: Value,
+    targets: Vec<String>,
 }
 
 type Confirmations = Arc<Mutex<HashMap<String, Confirmation>>>;
@@ -307,9 +311,32 @@ fn issue_confirmation(
     let fingerprint = confirmation_fingerprint(client, action, payload, targets);
     if let Ok(mut map) = confirmations.lock() {
         prune_confirmations_locked(&mut map, now_ms());
-        map.insert(token.clone(), Confirmation { fingerprint, expires_at });
+        map.insert(token.clone(), Confirmation {
+            fingerprint,
+            expires_at,
+            client: client.to_string(),
+            action: action.to_string(),
+            payload: payload.clone(),
+            targets: targets.to_vec(),
+        });
     }
     (token, expires_at)
+}
+
+fn resume_confirmation(
+    confirmations: &Confirmations,
+    token: Option<&str>,
+) -> Option<(String, String, Value)> {
+    let token = token.filter(|t| !t.is_empty())?;
+    if let Ok(mut map) = confirmations.lock() {
+        prune_confirmations_locked(&mut map, now_ms());
+        let entry = map.get(token)?;
+        // Keep these fields in the pending entry so the normal fingerprint
+        // check still binds token/client/action/payload/live targets.
+        let _targets = &entry.targets;
+        return Some((entry.client.clone(), entry.action.clone(), entry.payload.clone()));
+    }
+    None
 }
 
 fn consume_confirmation(
@@ -1387,7 +1414,7 @@ fn handle_socket_client(
             .get("token")
             .and_then(|t| t.as_str())
             .and_then(|t| resolve_client(tokens, host_dir, logger, t));
-        let client_name = match client_name {
+        let mut client_name = match client_name {
             Some(name) => name,
             None => {
                 log_warn(logger, "Rejected unauthenticated/invalid-token request.");
@@ -1397,7 +1424,7 @@ fn handle_socket_client(
         };
 
         // Never forward secrets or host-only confirmation fields to the extension.
-        let confirmation_token = if let Value::Object(map) = &mut cmd {
+        let mut confirmation_token = if let Value::Object(map) = &mut cmd {
             map.remove("token");
             map.remove("confirmationToken")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -1405,8 +1432,44 @@ fn handle_socket_client(
             None
         };
 
-        let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
-        let payload = cmd.get("payload").cloned();
+        let mut action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        let mut payload = cmd.get("payload").cloned();
+
+        // Token-only confirmation resume. Recover the exact short-lived action
+        // and payload, then run the complete policy/origin/lease/confirmation
+        // path again. The token is not consumed until just before forwarding.
+        if action == "confirm" {
+            let resume_token = payload
+                .as_ref()
+                .and_then(|p| p.get("confirmationToken"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match resume_confirmation(confirmations, resume_token.as_deref()) {
+                Some((resumed_client, resumed_action, resumed_payload)) => {
+                    let requester_name = client_name.clone();
+                    confirmation_token = resume_token;
+                    client_name = resumed_client;
+                    action = resumed_action;
+                    payload = Some(resumed_payload.clone());
+                    cmd = json!({"action": action, "payload": resumed_payload});
+                    let policy_value = current_policy(policy, host_dir, logger);
+                    let cp = policy_for_client(&policy_value, &requester_name);
+                    let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+                    audit(host_dir, logger, audit_enabled, &requester_name, "confirm", &[], "confirmation_resume", None, None);
+                }
+                None => {
+                    let policy_value = current_policy(policy, host_dir, logger);
+                    let cp = policy_for_client(&policy_value, &client_name);
+                    let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+                    audit(host_dir, logger, audit_enabled, &client_name, "confirm", &[], "confirmation_deny", Some("invalid or expired confirmation token"), None);
+                    let _ = write_line(&mut stream, &json!({
+                        "success": false,
+                        "error": "invalid or expired confirmation token"
+                    }));
+                    continue;
+                }
+            }
+        }
 
         // Reserved host-internal actions (e.g. __tabOrigin) are never reachable
         // from socket clients; reject as unknown so the internal surface cannot
@@ -1585,7 +1648,8 @@ fn handle_socket_client(
                     "action": action,
                     "targets": targets,
                     "confirmationToken": token,
-                    "expiresAt": expires_at
+                    "expiresAt": expires_at,
+                    "resumeCommand": format!("chrome-bridge confirm {}", token)
                 }));
                 continue;
             }

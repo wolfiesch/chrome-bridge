@@ -12,6 +12,7 @@ import time
 import re
 import fnmatch
 import hashlib
+import copy
 import shlex
 import subprocess
 from urllib.parse import urlparse
@@ -150,8 +151,34 @@ def issue_confirmation(name, action, payload, targets):
         _pending_confirmations[token] = {
             "fingerprint": fingerprint,
             "expires_at": expires_at,
+            "client": name,
+            "action": action,
+            "payload": copy.deepcopy(payload),
+            "targets": list(targets),
         }
     return token, expires_at
+
+
+def resume_confirmation(token):
+    """Return the pending action for a token without consuming it.
+
+    The token carries the authority to resume across authenticated local bridge
+    identities (for example MCP -> CLI). The original identity is restored, the
+    normal policy/origin/lease path runs again, and the fingerprint-bound
+    consume step removes the token only immediately before forwarding.
+    """
+    if not isinstance(token, str) or not token:
+        return None
+    with _confirmation_lock:
+        _prune_confirmations_locked()
+        entry = _pending_confirmations.get(token)
+        if not entry:
+            return None
+        return {
+            "client": entry.get("client"),
+            "action": entry.get("action"),
+            "payload": copy.deepcopy(entry.get("payload") or {}),
+        }
 
 
 def consume_confirmation(token, name, action, payload, targets):
@@ -1029,6 +1056,32 @@ def handle_socket_client(client_socket):
 
             action = cmd.get("action")
 
+            # Token-only confirmation resume. The host keeps the original
+            # action/payload for the short token TTL, then sends it through the
+            # full policy, live-origin, lease, and confirmation checks again.
+            # This lets CLI/MCP users resume safely without reconstructing JSON.
+            if action == 'confirm':
+                resume_payload = cmd.get("payload") or {}
+                resume_token = resume_payload.get("confirmationToken")
+                resumed = resume_confirmation(resume_token)
+                if resumed is None:
+                    policy = current_policy()
+                    audit_enabled = policy_for_client(policy, name).get('audit', True)
+                    _audit(audit_enabled, name, "confirm", [], "confirmation_deny", "invalid or expired confirmation token", None)
+                    client_socket.sendall((json.dumps({
+                        "success": False,
+                        "error": "invalid or expired confirmation token",
+                    }) + "\n").encode('utf-8'))
+                    continue
+                confirmation_token = resume_token
+                requester_name = name
+                name = resumed["client"]
+                action = resumed["action"]
+                cmd = {"action": action, "payload": resumed["payload"]}
+                policy = current_policy()
+                audit_enabled = policy_for_client(policy, requester_name).get('audit', True)
+                _audit(audit_enabled, requester_name, "confirm", [], "confirmation_resume", None, None)
+
             # Reserved host-internal actions (e.g. __tabOrigin) are never
             # reachable from socket clients; reject them as unknown so the
             # internal surface cannot be driven or probed externally.
@@ -1193,6 +1246,7 @@ def handle_socket_client(client_socket):
                         "targets": targets,
                         "confirmationToken": token,
                         "expiresAt": expires_at,
+                        "resumeCommand": f"chrome-bridge confirm {token}",
                     }) + "\n").encode('utf-8'))
                     continue
 

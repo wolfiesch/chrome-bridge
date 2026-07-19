@@ -82,9 +82,9 @@ Full instructions: [setup](docs/setup.md) and [MCP registration](docs/mcp.md).
 
 | Category | What you get |
 |---|---|
-| **Real profile** | Navigation, tabs, waits, scrolling, screenshots, extraction, forms, uploads, keyboard/pointer, viewport, emulation, downloads, storage, geolocation, diagnostics |
+| **Real profile** | Navigation, tabs, filtered accessibility views, semantic selectors, screenshots, forms, uploads, a one-command GitHub PR-body attachment helper, viewport, emulation, downloads, storage, geolocation, diagnostics |
 | **Background-safe** | Inactive-tab navigation, CDP screenshots without tab selection, connection checks that never launch Chrome or open wake tabs |
-| **Governance** | Fail-closed `bridge_policy.json`, origin-aware action policy, deny/allow lists, confirmation tokens, optional local origin-approval prompt |
+| **Governance** | Fail-closed `bridge_policy.json`, origin-aware action policy, deny/allow lists, resumable confirmation tokens (`chrome-bridge confirm <token>`), optional local origin-approval prompt |
 | **Audit & redaction** | Action/client/target/decision/reason/request-ID audit log; cookie, storage-state, and policy-defined page-content redaction; `sessionStatus` redacted auth probe |
 | **Human handoff** | `waitForHandoff` focuses the real tab, shows an instruction banner, and waits for login/2FA/captcha before resuming |
 | **Multi-agent** | Named per-client tokens, cooperative leasing, task-owned tab groups that never touch unrelated human tabs |

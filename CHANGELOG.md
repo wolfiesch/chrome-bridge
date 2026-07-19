@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed packaged MCP startup so repo-local CLI helpers load without a manual `PYTHONPATH`, and added one safe reconnect attempt when TCP connection setup fails before an action is sent.
+- Added token-only confirmation resume through `chrome-bridge confirm <token>` and MCP `browser_confirm`; confirmation responses now include the exact resume command.
+- Added `chrome-bridge github-attach-pr-body <tabId> <files...>` and MCP `browser_github_attach_pr_body` to open a PR body editor, upload through GitHub's attachment component, wait for CDN links, and save.
+- Added normal top-level/per-command CLI help, compact and filtered `observe`, and `aria=<accessible-name>` selectors alongside existing `text=`, `label=`, and `role=` selectors.
 - Added durable task sessions with owned tabs, named Chrome tab groups, safe session cleanup, CLI commands, and typed MCP tools.
 - Added a machine-readable background reliability harness that detects active-tab changes, frontmost-app changes, unexpected tabs, and owned tabs becoming active.
 - Routine CLI and broker retries no longer open a visible extension wake tab when the native backend is unavailable.

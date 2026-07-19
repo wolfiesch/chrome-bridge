@@ -13,8 +13,10 @@ chrome-bridge getTabs
 chrome-bridge getCookies <domain>
 chrome-bridge executeScript <tabId> <code>
 chrome-bridge executeScriptCDP <tabId> <code>
-chrome-bridge observe <tabId>
+chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]
 ```
+
+`observe` now prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. Use `--full` only when node IDs, descriptions, and detailed accessibility properties are needed.
 
 ### Navigation and tabs
 
@@ -74,11 +76,14 @@ chrome-bridge select <tabId> <selector> <value>
 chrome-bridge uploadFile <tabId> <selector> <path...>
 chrome-bridge githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]
 chrome-bridge githubSubmitComment <tabId> [formSelector] [timeoutMs]
+chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]
 ```
 
-`type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, and `uploadFile` accept plain CSS plus semantic selector prefixes: `css=<selector>`, `label=<text>`, `text=<text>`, and `role=<role>[name=<accessible-name>]`. Use `<host> >>> <shadow-selector>` for open shadow DOM and `frame=<iframe-selector> >> <target-selector>` for iframe targets; these forms also work for `<select>` elements and file inputs. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
+`type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, and `uploadFile` accept plain CSS plus semantic selector prefixes: `css=<selector>`, `text=<visible-text>`, `aria=<accessible-name>`, `label=<form-label>`, and `role=<role>[name=<accessible-name>]`. For example, `chrome-bridge click 123 'aria=Show options'` or `chrome-bridge click 123 'role=button[name=Save]'` avoids guessing GitHub-specific CSS. Use `<host> >>> <shadow-selector>` for open shadow DOM and `frame=<iframe-selector> >> <target-selector>` for iframe targets; these forms also work for `<select>` elements and file inputs. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
 
 For GitHub comments, use `uploadFile` first, then `githubAttachUploadedFiles` to call GitHub's `<file-attachment>` component without opening arbitrary `executeScript*` access. Use `githubSubmitComment` instead of a broad submit-button click on draft PRs; it only clicks an exact `Comment` or `Add comment` button and refuses `Close with comment`. Both GitHub-specific actions also verify the target tab is on `https://github.com`.
+
+For a pull-request description, prefer `github-attach-pr-body`. It performs the whole narrow workflow: verifies a `/owner/repo/pull/number` GitHub page, opens only the PR body's options menu and edit form, sets the requested local files, calls GitHub's own attachment component, waits for new `user-attachments` CDN URLs, and clicks the one exact `Update comment`/`Save` button inside that form. Existing body text is preserved. Missing files fail locally before Chrome is contacted.
 
 ### Viewport
 
@@ -125,6 +130,14 @@ chrome-bridge policy allow-origin <pattern> [client]
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
 `policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time.
+
+When an action such as `executeScript` is confirmation-gated, the response includes a one-use token and `resumeCommand`. Resume without rebuilding the original JSON:
+
+```bash
+chrome-bridge confirm <confirmationToken>
+```
+
+The host stores the exact original client identity, action, and payload only for the short confirmation lifetime (60 seconds by default). This lets the normal CLI resume a token produced by MCP while still re-running the original client's policy, live-origin, lease, and confirmation checks before forwarding. The older `confirm <action> <token> <payloadJson>` form remains compatible but is no longer necessary.
 
 The `policy` subcommands let an agent self-service policy when an action is denied. `policy info` asks the host for the active `bridge_policy.json` / audit-log paths (always answerable, even under a deny-all policy, and it never returns policy contents over the wire). `policy show` prints the local policy file; `policy doctor` reads recent deny events from the audit log and proposes the precise fix for each: a `policy allow-action`/`policy allow-origin` command when an item is missing from an allow-list (`not allowed`), or a manual deny-list edit when a deny-list pattern matched (`denied`, which a grant cannot override). `policy allow-action`/`policy allow-origin` edit the policy file in place (mode `600`); with no client argument they edit the section the host says governs this client, and an explicitly named client always edits its own `clients.<name>` section so a new name never silently broadens the shared `default`. Every deny response also carries a structured `policyDenial` companion (`kind`, `suggestedPatch`, `policyFile`, `batchStep`) alongside the byte-stable `policy denied: <reason>` error string.
 
