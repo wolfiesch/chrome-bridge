@@ -148,6 +148,16 @@ def add_extension_zip(repo_root: Path, dist_dir: Path, version: str) -> Path:
         archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=False) + "\n")
         archive.write(repo_root / "wake.html", "wake.html")
         archive.write(repo_root / "wake.js", "wake.js")
+        archive.write(repo_root / "popup.html", "popup.html")
+        archive.write(repo_root / "popup.css", "popup.css")
+        archive.write(repo_root / "popup.js", "popup.js")
+        for relative in (
+            "icons/icon-16.png",
+            "icons/icon-32.png",
+            "icons/icon-48.png",
+            "icons/icon-128.png",
+        ):
+            archive.write(repo_root / relative, relative)
     return extension_zip
 
 

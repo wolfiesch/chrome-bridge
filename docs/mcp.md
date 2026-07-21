@@ -29,7 +29,7 @@ Sensitive:
 Mutating:
 
 - `browser_navigate`
-- `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_close`
+- `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_state`, `browser_task_session_close`
 - `browser_click`, `browser_type`, `browser_fill`, `browser_hover`
 - `browser_scroll`, `browser_press`, `browser_drag`
 - `browser_select`
@@ -37,7 +37,7 @@ Mutating:
 - `browser_github_attach_pr_body` (opens only the GitHub PR-body editor, attaches files, waits for CDN URLs, and saves)
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
 - `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
-- `browser_wait_for_handoff` - pause automation, focus the real tab with an on-page banner, and wait for a human to finish login/2FA/captcha before resuming
+- `browser_wait_for_handoff` - pause automation, mark the task group as needing review, focus the real tab with a compact bottom card, and wait for a human to finish login/2FA/captcha before resuming
 - `browser_confirm_action` - resend an action with a host-issued confirmation token
 - `browser_confirm` - resume the exact pending action from only its host-issued token
 

@@ -37,6 +37,7 @@ chrome-bridge taskSession create "GPU research"
 chrome-bridge taskSession navigate <sessionId> <url>
 chrome-bridge taskSession navigate <sessionId> <url> --new
 chrome-bridge taskSession show [sessionId]
+chrome-bridge taskSession state <sessionId> <working|needs_user|completed>
 chrome-bridge taskSession close <sessionId>
 ```
 
@@ -156,7 +157,7 @@ chrome-bridge waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] 
 
 `sessionStatus` is a **redacted auth probe**: for each domain it reports cookie count, cookie *names* (never values), whether a session/auth cookie is present, and a `loggedIn` boolean - enough to decide "is this profile already signed in to X?" without exposing secrets. Treat its output as sensitive: cookie names plus logged-in status can reveal which accounts and sites the profile uses.
 
-`waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, shows an in-page banner with your `message`, and blocks until the page reaches an expected state, then resumes the agent. Use it for interactive steps an agent should not perform - login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting.
+`waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, changes its task-group label to `↗ Review needed`, shows a compact bottom card with your `message`, and blocks until the page reaches an expected state. It then restores the previous task state and resumes the agent. Use it for interactive steps an agent should not perform - login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting.
 
 ## Raw-output safety
 

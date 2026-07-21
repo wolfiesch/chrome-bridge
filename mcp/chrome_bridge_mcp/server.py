@@ -86,6 +86,13 @@ def browser_task_session_list(session_id: Optional[str] = None) -> str:
     return _text(call("getTaskSessions", payload))
 
 
+def browser_task_session_state(session_id: str, state: str) -> str:
+    """Set a task-group state: working, needs_user, or completed."""
+    if state not in {"working", "needs_user", "completed"}:
+        raise ValueError("state must be working, needs_user, or completed")
+    return _text(call("updateTaskSessionState", {"sessionId": session_id, "state": state}))
+
+
 def browser_task_session_close(session_id: str) -> str:
     """Close only the tabs owned by ``session_id`` and remove the session."""
     return _text(call("closeTaskSession", {"sessionId": session_id}))
@@ -446,6 +453,7 @@ _TOOLS = [
     (browser_navigate, True, False),
     (browser_task_session_create, True, False),
     (browser_task_session_navigate, True, False),
+    (browser_task_session_state, True, False),
     (browser_task_session_close, True, False),
     (browser_click, True, False),
     (browser_type, True, False),

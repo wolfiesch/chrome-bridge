@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { pathToFileURL } from 'node:url';
 
 const BACKGROUND = new URL('./background.js', import.meta.url);
 const SESSION_KEY = 'chromeBridgeTaskSessions';
@@ -14,9 +15,12 @@ async function flush(count = 6) {
   for (let index = 0; index < count; index += 1) await Promise.resolve();
 }
 
-function createHarness({ sessions = {}, tabs = {} } = {}) {
+export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {}) {
   const listeners = { detach: null, removed: null };
-  const localState = { [SESSION_KEY]: clone(sessions) };
+  const localState = {
+    [SESSION_KEY]: clone(sessions),
+    chromeBridgePreferences: { showAgentPointer: true, ...clone(preferences) },
+  };
   const tabState = new Map(Object.entries(tabs).map(([id, tab]) => [Number(id), { id: Number(id), ...clone(tab) }]));
   const attachedTabs = new Set();
   const heldTabGets = new Map();
@@ -30,6 +34,8 @@ function createHarness({ sessions = {}, tabs = {} } = {}) {
     attachCalls: 0,
     detachCalls: 0,
     commandMethods: [],
+    scriptCalls: [],
+    tabGroupUpdates: [],
     delayDetach: false,
     detachEventAfterCallback: false,
     failNextDetach: false,
@@ -144,7 +150,10 @@ function createHarness({ sessions = {}, tabs = {} } = {}) {
       },
     },
     scripting: {
-      async executeScript() { return clone(controller.scriptResult); },
+      async executeScript(options) {
+        controller.scriptCalls.push(options);
+        return clone(controller.scriptResult);
+      },
     },
     tabs: {
       onRemoved: { addListener(listener) { listeners.removed = listener; } },
@@ -184,8 +193,15 @@ function createHarness({ sessions = {}, tabs = {} } = {}) {
       },
       async reload() {},
     },
-    tabGroups: { async update() {} },
-    windows: { async update() {} },
+    tabGroups: {
+      async update(groupId, options) {
+        controller.tabGroupUpdates.push({ groupId, options: clone(options) });
+      },
+    },
+    windows: {
+      async get(windowId) { return { id: windowId, focused: windowId === 1 }; },
+      async update() {},
+    },
     cookies: { async getAll() { return []; } },
     downloads: { async download() { return 1; } },
     contentSettings: { location: { async set() {} } },
@@ -217,6 +233,15 @@ function createHarness({ sessions = {}, tabs = {} } = {}) {
       startMonitoring,
       stopMonitoring,
       loadTaskSessions,
+      createTaskSession,
+      navigateTaskSession,
+      updateTaskSessionState,
+      taskGroupColor,
+      taskGroupTitle,
+      getBridgeStatus,
+      setBridgePreference,
+      showAgentPointer,
+      showHandoffOverlay,
       debuggerStates: typeof taskDebuggerStates === 'undefined' ? taskDebuggers : taskDebuggerStates,
     };
   `;
@@ -396,8 +421,10 @@ const tests = [
   testCloseDoesNotRemoveTabMovedToAnotherGroup,
 ];
 
-for (const test of tests) {
-  await test();
-  process.stdout.write(`PASS ${test.name}\n`);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  for (const test of tests) {
+    await test();
+    process.stdout.write(`PASS ${test.name}\n`);
+  }
+  process.stdout.write('Quiet debugger behavioral contract OK\n');
 }
-process.stdout.write('Quiet debugger behavioral contract OK\n');

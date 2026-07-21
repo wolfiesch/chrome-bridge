@@ -555,8 +555,8 @@ COMMAND_HELP = {
         "On a GitHub pull-request page, open the body editor, attach the files, wait for GitHub CDN links, and save without replacing existing text.",
     ),
     "taskSession": (
-        "chrome-bridge taskSession create|navigate|show|close ...",
-        "Create and manage tabs owned by one task. Navigation stays in the background unless --foreground is given.",
+        "chrome-bridge taskSession create|navigate|show|state|close ...",
+        "Create and manage tabs owned by one task. Set state to working, needs_user, or completed.",
     ),
     "policy": (
         "chrome-bridge policy info|show|doctor|allow-action|allow-origin ...",
@@ -666,7 +666,7 @@ def main():
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
     elif action == "taskSession":
-        require_args(args, 3, "Usage: python3 test_client.py taskSession create|navigate|show|close ...")
+        require_args(args, 3, "Usage: python3 test_client.py taskSession create|navigate|show|state|close ...")
         op = args[2]
         if op == "create":
             require_args(args, 4, "Usage: python3 test_client.py taskSession create <name>")
@@ -683,6 +683,13 @@ def main():
         if op == "show":
             payload = {"sessionId": args[3]} if len(args) > 3 else {}
             sys.exit(send_command("getTaskSessions", payload))
+        if op == "state":
+            require_args(args, 5, "Usage: python3 test_client.py taskSession state <sessionId> <working|needs_user|completed>")
+            state = args[4]
+            if state not in {"working", "needs_user", "completed"}:
+                print("state must be working, needs_user, or completed", file=sys.stderr)
+                sys.exit(64)
+            sys.exit(send_command("updateTaskSessionState", {"sessionId": args[3], "state": state}))
         if op == "close":
             require_args(args, 4, "Usage: python3 test_client.py taskSession close <sessionId>")
             sys.exit(send_command("closeTaskSession", {"sessionId": args[3]}))
