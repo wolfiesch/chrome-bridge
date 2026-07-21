@@ -10,6 +10,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_task_session_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_quiet_debugger_contract.py
+node verify_quiet_debugger_behavior.mjs
 PYTHONDONTWRITEBYTECODE=1 ./verify_github_attachment_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py

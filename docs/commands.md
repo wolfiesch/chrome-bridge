@@ -16,7 +16,7 @@ chrome-bridge executeScriptCDP <tabId> <code>
 chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]
 ```
 
-`observe` now prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. These compact snapshots, text extraction, HTML capture, and text waits run through normal extension page access, without attaching Chrome's debugger. Use `--full` only when node IDs, descriptions, and detailed accessibility properties are needed; that detailed view does attach the debugger.
+`observe` prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. Both compact and full snapshots use Chrome's real accessibility tree, so both attach Chrome's debugger. `--full` also includes node IDs, descriptions, and detailed accessibility properties. Text extraction, HTML capture, and text waits use normal extension page access and do not attach the debugger.
 
 ### Navigation and tabs
 
@@ -43,6 +43,8 @@ chrome-bridge taskSession close <sessionId>
 Use `--foreground` only when the user intentionally needs to see the session tab. Prefer task sessions over omitted tab IDs so a human tab change cannot redirect the agent.
 
 The tab group is an ownership boundary, not a place where Chrome can hide its debugger notice. Chrome shows that notice across the browser whenever any extension debugger is attached. On task-owned tabs, the bridge reuses one debugger connection for debugger-backed actions during the active burst and detaches after 30 seconds idle. This prevents the notice from repeatedly opening and closing between nearby actions. A tab manually moved into the task's Chrome group is also treated as task-owned. Commands on unrelated tabs keep the older one-command connection behavior for compatibility and may still re-trigger the notice.
+
+The extension requires Chrome 118 or newer because its 30-second idle timer relies on service-worker timers supported from that version onward.
 
 ### Waits
 

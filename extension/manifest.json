@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Chrome Native Messaging Automation Bridge",
   "version": "1.0.1",
+  "minimum_chrome_version": "118",
   "description": "Trusted-local Chrome automation bridge over native messaging.",
   "permissions": [
     "nativeMessaging",
