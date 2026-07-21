@@ -16,7 +16,7 @@ Claude Desktop/Code can already use MCP tools, but many real web workflows depen
 
 The important part is not just "Claude can click my browser." The host is the enforcement boundary. The API is localhost-only and token-gated. The default host posture is fail-closed unless local policy opts into actions/origins. Tab-scoped actions are checked against the live tab origin before forwarding. Policy can require confirmation tokens for sensitive actions. Audit logs are JSONL and omit payload/response bodies. Redaction can mask cookie values, sensitive storage keys, and page-derived content before the client sees it.
 
-The handoff flow is what made it click for me. Claude can navigate until it reaches a login, captcha, 2FA, or payment step, then call `browser_wait_for_handoff`. Chrome Bridge focuses the real tab, shows an in-page banner, and pauses the tool call while I complete the sensitive step myself. When the expected selector, text, URL, or manual page change appears, the agent resumes.
+The handoff flow is what made it click for me. Claude can navigate until it reaches a login, captcha, 2FA, or payment step, then call `browser_wait_for_handoff`. Chrome Bridge focuses the real tab, marks its group as needing review, shows a compact bottom card, and pauses the tool call while I complete the sensitive step myself. When the expected selector, text, URL, or manual page change appears, the agent resumes.
 
 There is also `browser_session_status`, which is a redacted auth probe: cookie names/counts plus a logged-in boolean for domains, never cookie values. That lets the agent decide whether it is already signed in without dumping credentials into the transcript.
 

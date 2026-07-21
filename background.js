@@ -6,7 +6,14 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 30000;
 const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
+const BRIDGE_PREFERENCES_KEY = "chromeBridgePreferences";
 const TASK_DEBUGGER_IDLE_MS = 30000;
+const TASK_GROUP_COLORS = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
+const TASK_GROUP_STATES = {
+  working: { symbol: "✦", label: "Working", prefix: "" },
+  needs_user: { symbol: "↗", label: "Needs your help", prefix: "Review needed: " },
+  completed: { symbol: "✓", label: "Completed", prefix: "" },
+};
 // Persist retry state across SW suspension. A bare module variable is lost when
 // the MV3 service worker suspends, so we keep backoff state in chrome.storage.
 // The manifest grants "storage"; prefer storage.session (resets on browser
@@ -238,12 +245,28 @@ function connectToHost() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.action !== "wakeNativeHost") return false;
-  connectToHost();
-  sendResponse({ success: true });
-  const tabId = sender && sender.tab && sender.tab.id;
-  if (tabId !== undefined) {
-    setTimeout(() => chrome.tabs.remove(tabId), 50);
+  if (!message || !message.action) return false;
+  if (message.action === "wakeNativeHost") {
+    connectToHost();
+    sendResponse({ success: true });
+    const tabId = sender && sender.tab && sender.tab.id;
+    if (tabId !== undefined) {
+      setTimeout(() => chrome.tabs.remove(tabId), 50);
+    }
+    return false;
+  }
+  if (message.action === "getBridgeStatus" || message.action === "setBridgePreference") {
+    (async () => {
+      try {
+        if (message.action === "setBridgePreference") {
+          await setBridgePreference(message.key, message.value);
+        }
+        sendResponse(await getBridgeStatus());
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
   }
   return false;
 });
@@ -328,6 +351,9 @@ async function dispatchAction(action, payload) {
         break;
       case "getTaskSessions":
         result = await getTaskSessions(payload.sessionId);
+        break;
+      case "updateTaskSessionState":
+        result = await updateTaskSessionState(payload.sessionId, payload.state);
         break;
       case "closeTaskSession":
         result = await closeTaskSession(payload.sessionId);
@@ -528,6 +554,98 @@ async function loadTaskSessions() {
 async function saveTaskSessions(sessions) {
   const store = chrome.storage && chrome.storage.local;
   if (store) await store.set({ [TASK_SESSIONS_KEY]: sessions });
+}
+
+async function loadBridgePreferences() {
+  const store = chrome.storage && chrome.storage.local;
+  if (!store) return { showAgentPointer: true };
+  const data = await store.get(BRIDGE_PREFERENCES_KEY);
+  return { showAgentPointer: true, ...(data[BRIDGE_PREFERENCES_KEY] || {}) };
+}
+
+async function setBridgePreference(key, value) {
+  if (key !== "showAgentPointer") throw new Error("unknown bridge preference");
+  const preferences = await loadBridgePreferences();
+  preferences[key] = value === true;
+  const store = chrome.storage && chrome.storage.local;
+  if (store) await store.set({ [BRIDGE_PREFERENCES_KEY]: preferences });
+  return preferences;
+}
+
+function normalizedTaskName(name) {
+  const cleaned = String(name || "Browser task")
+    .replace(/^[✦↗✓]\s*/, "")
+    .replace(/^Review needed:\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "Browser task";
+}
+
+function taskGroupColor(sessionId) {
+  let hash = 2166136261;
+  for (const char of String(sessionId || "task")) {
+    hash ^= char.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return TASK_GROUP_COLORS[(hash >>> 0) % TASK_GROUP_COLORS.length];
+}
+
+function taskGroupTitle(session) {
+  const state = TASK_GROUP_STATES[session.state] || TASK_GROUP_STATES.working;
+  const available = Math.max(1, 40 - state.symbol.length - 1);
+  const name = `${state.prefix}${normalizedTaskName(session.name)}`.slice(0, available).trimEnd();
+  return `${state.symbol} ${name}`;
+}
+
+async function refreshTaskGroup(session) {
+  if (!chrome.tabGroups || !Number.isInteger(session.groupId) || session.groupId < 0) return;
+  try {
+    await chrome.tabGroups.update(session.groupId, {
+      title: taskGroupTitle(session),
+      color: session.color || taskGroupColor(session.sessionId),
+      collapsed: false,
+    });
+  } catch (error) {
+    console.warn("Could not update task group visual state:", error);
+  }
+}
+
+async function updateTaskSessionState(sessionId, state) {
+  if (!TASK_GROUP_STATES[state]) throw new Error("state must be working, needs_user, or completed");
+  const session = await mutateTaskSessions(async (sessions) => {
+    const current = sessions[sessionId];
+    if (!current) throw new Error("unknown task session");
+    current.state = state;
+    current.color ||= taskGroupColor(current.sessionId);
+    current.updatedAt = Date.now();
+    return { value: { ...current }, changed: true };
+  });
+  try {
+    await refreshTaskGroup(session);
+  } catch (error) {
+    console.warn("Could not update task group state:", error);
+  }
+  return session;
+}
+
+async function getBridgeStatus() {
+  const [preferences, sessions] = await Promise.all([loadBridgePreferences(), getTaskSessions()]);
+  const active = sessions
+    .filter((session) => (session.tabIds || []).length > 0)
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+  const state = active ? (TASK_GROUP_STATES[active.state] || TASK_GROUP_STATES.working) : null;
+  return {
+    connected: nativePort !== null,
+    quietReads: true,
+    showAgentPointer: preferences.showAgentPointer !== false,
+    activeTask: active ? {
+      name: normalizedTaskName(active.name),
+      state: active.state || "working",
+      stateLabel: state.label,
+      symbol: state.symbol,
+      color: active.color || taskGroupColor(active.sessionId),
+    } : null,
+  };
 }
 
 function mutateTaskSessions(mutator) {
@@ -756,7 +874,9 @@ async function createTaskSession(name) {
     const sessionId = newTaskSessionId();
     sessions[sessionId] = {
       sessionId,
-      name: String(name || "Browser task"),
+      name: normalizedTaskName(name),
+      state: "working",
+      color: taskGroupColor(sessionId),
       tabIds: [],
       groupId: null,
       createdAt: Date.now(),
@@ -788,19 +908,13 @@ async function groupTaskTab(session, tabId) {
     const options = { tabIds: [tabId] };
     if (Number.isInteger(session.groupId)) options.groupId = session.groupId;
     session.groupId = await chrome.tabs.group(options);
-    await chrome.tabGroups.update(session.groupId, {
-      title: session.name.slice(0, 40),
-      color: "blue",
-      collapsed: false
-    });
+    await refreshTaskGroup(session);
   } catch (error) {
     console.warn("Could not group task tab:", error);
     session.groupId = null;
     try {
       session.groupId = await chrome.tabs.group({ tabIds: [tabId] });
-      await chrome.tabGroups.update(session.groupId, {
-        title: session.name.slice(0, 40), color: "blue", collapsed: false
-      });
+      await refreshTaskGroup(session);
     } catch (retryError) {
       console.warn("Could not create replacement task group:", retryError);
     }
@@ -1660,9 +1774,56 @@ async function getElementCenter(target, selector) {
 async function isTabActive(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
-    return tab.active === true;
+    if (tab.active !== true || tab.windowId === undefined) return false;
+    const window = await chrome.windows.get(tab.windowId);
+    return window.focused === true;
   } catch (error) {
+    return false;
+  }
+}
+
+async function showAgentPointer(tabId, x, y, click = false) {
+  const preferences = await loadBridgePreferences();
+  if (preferences.showAgentPointer === false || !(await isTabActive(tabId))) return false;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (left, top, shouldClick) => {
+        const id = "__chrome_bridge_pointer__";
+        document.getElementById(id)?.remove();
+        const host = document.createElement("div");
+        host.id = id;
+        host.setAttribute("aria-hidden", "true");
+        host.style.cssText = `position:fixed;left:${left}px;top:${top}px;width:1px;height:1px;z-index:2147483647;pointer-events:none;contain:layout style paint`;
+        const root = host.attachShadow({ mode: "closed" });
+        const style = document.createElement("style");
+        style.textContent = `
+          :host{all:initial;pointer-events:none}
+          .pointer{position:absolute;left:-5px;top:-5px;width:21px;height:27px;transform:translate(-2px,-2px) rotate(-12deg);filter:drop-shadow(0 4px 8px rgba(17,19,24,.36));animation:bridge-arrive 160ms cubic-bezier(.2,.8,.2,1) both}
+          .pointer:before{content:"";position:absolute;inset:0;background:linear-gradient(145deg,#f5f0e8 8%,#9b6cff 54%,#47d7c8 100%);clip-path:polygon(0 0,79% 62%,51% 65%,66% 100%,51% 100%,37% 69%,17% 89%);}
+          .pointer:after{content:"✦";position:absolute;left:17px;top:-11px;color:#47d7c8;font:700 12px system-ui;text-shadow:0 0 9px rgba(71,215,200,.95)}
+          .ripple{position:absolute;left:-15px;top:-15px;width:30px;height:30px;border:2px solid #9b6cff;border-radius:50%;box-shadow:0 0 0 5px rgba(71,215,200,.16);animation:bridge-ripple 460ms ease-out both}
+          @keyframes bridge-arrive{from{opacity:0;transform:translate(-7px,-7px) rotate(-12deg) scale(.72)}to{opacity:1;transform:translate(-2px,-2px) rotate(-12deg) scale(1)}}
+          @keyframes bridge-ripple{from{opacity:.92;transform:scale(.28)}to{opacity:0;transform:scale(1.45)}}
+          @media (prefers-reduced-motion:reduce){.pointer,.ripple{animation-duration:.01ms!important}}
+        `;
+        const pointer = document.createElement("div");
+        pointer.className = "pointer";
+        root.append(style, pointer);
+        if (shouldClick) {
+          const ripple = document.createElement("div");
+          ripple.className = "ripple";
+          root.appendChild(ripple);
+        }
+        (document.body || document.documentElement).appendChild(host);
+        setTimeout(() => host.remove(), shouldClick ? 650 : 900);
+      },
+      args: [x, y, click === true],
+    });
     return true;
+  } catch (_error) {
+    return false;
   }
 }
 
@@ -1677,6 +1838,8 @@ async function clickSelector(tabId, selector) {
       return { success: true, tagName: value.tagName, text: value.text };
     }
     const { x, y } = lookup;
+    const pointerShown = await showAgentPointer(tabId, x, y, true);
+    if (pointerShown) await sleep(160);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
@@ -1701,6 +1864,8 @@ async function hoverSelector(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const lookup = await getElementCenter(target, selector);
     if (lookup.success === false) return lookup;
+    const pointerShown = await showAgentPointer(tabId, lookup.x, lookup.y, false);
+    if (pointerShown) await sleep(100);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: lookup.x, y: lookup.y, button: 'none' });
     return { success: true, tagName: lookup.tagName, text: lookup.text };
   });
@@ -2656,15 +2821,28 @@ async function showHandoffOverlay(tabId, message) {
       func: (msg) => {
         const id = "__chrome_bridge_handoff__";
         document.getElementById(id)?.remove();
-        const el = document.createElement("div");
-        el.id = id;
-        el.textContent = "\u270b Automation paused \u2014 " + String(msg || "please complete this step");
-        el.style.cssText = [
-          "position:fixed", "top:0", "left:0", "right:0", "z-index:2147483647",
-          "background:#1a73e8", "color:#fff", "font:600 14px system-ui,sans-serif",
-          "padding:10px 16px", "text-align:center", "box-shadow:0 2px 8px rgba(0,0,0,.3)",
-        ].join(";");
-        (document.body || document.documentElement).appendChild(el);
+        const host = document.createElement("div");
+        host.id = id;
+        host.setAttribute("role", "status");
+        host.setAttribute("aria-live", "polite");
+        host.style.cssText = "position:fixed;bottom:24px;left:50%;width:min(420px,calc(100vw - 32px));z-index:2147483647;pointer-events:none;transform:translateX(-50%);contain:layout style paint";
+        const root = host.attachShadow({ mode: "closed" });
+        const card = document.createElement("div");
+        card.innerHTML = `
+          <style>
+            :host{all:initial;pointer-events:none}
+            .card{position:relative;display:flex;gap:12px;align-items:center;padding:13px 15px;border:1px solid #343a45;border-radius:15px;background:#111318;color:#f5f0e8;box-shadow:0 14px 40px rgba(0,0,0,.36);font-family:"Avenir Next","Segoe UI",sans-serif;overflow:hidden;animation:bridge-card-in 180ms cubic-bezier(.2,.8,.2,1) both}
+            .card:before{content:"";position:absolute;inset:0 0 auto;height:2px;background:linear-gradient(90deg,#9b6cff,#47d7c8)}
+            .mark{position:relative;width:34px;height:34px;flex:0 0 auto;border-radius:10px;background:#191c22}
+            .mark:before,.mark:after{content:"";position:absolute;top:8px;width:11px;height:17px;border:2px solid;border-radius:5px}.mark:before{left:6px;border-color:#9b6cff}.mark:after{right:6px;border-color:#47d7c8}.spark{position:absolute;left:14px;top:8px;color:#f5f0e8;font:700 12px system-ui}
+            strong{display:block;font-size:13px;line-height:1.2}p{margin:4px 0 0;color:#abb0ba;font-size:12px;line-height:1.35}
+            @keyframes bridge-card-in{from{opacity:0;transform:translateY(9px) scale(.98)}to{opacity:1;transform:none}}
+            @media (prefers-reduced-motion:reduce){.card{animation-duration:.01ms!important}}
+          </style>
+          <div class="card"><div class="mark" aria-hidden="true"><span class="spark">✦</span></div><div><strong>Chrome Bridge needs your help</strong><p></p></div></div>`;
+        card.querySelector("p").textContent = String(msg || "Please complete this step, then continue.");
+        root.appendChild(card);
+        (document.body || document.documentElement).appendChild(host);
       },
       args: [message || ""],
     });
@@ -2701,40 +2879,49 @@ async function waitForHandoff(payload) {
   }
   const tab = await chrome.tabs.update(tabId, { active: true });
   if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+  const taskSession = await findTaskSessionForTab(tabId);
+  const previousState = taskSession?.session?.state || "working";
+  if (taskSession) await updateTaskSessionState(taskSession.sessionId, "needs_user");
   const startedAt = Date.now();
   await showHandoffOverlay(tabId, payload.message);
   const timeoutErr = { success: false, err: `handoff timeout after ${timeoutMs}ms (${mode})` };
-  const settle = async (found) => {
+  const settle = async (found) => found ? await handoffResult(tabId, mode, startedAt) : timeoutErr;
+  try {
+    if (mode === "selector") {
+      const found = await waitForSelector(tabId, until.selector, timeoutMs);
+      return await settle(found.success);
+    }
+    if (mode === "url") {
+      const found = await waitForUrl(tabId, until.urlSubstring, timeoutMs);
+      return await settle(found.success);
+    }
+    if (mode === "text") {
+      const found = await waitForText(tabId, until.text, timeoutMs);
+      return await settle(found.success);
+    }
+    const startUrl = (await chrome.tabs.get(tabId)).url || "";
+    let startLen = await handoffBodyLength(tabId);
+    const deadline = deadlineFrom(timeoutMs);
+    while (Date.now() <= deadline) {
+      await sleep(250);
+      const currentUrl = (await chrome.tabs.get(tabId)).url || "";
+      const currentLen = await handoffBodyLength(tabId);
+      if (currentUrl !== startUrl) return await settle(true);
+      if (startLen < 0) {
+        if (currentLen >= 0) startLen = currentLen;
+        continue;
+      }
+      if (currentLen >= 0 && currentLen !== startLen) return await settle(true);
+    }
+    return await settle(false);
+  } finally {
     await hideHandoffOverlay(tabId);
-    return found ? await handoffResult(tabId, mode, startedAt) : timeoutErr;
-  };
-  if (mode === "selector") {
-    const found = await waitForSelector(tabId, until.selector, timeoutMs);
-    return await settle(found.success);
-  }
-  if (mode === "url") {
-    const found = await waitForUrl(tabId, until.urlSubstring, timeoutMs);
-    return await settle(found.success);
-  }
-  if (mode === "text") {
-    const found = await waitForText(tabId, until.text, timeoutMs);
-    return await settle(found.success);
-  }
-  const startUrl = (await chrome.tabs.get(tabId)).url || "";
-  let startLen = await handoffBodyLength(tabId);
-  const deadline = deadlineFrom(timeoutMs);
-  while (Date.now() <= deadline) {
-    await sleep(250);
-    const currentUrl = (await chrome.tabs.get(tabId)).url || "";
-    const currentLen = await handoffBodyLength(tabId);
-    if (currentUrl !== startUrl) {
-      return await settle(true);
+    if (taskSession) {
+      try {
+        await updateTaskSessionState(taskSession.sessionId, previousState);
+      } catch (_error) {
+        // The task can be closed while the user is completing a handoff.
+      }
     }
-    if (startLen < 0) {
-      if (currentLen >= 0) startLen = currentLen;
-      continue;
-    }
-    if (currentLen >= 0 && currentLen !== startLen) return await settle(true);
   }
-  return await settle(false);
 }

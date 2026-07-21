@@ -304,7 +304,7 @@ MUTATING_ACTIONS = {
     'setColorScheme', 'setUserAgent',
     'startInterception', 'stopInterception', 'startMonitoring', 'stopMonitoring',
     'handleDialog', 'downloadUrl', 'batch',
-    'createTaskSession', 'navigateTaskSession', 'closeTaskSession',
+    'createTaskSession', 'navigateTaskSession', 'updateTaskSessionState', 'closeTaskSession',
 }
 DESTRUCTIVE_ACTIONS = {
     'executeScript', 'executeScriptCDP', 'startInterception', 'downloadUrl',
@@ -319,7 +319,7 @@ DESTRUCTIVE_ACTIONS = {
 # by default rather than silently exempt).
 ORIGIN_EXEMPT_ACTIONS = {
     'ping', 'getTabs', 'navigate', 'downloadUrl', 'getCookies', 'sessionStatus',
-    'createTaskSession', 'getTaskSessions', 'closeTaskSession',
+    'createTaskSession', 'getTaskSessions', 'updateTaskSessionState', 'closeTaskSession',
     'navigateTaskSession', 'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
 }
 

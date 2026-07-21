@@ -478,7 +478,7 @@ fn mutating_actions() -> &'static [&'static str] {
         "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
         "setColorScheme", "setUserAgent", "startInterception", "stopInterception",
         "startMonitoring", "stopMonitoring", "handleDialog", "downloadUrl", "batch",
-        "createTaskSession", "navigateTaskSession", "closeTaskSession",
+        "createTaskSession", "navigateTaskSession", "updateTaskSessionState", "closeTaskSession",
     ]
 }
 
@@ -498,7 +498,8 @@ fn origin_exempt_action(action: &str) -> bool {
         action,
         "ping" | "getTabs" | "navigate" | "downloadUrl" | "getCookies"
             | "sessionStatus" | "createTaskSession" | "navigateTaskSession"
-            | "getTaskSessions" | "closeTaskSession" | "batch" | "lease" | "release" | "leaseStatus"
+            | "getTaskSessions" | "updateTaskSessionState" | "closeTaskSession"
+            | "batch" | "lease" | "release" | "leaseStatus"
             | "policyCheck" | "policyInfo"
     )
 }

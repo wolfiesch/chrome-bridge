@@ -32,6 +32,7 @@ CASES = [
     (["taskSession", "navigate", "session-1", "https://example.com"], 111),
     (["taskSession", "show"], 111),
     (["taskSession", "show", "session-1"], 111),
+    (["taskSession", "state", "session-1", "completed"], 111),
     (["taskSession", "close", "session-1"], 111),
     (["executeScriptCDP", "1", "document.title"], 111),
     (["click", "1", "#submit"], 111),
@@ -196,6 +197,10 @@ check("task session foreground payload", result.get("payload"), {
 
 result = dispatch(["taskSession", "show", "session-1"])
 check("task session show payload", result.get("payload"), {"sessionId": "session-1"})
+
+result = dispatch(["taskSession", "state", "session-1", "needs_user"])
+check("task session state action", result.get("action"), "updateTaskSessionState")
+check("task session state payload", result.get("payload"), {"sessionId": "session-1", "state": "needs_user"})
 
 result = dispatch(["taskSession", "close", "session-1"])
 check("task session close action", result.get("action"), "closeTaskSession")

@@ -146,8 +146,11 @@ def main():
         ext_dir = tmp / "extension"
         r = run(["./deploy.sh", "--ext", str(ext_dir), "--with-local-key", "--key-file", str(key)])
         expect(r.returncode == 0, f"keyed deploy failed: {r.stderr}")
-        expect(visible_names(ext_dir) == ["background.js", "manifest.json", "wake.html", "wake.js"],
-               f"extension deploy should contain background.js, manifest.json, wake.html, and wake.js, got {visible_names(ext_dir)}")
+        expected_extension_names = [
+            "background.js", "icons", "manifest.json", "popup.css", "popup.html", "popup.js", "wake.html", "wake.js",
+        ]
+        expect(visible_names(ext_dir) == expected_extension_names,
+               f"extension deploy contents mismatch, got {visible_names(ext_dir)}")
         deployed = json.loads((ext_dir / "manifest.json").read_text())
         expect("key" in deployed, "keyed deploy manifest should include key")
 
@@ -299,7 +302,11 @@ def main():
             package_release.add_extension_zip(SCRIPT_DIR, dist, "contract")
             expect_zip_names(
                 dist / "chrome-native-bridge-extension-unpacked-contract.zip",
-                ["background.js", "manifest.json", "wake.html", "wake.js"],
+                [
+                    "background.js",
+                    "icons/icon-16.png", "icons/icon-32.png", "icons/icon-48.png", "icons/icon-128.png",
+                    "manifest.json", "popup.css", "popup.html", "popup.js", "wake.html", "wake.js",
+                ],
                 "extension package contents",
             )
             with zipfile.ZipFile(dist / "chrome-native-bridge-source-contract.zip") as archive:

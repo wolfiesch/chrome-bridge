@@ -180,6 +180,10 @@ def main():
     }), "task session navigate mismatch")
     server.browser_task_session_list("session-1")
     expect(last_request() == ("getTaskSessions", {"sessionId": "session-1"}), "task session list mismatch")
+    server.browser_task_session_state("session-1", "completed")
+    expect(last_request() == ("updateTaskSessionState", {
+        "sessionId": "session-1", "state": "completed",
+    }), "task session state mismatch")
     server.browser_task_session_close("session-1")
     expect(last_request() == ("closeTaskSession", {"sessionId": "session-1"}), "task session close mismatch")
 

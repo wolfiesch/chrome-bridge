@@ -69,7 +69,7 @@ if [[ -n "$EXT_DIR" ]]; then
 
   ext_resolved="$(abspath "$EXT_DIR")"
   preexisting_ext=0
-  if [[ -f "$EXT_DIR/manifest.json" ]] && grep -q "Chrome Native Messaging Automation Bridge" "$EXT_DIR/manifest.json" 2>/dev/null; then
+  if [[ -f "$EXT_DIR/manifest.json" ]] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"(Chrome Bridge|Chrome Native Messaging Automation Bridge)"' "$EXT_DIR/manifest.json" 2>/dev/null; then
     preexisting_ext=1
   fi
 
@@ -99,6 +99,11 @@ if [[ -n "$EXT_DIR" ]]; then
   cp "$SCRIPT_DIR/background.js" "$EXT_DIR/background.js"
   cp "$SCRIPT_DIR/wake.html" "$EXT_DIR/wake.html"
   cp "$SCRIPT_DIR/wake.js" "$EXT_DIR/wake.js"
+  cp "$SCRIPT_DIR/popup.html" "$EXT_DIR/popup.html"
+  cp "$SCRIPT_DIR/popup.css" "$EXT_DIR/popup.css"
+  cp "$SCRIPT_DIR/popup.js" "$EXT_DIR/popup.js"
+  rm -rf "$EXT_DIR/icons"
+  cp -R "$SCRIPT_DIR/icons" "$EXT_DIR/icons"
   if [[ "$PUBLIC_UNKEYED" == "1" ]]; then
     cp "$SCRIPT_DIR/manifest.json" "$EXT_DIR/manifest.json"
   else
@@ -107,6 +112,7 @@ if [[ -n "$EXT_DIR" ]]; then
     echo "Extension ID: $extension_id"
   fi
   node --check "$EXT_DIR/background.js"
+  node --check "$EXT_DIR/popup.js"
 
   if [[ "$PRUNE" == "1" ]]; then
     for junk in bridge.py bridge_token.txt test_client.py com.automation.bridge.json \
@@ -126,7 +132,7 @@ if [[ -n "$EXT_DIR" ]]; then
     find "$EXT_DIR" -maxdepth 1 -name '_*' >&2
     exit 1
   fi
-  echo "Extension synced to $EXT_DIR (background.js, wake.html, wake.js, manifest.json). Reload the extension."
+  echo "Extension synced to $EXT_DIR (Chrome Bridge shell, background worker, and manifest). Reload the extension."
 fi
 
 if [[ -n "$HOST_DIR" ]]; then

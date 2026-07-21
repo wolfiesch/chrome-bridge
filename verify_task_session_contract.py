@@ -18,6 +18,7 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         'case "createTaskSession"',
         'case "navigateTaskSession"',
         'case "getTaskSessions"',
+        'case "updateTaskSessionState"',
         'case "closeTaskSession"',
         'TASK_SESSIONS_KEY',
         'chrome.storage.local',
@@ -59,6 +60,7 @@ for path in (ROOT / "manifest.json", ROOT / "extension" / "manifest.json"):
 bridge = (ROOT / "bridge.py").read_text(encoding="utf-8")
 expect("'navigateTaskSession'" in bridge, "host missing navigateTaskSession policy classification")
 expect("'closeTaskSession'" in bridge, "host missing closeTaskSession policy classification")
+expect("'updateTaskSessionState'" in bridge, "host missing updateTaskSessionState policy classification")
 
 harness = (ROOT / "scripts" / "background_reliability.py").read_text(encoding="utf-8")
 for needle in ("active_tabs_changed", "frontmost_app_changed", "unexpected_tabs", "owned_tab_became_active", "owned_ready", "runError"):

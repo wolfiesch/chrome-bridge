@@ -23,7 +23,8 @@ Opening a browser is the easy part. The hard part is safely handing an agent you
 
 - **Fail-closed policy engine** in the native host - nothing runs without an explicit local grant
 - **Confirmation tokens, response redaction, and a full audit log** for every action
-- **`waitForHandoff`** - the agent stops, focuses the real tab, and waits for you to do login, 2FA, captcha, or payment
+- **Calm, visible task state** - named tab groups show whether the agent is working, waiting for you, or finished
+- **`waitForHandoff`** - the agent stops, focuses the real tab, and shows a compact card while you do login, 2FA, captcha, or payment
 - **Cooperative multi-agent leasing** so two agents never mutate one real profile at the same time
 
 ## How it works
@@ -86,8 +87,9 @@ Full instructions: [setup](docs/setup.md) and [MCP registration](docs/mcp.md).
 | **Background-safe** | Inactive-tab navigation, CDP screenshots without tab selection, connection checks that never launch Chrome or open wake tabs |
 | **Governance** | Fail-closed `bridge_policy.json`, origin-aware action policy, deny/allow lists, resumable confirmation tokens (`chrome-bridge confirm <token>`), optional local origin-approval prompt |
 | **Audit & redaction** | Action/client/target/decision/reason/request-ID audit log; cookie, storage-state, and policy-defined page-content redaction; `sessionStatus` redacted auth probe |
-| **Human handoff** | `waitForHandoff` focuses the real tab, shows an instruction banner, and waits for login/2FA/captcha before resuming |
-| **Multi-agent** | Named per-client tokens, cooperative leasing, task-owned tab groups that never touch unrelated human tabs |
+| **Human handoff** | `waitForHandoff` focuses the real tab, shows a compact bottom card, and waits for login/2FA/captcha before resuming |
+| **Visible status** | Toolbar popup with connection/task state and a foreground-only agent-pointer toggle; task groups use `✦`, `↗`, and `✓` status labels |
+| **Multi-agent** | Named per-client tokens, cooperative leasing, task-owned tab groups with stable colors that never touch unrelated human tabs |
 | **Reliability** | Machine-readable background runs detecting active-tab changes, frontmost-app changes, unexpected tabs, and owned tabs becoming active |
 | **Integrations** | MCP server (Claude Desktop, Cursor, Cline, ...) with read-only and sensitive-tool scoping; optional Rust native-host parity port |
 
