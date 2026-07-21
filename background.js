@@ -599,11 +599,15 @@ function taskGroupTitle(session) {
 
 async function refreshTaskGroup(session) {
   if (!chrome.tabGroups || !Number.isInteger(session.groupId) || session.groupId < 0) return;
-  await chrome.tabGroups.update(session.groupId, {
-    title: taskGroupTitle(session),
-    color: session.color || taskGroupColor(session.sessionId),
-    collapsed: false,
-  });
+  try {
+    await chrome.tabGroups.update(session.groupId, {
+      title: taskGroupTitle(session),
+      color: session.color || taskGroupColor(session.sessionId),
+      collapsed: false,
+    });
+  } catch (error) {
+    console.warn("Could not update task group visual state:", error);
+  }
 }
 
 async function updateTaskSessionState(sessionId, state) {

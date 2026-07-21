@@ -30,6 +30,17 @@ async function testSessionStatePersistsAndRefreshesGroup() {
   await assert.rejects(harness.api.updateTaskSessionState('S', 'paused'), /state must be/);
 }
 
+async function testVisualRefreshFailureKeepsExistingGroup() {
+  const harness = createHarness({
+    tabs: { 1: { groupId: 7, active: false, windowId: 1, url: 'https://example.com' } },
+  });
+  harness.controller.failNextTabGroupUpdate = true;
+  const session = { sessionId: 'S', name: 'Research', state: 'working', color: 'purple', groupId: 7, tabIds: [1] };
+  await harness.api.groupTaskTab(session, 1);
+  assert.equal(harness.controller.groupCalls, 1, 'a visual refresh failure must not create a replacement group');
+  assert.equal(session.groupId, 7);
+}
+
 async function testPointerIsForegroundOnly() {
   const hidden = createHarness({ tabs: { 1: { active: false, windowId: 1, groupId: -1 } } });
   assert.equal(await hidden.api.showAgentPointer(1, 20, 30, true), false);
@@ -89,6 +100,7 @@ async function testHandoffIsCompactAndNonLayoutShifting() {
 const tests = [
   testTaskGroupPresentation,
   testSessionStatePersistsAndRefreshesGroup,
+  testVisualRefreshFailureKeepsExistingGroup,
   testPointerIsForegroundOnly,
   testPopupStatusUsesLatestTaskAndPreference,
   testHandoffIsCompactAndNonLayoutShifting,

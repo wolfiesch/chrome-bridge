@@ -36,6 +36,8 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     commandMethods: [],
     scriptCalls: [],
     tabGroupUpdates: [],
+    groupCalls: 0,
+    failNextTabGroupUpdate: false,
     delayDetach: false,
     detachEventAfterCallback: false,
     failNextDetach: false,
@@ -187,6 +189,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
         }
       },
       async group({ tabIds, groupId }) {
+        controller.groupCalls += 1;
         const chosen = Number.isInteger(groupId) ? groupId : 77;
         for (const tabId of tabIds) tabState.get(tabId).groupId = chosen;
         return chosen;
@@ -196,6 +199,10 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     tabGroups: {
       async update(groupId, options) {
         controller.tabGroupUpdates.push({ groupId, options: clone(options) });
+        if (controller.failNextTabGroupUpdate) {
+          controller.failNextTabGroupUpdate = false;
+          throw new Error('Group disappeared');
+        }
       },
     },
     windows: {
@@ -236,6 +243,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
       createTaskSession,
       navigateTaskSession,
       updateTaskSessionState,
+      groupTaskTab,
       taskGroupColor,
       taskGroupTitle,
       getBridgeStatus,
