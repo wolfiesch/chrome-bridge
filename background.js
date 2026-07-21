@@ -6,6 +6,7 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 30000;
 const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
+const TASK_DEBUGGER_IDLE_MS = 30000;
 // Persist retry state across SW suspension. A bare module variable is lost when
 // the MV3 service worker suspends, so we keep backoff state in chrome.storage.
 // The manifest grants "storage"; prefer storage.session (resets on browser
@@ -47,6 +48,10 @@ async function scheduleReconnect() {
 }
 const monitors = new Map();
 const interceptors = new Map();
+const taskDebuggerStates = new Map();
+const expectedDebuggerDetaches = new Map();
+let nextTaskDebuggerGeneration = 1;
+let taskSessionMutationQueue = Promise.resolve();
 const MONITOR_LIMIT = 200;
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -168,6 +173,22 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       defaultPrompt: params.defaultPrompt || ""
     });
   }
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  const tabId = source.tabId;
+  if (tabId === undefined || tabId === null) return;
+  const expected = expectedDebuggerDetaches.get(tabId) || 0;
+  if (expected > 0) {
+    if (expected === 1) expectedDebuggerDetaches.delete(tabId);
+    else expectedDebuggerDetaches.set(tabId, expected - 1);
+    return;
+  }
+  const state = taskDebuggerStates.get(tabId);
+  if (state?.timer) clearTimeout(state.timer);
+  taskDebuggerStates.delete(tabId);
+  monitors.delete(tabId);
+  interceptors.delete(tabId);
 });
 
 function scheduleHeartbeat() {
@@ -509,6 +530,17 @@ async function saveTaskSessions(sessions) {
   if (store) await store.set({ [TASK_SESSIONS_KEY]: sessions });
 }
 
+function mutateTaskSessions(mutator) {
+  const operation = taskSessionMutationQueue.then(async () => {
+    const sessions = await loadTaskSessions();
+    const outcome = await mutator(sessions);
+    if (outcome.changed) await saveTaskSessions(sessions);
+    return outcome.value;
+  });
+  taskSessionMutationQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
 function newTaskSessionId() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -516,51 +548,238 @@ function newTaskSessionId() {
   return `task-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function validOwnedTabs(tabIds) {
+async function validSessionOwnedTabs(session) {
   const valid = [];
-  for (const tabId of tabIds || []) {
+  const hasGroup = Number.isInteger(session.groupId) && session.groupId >= 0;
+  for (const tabId of session.tabIds || []) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab) valid.push(tabId);
+      if (tab && (!hasGroup || tab.groupId === session.groupId)) valid.push(tabId);
     } catch (error) {
-      // Closed tabs are removed from the durable ownership record.
+      // Closed tabs and tabs moved out of the task group are no longer owned.
     }
   }
   return valid;
 }
 
+async function findTaskSessionForTab(tabId) {
+  return mutateTaskSessions(async (sessions) => {
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (error) {
+      let changed = false;
+      for (const session of Object.values(sessions)) {
+        if ((session.tabIds || []).includes(tabId)) {
+          session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
+          session.updatedAt = Date.now();
+          changed = true;
+        }
+      }
+      return { value: null, changed };
+    }
+
+    const groupSession = Object.values(sessions).find((session) =>
+      Number.isInteger(session.groupId) && session.groupId >= 0 && tab.groupId === session.groupId
+    );
+    if (groupSession) {
+      let changed = false;
+      for (const session of Object.values(sessions)) {
+        const owned = (session.tabIds || []).includes(tabId);
+        if (session === groupSession) {
+          if (!owned) {
+            session.tabIds = [...(session.tabIds || []), tabId];
+            session.updatedAt = Date.now();
+            changed = true;
+          }
+        } else if (owned) {
+          session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
+          session.updatedAt = Date.now();
+          changed = true;
+        }
+      }
+      return { value: { sessionId: groupSession.sessionId, session: groupSession }, changed };
+    }
+
+    const directSession = Object.values(sessions).find((session) => (session.tabIds || []).includes(tabId));
+    if (directSession && (!Number.isInteger(directSession.groupId) || directSession.groupId < 0)) {
+      return { value: { sessionId: directSession.sessionId, session: directSession }, changed: false };
+    }
+    if (directSession) {
+      directSession.tabIds = directSession.tabIds.filter((ownedId) => ownedId !== tabId);
+      directSession.updatedAt = Date.now();
+      return { value: null, changed: true };
+    }
+    return { value: null, changed: false };
+  });
+}
+
+async function detachTaskDebugger(tabId, force = false) {
+  const state = taskDebuggerStates.get(tabId);
+  if (!state) return false;
+  if (state.phase === "attaching") {
+    try {
+      await state.attachPromise;
+    } catch (error) {
+      return false;
+    }
+    return detachTaskDebugger(tabId, force);
+  }
+  if (state.phase === "detaching") return state.detachPromise;
+  if (!force && (state.busyCount > 0 || state.holders.size > 0)) return false;
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = null;
+  if (force) {
+    monitors.delete(tabId);
+    interceptors.delete(tabId);
+    state.holders.clear();
+  }
+  state.phase = "detaching";
+  const expected = expectedDebuggerDetaches.get(tabId) || 0;
+  expectedDebuggerDetaches.set(tabId, expected + 1);
+  state.detachPromise = (async () => {
+    try {
+      await debuggerDetach({ tabId });
+      if (taskDebuggerStates.get(tabId) === state) taskDebuggerStates.delete(tabId);
+      return true;
+    } catch (error) {
+      const pendingExpected = expectedDebuggerDetaches.get(tabId) || 0;
+      if (pendingExpected <= 1) expectedDebuggerDetaches.delete(tabId);
+      else expectedDebuggerDetaches.set(tabId, pendingExpected - 1);
+      if (taskDebuggerStates.get(tabId) === state) {
+        state.phase = "attached";
+        state.detachPromise = null;
+        if (!force) scheduleTaskDebuggerDetach(tabId);
+      }
+      throw error;
+    }
+  })();
+  return state.detachPromise;
+}
+
+function scheduleTaskDebuggerDetach(tabId) {
+  const state = taskDebuggerStates.get(tabId);
+  if (!state || state.phase !== "attached" || state.busyCount > 0 || state.holders.size > 0) return;
+  if (state.timer) clearTimeout(state.timer);
+  state.lastUsedAt = Date.now();
+  state.timer = setTimeout(() => {
+    detachTaskDebugger(tabId).catch((error) => {
+      console.warn(`Could not detach idle task debugger for tab ${tabId}:`, error.message);
+    });
+  }, TASK_DEBUGGER_IDLE_MS);
+}
+
+async function acquireTaskDebugger(tabId, sessionId, holder = null) {
+  const target = { tabId };
+  while (true) {
+    let state = taskDebuggerStates.get(tabId);
+    if (state && state.sessionId !== sessionId) {
+      await detachTaskDebugger(tabId, true);
+      continue;
+    }
+    if (state?.phase === "detaching") {
+      try {
+        await state.detachPromise;
+      } catch (error) {
+        if (taskDebuggerStates.get(tabId) === state && state.phase === "attached") continue;
+        throw error;
+      }
+      continue;
+    }
+    if (state?.phase === "attaching") {
+      await state.attachPromise;
+      continue;
+    }
+    if (!state) {
+      const alreadyAttached = monitors.has(tabId) || interceptors.has(tabId);
+      state = {
+        sessionId,
+        phase: alreadyAttached ? "attached" : "attaching",
+        generation: nextTaskDebuggerGeneration++,
+        attachPromise: null,
+        detachPromise: null,
+        lastUsedAt: Date.now(),
+        timer: null,
+        busyCount: 0,
+        holders: new Set([
+          ...(monitors.has(tabId) ? ["monitor"] : []),
+          ...(interceptors.has(tabId) ? ["interceptor"] : []),
+        ]),
+      };
+      taskDebuggerStates.set(tabId, state);
+      if (!alreadyAttached) {
+        state.attachPromise = debuggerAttach(target).then(() => {
+          if (taskDebuggerStates.get(tabId) === state) state.phase = "attached";
+        }).catch((error) => {
+          if (taskDebuggerStates.get(tabId) === state) taskDebuggerStates.delete(tabId);
+          throw error;
+        });
+        await state.attachPromise;
+      }
+      continue;
+    }
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    state.lastUsedAt = Date.now();
+    if (holder) state.holders.add(holder);
+    else state.busyCount += 1;
+    return { tabId, target, state, generation: state.generation, holder };
+  }
+}
+
+function releaseTaskDebugger(lease) {
+  const current = taskDebuggerStates.get(lease.tabId);
+  if (current !== lease.state || current.generation !== lease.generation) return;
+  if (lease.holder) current.holders.delete(lease.holder);
+  else current.busyCount = Math.max(0, current.busyCount - 1);
+  scheduleTaskDebuggerDetach(lease.tabId);
+}
+
+async function withTaskDebugger(tabId, sessionId, fn) {
+  const lease = await acquireTaskDebugger(tabId, sessionId);
+  try {
+    return await fn(lease.target);
+  } finally {
+    releaseTaskDebugger(lease);
+  }
+}
+
+async function detachTaskSessionDebuggers(sessionId) {
+  const tabIds = [...taskDebuggerStates.entries()]
+    .filter(([, state]) => state.sessionId === sessionId)
+    .map(([tabId]) => tabId);
+  await Promise.all(tabIds.map((tabId) => detachTaskDebugger(tabId, true)));
+}
+
 async function createTaskSession(name) {
-  const sessions = await loadTaskSessions();
-  const sessionId = newTaskSessionId();
-  sessions[sessionId] = {
-    sessionId,
-    name: String(name || "Browser task"),
-    tabIds: [],
-    groupId: null,
-    createdAt: Date.now(),
-    updatedAt: Date.now()
-  };
-  await saveTaskSessions(sessions);
-  return sessions[sessionId];
+  return mutateTaskSessions(async (sessions) => {
+    const sessionId = newTaskSessionId();
+    sessions[sessionId] = {
+      sessionId,
+      name: String(name || "Browser task"),
+      tabIds: [],
+      groupId: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    return { value: sessions[sessionId], changed: true };
+  });
 }
 
 async function getTaskSessions(sessionId) {
-  const sessions = await loadTaskSessions();
-  let changed = false;
-  for (const session of Object.values(sessions)) {
-    const valid = await validOwnedTabs(session.tabIds);
-    if (valid.length !== (session.tabIds || []).length) {
-      session.tabIds = valid;
-      session.updatedAt = Date.now();
-      changed = true;
+  return mutateTaskSessions(async (sessions) => {
+    let changed = false;
+    for (const session of Object.values(sessions)) {
+      const valid = await validSessionOwnedTabs(session);
+      if (valid.length !== (session.tabIds || []).length) {
+        session.tabIds = valid;
+        session.updatedAt = Date.now();
+        changed = true;
+      }
     }
-  }
-  if (changed) await saveTaskSessions(sessions);
-  if (sessionId) {
-    if (!sessions[sessionId]) throw new Error("unknown task session");
-    return sessions[sessionId];
-  }
-  return Object.values(sessions);
+    if (sessionId && !sessions[sessionId]) throw new Error("unknown task session");
+    return { value: sessionId ? sessions[sessionId] : Object.values(sessions), changed };
+  });
 }
 
 async function groupTaskTab(session, tabId) {
@@ -589,50 +808,50 @@ async function groupTaskTab(session, tabId) {
 }
 
 async function navigateTaskSession(sessionId, url, active = false, reuse = true) {
-  const sessions = await loadTaskSessions();
-  const session = sessions[sessionId];
-  if (!session) throw new Error("unknown task session");
-  session.tabIds = await validOwnedTabs(session.tabIds);
-  let tab = null;
-  if (reuse !== false && session.tabIds.length) {
-    const reusedTabId = session.tabIds[0];
-    try {
-      tab = await chrome.tabs.update(reusedTabId, { url, active: active === true });
-      if (active === true && tab.windowId !== undefined) {
-        await chrome.windows.update(tab.windowId, { focused: true });
+  return mutateTaskSessions(async (sessions) => {
+    const session = sessions[sessionId];
+    if (!session) throw new Error("unknown task session");
+    session.tabIds = await validSessionOwnedTabs(session);
+    let tab = null;
+    if (reuse !== false && session.tabIds.length) {
+      const reusedTabId = session.tabIds[0];
+      try {
+        tab = await chrome.tabs.update(reusedTabId, { url, active: active === true });
+        if (active === true && tab.windowId !== undefined) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+      } catch (error) {
+        tab = await chrome.tabs.create({ url, active: active === true });
+        session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
+        session.tabIds.push(tab.id);
+        await groupTaskTab(session, tab.id);
       }
-    } catch (error) {
-      // The owned tab can close after validOwnedTabs() checks it. Replace only
-      // that raced tab and preserve any other tabs owned by the session.
+    } else {
       tab = await chrome.tabs.create({ url, active: active === true });
-      session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
       session.tabIds.push(tab.id);
       await groupTaskTab(session, tab.id);
     }
-  } else {
-    tab = await chrome.tabs.create({ url, active: active === true });
-    session.tabIds.push(tab.id);
-    await groupTaskTab(session, tab.id);
-  }
-  session.updatedAt = Date.now();
-  await saveTaskSessions(sessions);
-  return { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active };
+    session.updatedAt = Date.now();
+    return { value: { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active }, changed: true };
+  });
 }
 
 async function closeTaskSession(sessionId) {
-  const sessions = await loadTaskSessions();
-  const session = sessions[sessionId];
-  if (!session) throw new Error("unknown task session");
-  const tabIds = await validOwnedTabs(session.tabIds);
-  delete sessions[sessionId];
-  await saveTaskSessions(sessions);
+  const tabIds = await mutateTaskSessions(async (sessions) => {
+    const session = sessions[sessionId];
+    if (!session) throw new Error("unknown task session");
+    const ownedTabIds = await validSessionOwnedTabs(session);
+    delete sessions[sessionId];
+    return { value: ownedTabIds, changed: true };
+  });
+  await detachTaskSessionDebuggers(sessionId);
   // Delete ownership first. chrome.tabs.remove emits onRemoved events; if the
   // record still exists, an event listener can race and re-save an empty copy.
   if (tabIds.length) {
     try {
       await chrome.tabs.remove(tabIds);
     } catch (error) {
-      // A tab can close between validOwnedTabs() and remove(). Ownership is
+      // A tab can close between the ownership check and remove(). Ownership is
       // already durably deleted, so this race should not fail the close call.
       console.warn("Could not remove every task-session tab:", error);
     }
@@ -641,16 +860,22 @@ async function closeTaskSession(sessionId) {
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const sessions = await loadTaskSessions();
-  let changed = false;
-  for (const session of Object.values(sessions)) {
-    if ((session.tabIds || []).includes(tabId)) {
-      session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
-      session.updatedAt = Date.now();
-      changed = true;
+  const state = taskDebuggerStates.get(tabId);
+  if (state?.timer) clearTimeout(state.timer);
+  taskDebuggerStates.delete(tabId);
+  monitors.delete(tabId);
+  interceptors.delete(tabId);
+  await mutateTaskSessions(async (sessions) => {
+    let changed = false;
+    for (const session of Object.values(sessions)) {
+      if ((session.tabIds || []).includes(tabId)) {
+        session.tabIds = session.tabIds.filter((ownedId) => ownedId !== tabId);
+        session.updatedAt = Date.now();
+        changed = true;
+      }
     }
-  }
-  if (changed) await saveTaskSessions(sessions);
+    return { value: undefined, changed };
+  });
 });
 
 // Reserved internal action used by the native host's tab-origin policy check.
@@ -743,13 +968,22 @@ function debuggerCommand(target, method, params) {
 }
 
 function debuggerDetach(target) {
-  return new Promise((resolve) => {
-    chrome.debugger.detach(target, () => resolve());
+  return new Promise((resolve, reject) => {
+    chrome.debugger.detach(target, () => {
+      const err = chrome.runtime.lastError;
+      err ? reject(new Error(err.message)) : resolve();
+    });
   });
 }
 
 async function withDebugger(tabId, fn) {
   const target = { tabId };
+  const taskState = taskDebuggerStates.get(tabId);
+  if (taskState && (taskState.phase !== "attached" || taskState.busyCount > 0 || taskState.holders.size > 0)) {
+    return withTaskDebugger(tabId, taskState.sessionId, fn);
+  }
+  const taskSession = await findTaskSessionForTab(tabId);
+  if (taskSession) return withTaskDebugger(tabId, taskSession.sessionId, fn);
   if (monitors.has(tabId) || interceptors.has(tabId)) return fn(target);
   await debuggerAttach(target);
   try {
@@ -1331,11 +1565,23 @@ async function waitForSelector(tabId, selector, timeoutMs) {
   return { success: false, err: "Timed out waiting for selector", selector, timeoutMs };
 }
 
+async function pageContainsText(tabId, text) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (expected) => (document.body?.innerText || document.documentElement?.innerText || '').includes(expected),
+      args: [String(text || '')]
+    });
+    return results[0]?.result === true;
+  } catch (error) {
+    return false;
+  }
+}
+
 async function waitForText(tabId, text, timeoutMs) {
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
-    const found = await withDebugger(tabId, (target) => evaluateWithDebugger(target, `(document.body?.innerText || '').includes(${JSON.stringify(text)})`));
-    if (found.success && found.val === true) return { success: true, text };
+    if (await pageContainsText(tabId, text)) return { success: true, text };
     await sleep(250);
   }
   return { success: false, err: "Timed out waiting for text", text, timeoutMs };
@@ -1375,29 +1621,30 @@ async function captureScreenshot(tabId, format, quiet = true) {
 
 async function extractText(tabId, maxChars) {
   const limit = maxChars || 20000;
-  return withDebugger(tabId, async (target) => {
-    const result = await evaluateWithDebugger(target, `(() => {
-      const raw = document.body ? document.body.innerText : document.documentElement.innerText;
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (maxLength) => {
+      const raw = document.body ? document.body.innerText : document.documentElement?.innerText;
       const text = raw || '';
-      const limit = ${JSON.stringify(limit)};
-      return { text: text.slice(0, limit), originalLength: text.length };
-    })()`);
-    if (!result.success) return result;
-    return {
-      success: true,
-      text: result.val.text,
-      truncated: result.val.originalLength > limit,
-      chars: result.val.text.length
-    };
+      return { text: text.slice(0, maxLength), originalLength: text.length };
+    },
+    args: [limit]
   });
+  const result = results[0]?.result || { text: '', originalLength: 0 };
+  return {
+    success: true,
+    text: result.text,
+    truncated: result.originalLength > limit,
+    chars: result.text.length
+  };
 }
 
 async function getHTML(tabId) {
-  return withDebugger(tabId, async (target) => {
-    const result = await evaluateWithDebugger(target, 'document.documentElement.outerHTML');
-    if (!result.success) return result;
-    return { success: true, html: result.val || "" };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => document.documentElement?.outerHTML || ''
   });
+  return { success: true, html: results[0]?.result || '' };
 }
 
 async function getElementCenter(target, selector) {
@@ -2033,7 +2280,12 @@ async function observeTab(tabId, options = {}) {
 async function startMonitoring(tabId) {
   if (monitors.has(tabId)) return { success: true, tabId, already: true };
   const target = { tabId };
-  if (!interceptors.has(tabId)) {
+  const taskSession = await findTaskSessionForTab(tabId);
+  const taskLease = taskSession
+    ? await acquireTaskDebugger(tabId, taskSession.sessionId, "monitor")
+    : null;
+  const attachedHere = !interceptors.has(tabId) && !taskLease;
+  if (attachedHere) {
     await debuggerAttach(target);
   }
   monitors.set(tabId, { console: [], network: new Map(), dialogs: [] });
@@ -2044,7 +2296,9 @@ async function startMonitoring(tabId) {
     await debuggerCommand(target, 'Page.enable', {});
   } catch (error) {
     monitors.delete(tabId);
-    if (!interceptors.has(tabId)) {
+    if (taskLease) {
+      releaseTaskDebugger(taskLease);
+    } else if (attachedHere && !interceptors.has(tabId)) {
       await debuggerDetach(target);
     }
     throw error;
@@ -2055,7 +2309,11 @@ async function startMonitoring(tabId) {
 async function stopMonitoring(tabId) {
   if (!monitors.has(tabId)) return { success: true, tabId, alreadyStopped: true };
   monitors.delete(tabId);
-  if (!interceptors.has(tabId)) {
+  const state = taskDebuggerStates.get(tabId);
+  if (state) {
+    state.holders.delete("monitor");
+    scheduleTaskDebuggerDetach(tabId);
+  } else if (!interceptors.has(tabId)) {
     await debuggerDetach({ tabId });
   }
   return { success: true, tabId };
@@ -2258,7 +2516,11 @@ function toBase64(str) {
 
 async function startInterception(tabId, urlPattern, mode, status, body) {
   const target = { tabId };
-  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId);
+  const taskSession = await findTaskSessionForTab(tabId);
+  const taskLease = taskSession
+    ? await acquireTaskDebugger(tabId, taskSession.sessionId, "interceptor")
+    : null;
+  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId) && !taskLease;
   if (attachedHere) {
     await debuggerAttach(target);
   }
@@ -2279,7 +2541,9 @@ async function startInterception(tabId, urlPattern, mode, status, body) {
     return { success: true, tabId, urlPattern, mode };
   } catch (error) {
     interceptors.delete(tabId);
-    if (attachedHere && !monitors.has(tabId)) {
+    if (taskLease) {
+      releaseTaskDebugger(taskLease);
+    } else if (attachedHere && !monitors.has(tabId)) {
       await debuggerDetach(target);
     }
     throw error;
@@ -2295,7 +2559,11 @@ async function stopInterception(tabId) {
     console.warn("Fetch.disable failed:", error.message);
   }
   interceptors.delete(tabId);
-  if (!monitors.has(tabId)) {
+  const state = taskDebuggerStates.get(tabId);
+  if (state) {
+    state.holders.delete("interceptor");
+    scheduleTaskDebuggerDetach(tabId);
+  } else if (!monitors.has(tabId)) {
     await debuggerDetach(target);
   }
   return { success: true, tabId };
@@ -2350,9 +2618,20 @@ async function sessionStatus(domains) {
   return { sessions };
 }
 
+async function readBodyLengthInTab(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => (document.body?.innerText || '').length
+    });
+    return Number.isFinite(results[0]?.result) ? results[0].result : -1;
+  } catch (error) {
+    return -1;
+  }
+}
+
 async function handoffBodyLength(tabId) {
-  const res = await withDebugger(tabId, (target) => evaluateWithDebugger(target, "(document.body && document.body.innerText || '').length"));
-  return res.success ? res.val : -1;
+  return readBodyLengthInTab(tabId);
 }
 
 async function handoffResult(tabId, mode, startedAt) {
@@ -2442,15 +2721,20 @@ async function waitForHandoff(payload) {
     return await settle(found.success);
   }
   const startUrl = (await chrome.tabs.get(tabId)).url || "";
-  const startLen = await handoffBodyLength(tabId);
+  let startLen = await handoffBodyLength(tabId);
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
     await sleep(250);
     const currentUrl = (await chrome.tabs.get(tabId)).url || "";
     const currentLen = await handoffBodyLength(tabId);
-    if (currentUrl !== startUrl || currentLen !== startLen) {
+    if (currentUrl !== startUrl) {
       return await settle(true);
     }
+    if (startLen < 0) {
+      if (currentLen >= 0) startLen = currentLen;
+      continue;
+    }
+    if (currentLen >= 0 && currentLen !== startLen) return await settle(true);
   }
   return await settle(false);
 }

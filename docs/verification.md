@@ -9,6 +9,8 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_task_session_contract.py
+PYTHONDONTWRITEBYTECODE=1 ./verify_quiet_debugger_contract.py
+node verify_quiet_debugger_behavior.mjs
 PYTHONDONTWRITEBYTECODE=1 ./verify_github_attachment_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py
@@ -17,7 +19,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
 python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py scripts/background_reliability.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_mcp_contract.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py scripts/background_reliability.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_mcp_contract.py
 node --check background.js
 node --check wake.js
 diff -q manifest.json extension/manifest.json

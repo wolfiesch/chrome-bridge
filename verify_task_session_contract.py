@@ -29,7 +29,9 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         expect(needle in text, f"{path.name} missing task-session contract: {needle}")
     close_body = text.split("async function closeTaskSession", 1)[1].split("chrome.tabs.onRemoved", 1)[0]
     expect(
-        close_body.index("await saveTaskSessions(sessions)") < close_body.index("await chrome.tabs.remove(tabIds)"),
+        "const tabIds = await mutateTaskSessions" in close_body
+        and "delete sessions[sessionId]" in close_body
+        and close_body.index("const tabIds = await mutateTaskSessions") < close_body.index("await chrome.tabs.remove(tabIds)"),
         f"{path.name} must persist session deletion before tab removal events fire",
     )
     navigate_body = text.split("async function navigateTaskSession", 1)[1].split("async function closeTaskSession", 1)[0]
