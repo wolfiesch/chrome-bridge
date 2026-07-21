@@ -1452,12 +1452,16 @@ async function waitForSelector(tabId, selector, timeoutMs) {
 }
 
 async function pageContainsText(tabId, text) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: (expected) => (document.body?.innerText || document.documentElement?.innerText || '').includes(expected),
-    args: [String(text || '')]
-  });
-  return results[0]?.result === true;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (expected) => (document.body?.innerText || document.documentElement?.innerText || '').includes(expected),
+      args: [String(text || '')]
+    });
+    return results[0]?.result === true;
+  } catch (error) {
+    return false;
+  }
 }
 
 async function waitForText(tabId, text, timeoutMs) {
@@ -2134,12 +2138,6 @@ async function observeTabWithoutDebugger(tabId, options = {}) {
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 50;
       const usefulRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'menuitem', 'tab', 'heading', 'img']);
       const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-      const isVisible = (element) => {
-        const style = getComputedStyle(element);
-        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
-        const rect = element.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      };
       const inferredRole = (element) => {
         const explicit = normalize(element.getAttribute('role')).split(' ')[0].toLowerCase();
         if (explicit) return explicit;
@@ -2174,20 +2172,21 @@ async function observeTabWithoutDebugger(tabId, options = {}) {
         }
         return normalize(element.getAttribute('alt') || element.getAttribute('title') || element.getAttribute('placeholder') || element.textContent).slice(0, 500);
       };
-      const roots = [document];
-      const elements = [];
-      for (let index = 0; index < roots.length; index += 1) {
-        for (const element of roots[index].querySelectorAll('*')) {
-          elements.push(element);
-          if (element.shadowRoot) roots.push(element.shadowRoot);
-        }
-      }
+      const pending = document.documentElement ? [document.documentElement] : [];
       const nodes = [];
-      for (const element of elements) {
-        if (nodes.length >= limit || !isVisible(element)) continue;
+      while (pending.length && nodes.length < limit) {
+        const element = pending.pop();
+        const style = getComputedStyle(element);
+        if (style.display === 'none' || style.contentVisibility === 'hidden' || Number(style.opacity) === 0) continue;
+        const children = [...element.children, ...(element.shadowRoot ? element.shadowRoot.children : [])];
+        for (let index = children.length - 1; index >= 0; index -= 1) pending.push(children[index]);
+        if (style.visibility === 'hidden') continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
         const role = inferredRole(element);
+        if (!role) continue;
         const name = accessibleName(element);
-        if (!role || (!usefulRoles.has(role) && !name)) continue;
+        if (!usefulRoles.has(role) && !name) continue;
         if (requestedRoles?.size && !requestedRoles.has(role)) continue;
         if (requestedName && !name.toLowerCase().includes(requestedName)) continue;
         const basic = { role, name };
@@ -2266,6 +2265,8 @@ async function startMonitoring(tabId) {
     monitors.delete(tabId);
     if (attachedHere && !interceptors.has(tabId)) {
       await debuggerDetach(target);
+    } else if (taskDebugger) {
+      scheduleTaskDebuggerDetach(tabId);
     }
     throw error;
   }
@@ -2509,6 +2510,8 @@ async function startInterception(tabId, urlPattern, mode, status, body) {
     interceptors.delete(tabId);
     if (attachedHere && !monitors.has(tabId)) {
       await debuggerDetach(target);
+    } else if (taskDebugger) {
+      scheduleTaskDebuggerDetach(tabId);
     }
     throw error;
   }
@@ -2580,11 +2583,15 @@ async function sessionStatus(domains) {
 }
 
 async function readBodyLengthInTab(tabId) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => (document.body?.innerText || '').length
-  });
-  return Number.isFinite(results[0]?.result) ? results[0].result : -1;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => (document.body?.innerText || '').length
+    });
+    return Number.isFinite(results[0]?.result) ? results[0].result : -1;
+  } catch (error) {
+    return -1;
+  }
 }
 
 async function handoffBodyLength(tabId) {
@@ -2678,15 +2685,20 @@ async function waitForHandoff(payload) {
     return await settle(found.success);
   }
   const startUrl = (await chrome.tabs.get(tabId)).url || "";
-  const startLen = await handoffBodyLength(tabId);
+  let startLen = await handoffBodyLength(tabId);
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
     await sleep(250);
     const currentUrl = (await chrome.tabs.get(tabId)).url || "";
     const currentLen = await handoffBodyLength(tabId);
-    if (currentUrl !== startUrl || currentLen !== startLen) {
+    if (currentUrl !== startUrl) {
       return await settle(true);
     }
+    if (startLen < 0) {
+      if (currentLen >= 0) startLen = currentLen;
+      continue;
+    }
+    if (currentLen >= 0 && currentLen !== startLen) return await settle(true);
   }
   return await settle(false);
 }

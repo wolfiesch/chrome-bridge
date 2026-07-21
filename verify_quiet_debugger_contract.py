@@ -55,6 +55,10 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
     expect("pageContainsText" in wait_for_text, f"{label} waitForText must use a quiet page probe")
     expect("withDebugger" not in wait_for_text, f"{label} waitForText must not attach the debugger")
 
+    text_probe = function_body(text, "pageContainsText", "waitForText")
+    expect("try" in text_probe and "catch" in text_probe and "return false" in text_probe,
+           f"{label} text probe must treat transient injection failures as not-ready")
+
     extract_text = function_body(text, "extractText", "getHTML")
     expect("chrome.scripting.executeScript" in extract_text, f"{label} extractText must use chrome.scripting")
     expect("withDebugger" not in extract_text, f"{label} extractText must not attach the debugger")
@@ -72,6 +76,12 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         "withDebugger" in observe and "Accessibility.getFullAXTree" in observe,
         f"{label} full observe must preserve the detailed debugger fallback",
     )
+
+    quiet_observe = function_body(text, "observeTabWithoutDebugger", "observeTab")
+    expect("querySelectorAll('*')" not in quiet_observe,
+           f"{label} compact observe must not scan every element before applying its limit")
+    expect("document.documentElement" in quiet_observe and "pending" in quiet_observe,
+           f"{label} compact observe must walk the DOM incrementally")
 
     close_session = function_body(text, "closeTaskSession", "tabOrigin")
     expect(
@@ -99,12 +109,22 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         "findTaskSessionForTab" in monitoring and "ensureTaskDebugger" in monitoring,
         f"{label} monitoring must join a task-owned debugger connection",
     )
+    expect("scheduleTaskDebuggerDetach" in monitoring,
+           f"{label} failed monitoring setup must restore task debugger idle cleanup")
 
     interception = function_body(text, "startInterception", "stopInterception")
     expect(
         "findTaskSessionForTab" in interception and "ensureTaskDebugger" in interception,
         f"{label} interception must join a task-owned debugger connection",
     )
+    expect("scheduleTaskDebuggerDetach" in interception,
+           f"{label} failed interception setup must restore task debugger idle cleanup")
+
+    body_length = function_body(text, "readBodyLengthInTab", "handoffBodyLength")
+    expect("try" in body_length and "catch" in body_length and "return -1" in body_length,
+           f"{label} handoff body probe must tolerate transient injection failures")
+    expect("startLen < 0" in text and "currentLen >= 0" in text,
+           f"{label} handoff loop must not treat a failed body probe as user activity")
 
 
 commands = (ROOT / "docs" / "commands.md").read_text(encoding="utf-8")
