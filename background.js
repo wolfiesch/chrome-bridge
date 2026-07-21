@@ -6,6 +6,7 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 30000;
 const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
+const TASK_DEBUGGER_IDLE_MS = 30000;
 // Persist retry state across SW suspension. A bare module variable is lost when
 // the MV3 service worker suspends, so we keep backoff state in chrome.storage.
 // The manifest grants "storage"; prefer storage.session (resets on browser
@@ -47,6 +48,8 @@ async function scheduleReconnect() {
 }
 const monitors = new Map();
 const interceptors = new Map();
+const taskDebuggers = new Map();
+const taskDebuggerAttachInFlight = new Map();
 const MONITOR_LIMIT = 200;
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -168,6 +171,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       defaultPrompt: params.defaultPrompt || ""
     });
   }
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  const tabId = source.tabId;
+  if (tabId === undefined || tabId === null) return;
+  const taskDebugger = taskDebuggers.get(tabId);
+  if (taskDebugger?.timer) clearTimeout(taskDebugger.timer);
+  taskDebuggers.delete(tabId);
+  taskDebuggerAttachInFlight.delete(tabId);
+  monitors.delete(tabId);
+  interceptors.delete(tabId);
 });
 
 function scheduleHeartbeat() {
@@ -529,6 +543,103 @@ async function validOwnedTabs(tabIds) {
   return valid;
 }
 
+async function findTaskSessionForTab(tabId) {
+  const sessions = await loadTaskSessions();
+  for (const session of Object.values(sessions)) {
+    if ((session.tabIds || []).includes(tabId)) {
+      return { sessionId: session.sessionId, session };
+    }
+  }
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    return null;
+  }
+  for (const session of Object.values(sessions)) {
+    if (Number.isInteger(session.groupId) && session.groupId >= 0 && tab.groupId === session.groupId) {
+      session.tabIds = [...new Set([...(session.tabIds || []), tabId])];
+      session.updatedAt = Date.now();
+      await saveTaskSessions(sessions);
+      return { sessionId: session.sessionId, session };
+    }
+  }
+  return null;
+}
+
+async function detachTaskDebugger(tabId, force = false) {
+  const state = taskDebuggers.get(tabId);
+  if (!state) return false;
+  if (!force && (state.busyCount > 0 || monitors.has(tabId) || interceptors.has(tabId))) return false;
+  if (state.timer) clearTimeout(state.timer);
+  taskDebuggers.delete(tabId);
+  if (force) {
+    monitors.delete(tabId);
+    interceptors.delete(tabId);
+  }
+  await debuggerDetach({ tabId });
+  return true;
+}
+
+function scheduleTaskDebuggerDetach(tabId) {
+  const state = taskDebuggers.get(tabId);
+  if (!state || state.busyCount > 0 || monitors.has(tabId) || interceptors.has(tabId)) return;
+  if (state.timer) clearTimeout(state.timer);
+  state.lastUsedAt = Date.now();
+  state.timer = setTimeout(() => {
+    detachTaskDebugger(tabId).catch((error) => {
+      console.warn(`Could not detach idle task debugger for tab ${tabId}:`, error.message);
+    });
+  }, TASK_DEBUGGER_IDLE_MS);
+}
+
+async function ensureTaskDebugger(tabId, sessionId) {
+  const target = { tabId };
+  let state = taskDebuggers.get(tabId);
+  if (state && state.sessionId !== sessionId) {
+    await detachTaskDebugger(tabId, true);
+    state = null;
+  }
+  if (!state) {
+    let attach = taskDebuggerAttachInFlight.get(tabId);
+    if (!attach) {
+      attach = (async () => {
+        await debuggerAttach(target);
+        const attached = { sessionId, lastUsedAt: Date.now(), timer: null, busyCount: 0 };
+        taskDebuggers.set(tabId, attached);
+        return attached;
+      })().finally(() => taskDebuggerAttachInFlight.delete(tabId));
+      taskDebuggerAttachInFlight.set(tabId, attach);
+    }
+    state = await attach;
+  }
+  return state;
+}
+
+async function withTaskDebugger(tabId, sessionId, fn) {
+  const target = { tabId };
+  const state = await ensureTaskDebugger(tabId, sessionId);
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  state.busyCount = (state.busyCount || 0) + 1;
+  try {
+    return await fn(target);
+  } finally {
+    state.busyCount = Math.max(0, (state.busyCount || 1) - 1);
+    scheduleTaskDebuggerDetach(tabId);
+  }
+}
+
+async function detachTaskSessionDebuggers(sessionId) {
+  const tabIds = [...taskDebuggers.entries()]
+    .filter(([, state]) => state.sessionId === sessionId)
+    .map(([tabId]) => tabId);
+  await Promise.all(tabIds.map((tabId) => detachTaskDebugger(tabId, true)));
+}
+
 async function createTaskSession(name) {
   const sessions = await loadTaskSessions();
   const sessionId = newTaskSessionId();
@@ -626,6 +737,7 @@ async function closeTaskSession(sessionId) {
   const tabIds = await validOwnedTabs(session.tabIds);
   delete sessions[sessionId];
   await saveTaskSessions(sessions);
+  await detachTaskSessionDebuggers(sessionId);
   // Delete ownership first. chrome.tabs.remove emits onRemoved events; if the
   // record still exists, an event listener can race and re-save an empty copy.
   if (tabIds.length) {
@@ -641,6 +753,12 @@ async function closeTaskSession(sessionId) {
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const taskDebugger = taskDebuggers.get(tabId);
+  if (taskDebugger?.timer) clearTimeout(taskDebugger.timer);
+  taskDebuggers.delete(tabId);
+  taskDebuggerAttachInFlight.delete(tabId);
+  monitors.delete(tabId);
+  interceptors.delete(tabId);
   const sessions = await loadTaskSessions();
   let changed = false;
   for (const session of Object.values(sessions)) {
@@ -751,6 +869,8 @@ function debuggerDetach(target) {
 async function withDebugger(tabId, fn) {
   const target = { tabId };
   if (monitors.has(tabId) || interceptors.has(tabId)) return fn(target);
+  const taskSession = await findTaskSessionForTab(tabId);
+  if (taskSession) return withTaskDebugger(tabId, taskSession.sessionId, fn);
   await debuggerAttach(target);
   try {
     return await fn(target);
@@ -1331,11 +1451,19 @@ async function waitForSelector(tabId, selector, timeoutMs) {
   return { success: false, err: "Timed out waiting for selector", selector, timeoutMs };
 }
 
+async function pageContainsText(tabId, text) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (expected) => (document.body?.innerText || document.documentElement?.innerText || '').includes(expected),
+    args: [String(text || '')]
+  });
+  return results[0]?.result === true;
+}
+
 async function waitForText(tabId, text, timeoutMs) {
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
-    const found = await withDebugger(tabId, (target) => evaluateWithDebugger(target, `(document.body?.innerText || '').includes(${JSON.stringify(text)})`));
-    if (found.success && found.val === true) return { success: true, text };
+    if (await pageContainsText(tabId, text)) return { success: true, text };
     await sleep(250);
   }
   return { success: false, err: "Timed out waiting for text", text, timeoutMs };
@@ -1375,29 +1503,30 @@ async function captureScreenshot(tabId, format, quiet = true) {
 
 async function extractText(tabId, maxChars) {
   const limit = maxChars || 20000;
-  return withDebugger(tabId, async (target) => {
-    const result = await evaluateWithDebugger(target, `(() => {
-      const raw = document.body ? document.body.innerText : document.documentElement.innerText;
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (maxLength) => {
+      const raw = document.body ? document.body.innerText : document.documentElement?.innerText;
       const text = raw || '';
-      const limit = ${JSON.stringify(limit)};
-      return { text: text.slice(0, limit), originalLength: text.length };
-    })()`);
-    if (!result.success) return result;
-    return {
-      success: true,
-      text: result.val.text,
-      truncated: result.val.originalLength > limit,
-      chars: result.val.text.length
-    };
+      return { text: text.slice(0, maxLength), originalLength: text.length };
+    },
+    args: [limit]
   });
+  const result = results[0]?.result || { text: '', originalLength: 0 };
+  return {
+    success: true,
+    text: result.text,
+    truncated: result.originalLength > limit,
+    chars: result.text.length
+  };
 }
 
 async function getHTML(tabId) {
-  return withDebugger(tabId, async (target) => {
-    const result = await evaluateWithDebugger(target, 'document.documentElement.outerHTML');
-    if (!result.success) return result;
-    return { success: true, html: result.val || "" };
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => document.documentElement?.outerHTML || ''
   });
+  return { success: true, html: results[0]?.result || '' };
 }
 
 async function getElementCenter(target, selector) {
@@ -1991,7 +2120,90 @@ async function setUserAgent(tabId, userAgent) {
   });
 }
 
+async function observeTabWithoutDebugger(tabId, options = {}) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [options],
+    func: (rawOptions) => {
+      const options = rawOptions || {};
+      const requestedRoles = Array.isArray(options.roles)
+        ? new Set(options.roles.map((role) => String(role || '').toLowerCase()).filter(Boolean))
+        : null;
+      const requestedName = String(options.name || '').trim().toLowerCase();
+      const rawLimit = Number(options.limit);
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 50;
+      const usefulRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'menuitem', 'tab', 'heading', 'img']);
+      const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+      const isVisible = (element) => {
+        const style = getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const inferredRole = (element) => {
+        const explicit = normalize(element.getAttribute('role')).split(' ')[0].toLowerCase();
+        if (explicit) return explicit;
+        const tag = element.tagName.toLowerCase();
+        if (tag === 'a' && element.hasAttribute('href')) return 'link';
+        if (tag === 'button' || tag === 'summary') return 'button';
+        if (tag === 'textarea') return 'textbox';
+        if (tag === 'select') return 'combobox';
+        if (tag === 'img') return 'img';
+        if (/^h[1-6]$/.test(tag)) return 'heading';
+        if (tag === 'input') {
+          const type = String(element.type || 'text').toLowerCase();
+          if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+          if (type === 'checkbox') return 'checkbox';
+          if (type === 'radio') return 'radio';
+          if (type === 'search') return 'searchbox';
+          if (!['hidden', 'file', 'color', 'range'].includes(type)) return 'textbox';
+        }
+        return '';
+      };
+      const accessibleName = (element) => {
+        const ariaLabel = normalize(element.getAttribute('aria-label'));
+        if (ariaLabel) return ariaLabel;
+        const labelledBy = normalize(element.getAttribute('aria-labelledby'));
+        if (labelledBy) {
+          const text = labelledBy.split(/\s+/).map((id) => normalize(document.getElementById(id)?.textContent)).filter(Boolean).join(' ');
+          if (text) return text;
+        }
+        if (element.labels?.length) {
+          const text = [...element.labels].map((label) => normalize(label.textContent)).filter(Boolean).join(' ');
+          if (text) return text;
+        }
+        return normalize(element.getAttribute('alt') || element.getAttribute('title') || element.getAttribute('placeholder') || element.textContent).slice(0, 500);
+      };
+      const roots = [document];
+      const elements = [];
+      for (let index = 0; index < roots.length; index += 1) {
+        for (const element of roots[index].querySelectorAll('*')) {
+          elements.push(element);
+          if (element.shadowRoot) roots.push(element.shadowRoot);
+        }
+      }
+      const nodes = [];
+      for (const element of elements) {
+        if (nodes.length >= limit || !isVisible(element)) continue;
+        const role = inferredRole(element);
+        const name = accessibleName(element);
+        if (!role || (!usefulRoles.has(role) && !name)) continue;
+        if (requestedRoles?.size && !requestedRoles.has(role)) continue;
+        if (requestedName && !name.toLowerCase().includes(requestedName)) continue;
+        const basic = { role, name };
+        const value = element.getAttribute('aria-valuetext') || element.getAttribute('aria-valuenow') ||
+          (['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName) ? element.value : null);
+        if (value != null && String(value) !== '') basic.value = value;
+        nodes.push(basic);
+      }
+      return nodes;
+    }
+  });
+  return results[0]?.result || [];
+}
+
 async function observeTab(tabId, options = {}) {
+  if (options.compact === true) return observeTabWithoutDebugger(tabId, options);
   return withDebugger(tabId, async (target) => {
     const ax = await debuggerCommand(target, 'Accessibility.getFullAXTree', {});
     const compact = options.compact === true;
@@ -2033,7 +2245,15 @@ async function observeTab(tabId, options = {}) {
 async function startMonitoring(tabId) {
   if (monitors.has(tabId)) return { success: true, tabId, already: true };
   const target = { tabId };
-  if (!interceptors.has(tabId)) {
+  let taskDebugger = taskDebuggers.get(tabId);
+  if (!taskDebugger && !interceptors.has(tabId)) {
+    const taskSession = await findTaskSessionForTab(tabId);
+    if (taskSession) taskDebugger = await ensureTaskDebugger(tabId, taskSession.sessionId);
+  }
+  if (taskDebugger?.timer) clearTimeout(taskDebugger.timer);
+  if (taskDebugger) taskDebugger.timer = null;
+  const attachedHere = !interceptors.has(tabId) && !taskDebugger;
+  if (attachedHere) {
     await debuggerAttach(target);
   }
   monitors.set(tabId, { console: [], network: new Map(), dialogs: [] });
@@ -2044,7 +2264,7 @@ async function startMonitoring(tabId) {
     await debuggerCommand(target, 'Page.enable', {});
   } catch (error) {
     monitors.delete(tabId);
-    if (!interceptors.has(tabId)) {
+    if (attachedHere && !interceptors.has(tabId)) {
       await debuggerDetach(target);
     }
     throw error;
@@ -2056,7 +2276,8 @@ async function stopMonitoring(tabId) {
   if (!monitors.has(tabId)) return { success: true, tabId, alreadyStopped: true };
   monitors.delete(tabId);
   if (!interceptors.has(tabId)) {
-    await debuggerDetach({ tabId });
+    if (taskDebuggers.has(tabId)) scheduleTaskDebuggerDetach(tabId);
+    else await debuggerDetach({ tabId });
   }
   return { success: true, tabId };
 }
@@ -2258,7 +2479,14 @@ function toBase64(str) {
 
 async function startInterception(tabId, urlPattern, mode, status, body) {
   const target = { tabId };
-  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId);
+  let taskDebugger = taskDebuggers.get(tabId);
+  if (!taskDebugger && !monitors.has(tabId) && !interceptors.has(tabId)) {
+    const taskSession = await findTaskSessionForTab(tabId);
+    if (taskSession) taskDebugger = await ensureTaskDebugger(tabId, taskSession.sessionId);
+  }
+  if (taskDebugger?.timer) clearTimeout(taskDebugger.timer);
+  if (taskDebugger) taskDebugger.timer = null;
+  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId) && !taskDebugger;
   if (attachedHere) {
     await debuggerAttach(target);
   }
@@ -2296,7 +2524,8 @@ async function stopInterception(tabId) {
   }
   interceptors.delete(tabId);
   if (!monitors.has(tabId)) {
-    await debuggerDetach(target);
+    if (taskDebuggers.has(tabId)) scheduleTaskDebuggerDetach(tabId);
+    else await debuggerDetach(target);
   }
   return { success: true, tabId };
 }
@@ -2350,9 +2579,16 @@ async function sessionStatus(domains) {
   return { sessions };
 }
 
+async function readBodyLengthInTab(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => (document.body?.innerText || '').length
+  });
+  return Number.isFinite(results[0]?.result) ? results[0].result : -1;
+}
+
 async function handoffBodyLength(tabId) {
-  const res = await withDebugger(tabId, (target) => evaluateWithDebugger(target, "(document.body && document.body.innerText || '').length"));
-  return res.success ? res.val : -1;
+  return readBodyLengthInTab(tabId);
 }
 
 async function handoffResult(tabId, mode, startedAt) {

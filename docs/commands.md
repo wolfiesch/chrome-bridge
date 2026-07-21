@@ -16,7 +16,7 @@ chrome-bridge executeScriptCDP <tabId> <code>
 chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]
 ```
 
-`observe` now prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. Use `--full` only when node IDs, descriptions, and detailed accessibility properties are needed.
+`observe` now prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. These compact snapshots, text extraction, HTML capture, and text waits run through normal extension page access, without attaching Chrome's debugger. Use `--full` only when node IDs, descriptions, and detailed accessibility properties are needed; that detailed view does attach the debugger.
 
 ### Navigation and tabs
 
@@ -41,6 +41,8 @@ chrome-bridge taskSession close <sessionId>
 ```
 
 Use `--foreground` only when the user intentionally needs to see the session tab. Prefer task sessions over omitted tab IDs so a human tab change cannot redirect the agent.
+
+The tab group is an ownership boundary, not a place where Chrome can hide its debugger notice. Chrome shows that notice across the browser whenever any extension debugger is attached. On task-owned tabs, the bridge reuses one debugger connection for debugger-backed actions during the active burst and detaches after 30 seconds idle. This prevents the notice from repeatedly opening and closing between nearby actions. A tab manually moved into the task's Chrome group is also treated as task-owned. Commands on unrelated tabs keep the older one-command connection behavior for compatibility and may still re-trigger the notice.
 
 ### Waits
 
@@ -127,7 +129,7 @@ chrome-bridge policy allow-action <action> [client]
 chrome-bridge policy allow-origin <pattern> [client]
 ```
 
-`startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger infobar may persist on monitored tabs. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
+`startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger notice may persist across the browser while monitoring is active. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
 `policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time.
 
